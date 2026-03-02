@@ -54,10 +54,11 @@ load_config() {
 get_tool_args() {
   local tool="$1"
   load_config
-  # Check for per-tool args first, then fall back to legacy LLMUX_TOOL_ARGS
-  local var="LLMUX_ARGS_${tool^^}"
-  var="${var//-/_}"
-  local args="${!var:-}"
+  local upper
+  upper=$(echo "$tool" | tr '[:lower:]-' '[:upper:]_')
+  local var="LLMUX_ARGS_${upper}"
+  local args
+  eval "args=\${$var:-}"
   if [[ -z "$args" && "$tool" == "${LLMUX_TOOL:-}" ]]; then
     args="${LLMUX_TOOL_ARGS:-}"
   fi
@@ -274,9 +275,9 @@ CONF
   for tool in "${found_tools[@]}"; do
     local args
     args=$(gum input --placeholder "e.g. --dangerously-skip-permissions" --header "Startup args for $tool (enter to skip)")
-    local var="LLMUX_ARGS_${tool^^}"
-    var="${var//-/_}"
-    echo "${var}=\"${args}\"" >> "$CONFIG_FILE"
+    local upper
+    upper=$(echo "$tool" | tr '[:lower:]-' '[:upper:]_')
+    echo "LLMUX_ARGS_${upper}=\"${args}\"" >> "$CONFIG_FILE"
     if [[ -n "$args" ]]; then
       echo "  $tool: $args"
     else
