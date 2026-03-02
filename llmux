@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SESSION="llmux"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/llmux"
+CONFIG_FILE="$CONFIG_DIR/config"
 
 usage() {
   cat <<EOF
@@ -12,6 +14,7 @@ Usage:
   llmux rm <name>                Remove pane by name
   llmux ls                       List active panes
   llmux attach                   Attach to the llmux session
+  llmux setup                    Detect LLM tools and pick a default
   llmux help                     Show this help
 
 Examples:
@@ -19,6 +22,22 @@ Examples:
   llmux add "bug-investigation"
   llmux rm "auth-refactor"
 EOF
+}
+
+get_tool() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+    echo "${LLMUX_TOOL:-}"
+  fi
+}
+
+launch_tool() {
+  local pane_target="$1"
+  local tool
+  tool="$(get_tool)"
+  if [[ -n "$tool" ]]; then
+    tmux send-keys -t "$pane_target" "$tool" Enter
+  fi
 }
 
 ensure_session() {
@@ -61,6 +80,7 @@ cmd_add() {
       tmux send-keys -t "$SESSION" "cd '$dir'" Enter
       tmux select-pane -t "$SESSION" -T "$name"
       tmux send-keys -t "$SESSION" "clear" Enter
+      launch_tool "$SESSION"
       echo "Created pane '$name' in $dir"
       return
     fi
@@ -70,6 +90,7 @@ cmd_add() {
   tmux split-window -t "$SESSION" -c "$dir"
   tmux select-pane -t "$SESSION" -T "$name"
   tmux select-layout -t "$SESSION" tiled
+  launch_tool "$SESSION"
   echo "Created pane '$name' in $dir"
 }
 
@@ -139,6 +160,65 @@ cmd_attach() {
   fi
 }
 
+cmd_setup() {
+  # Known LLM CLI tools to look for
+  local known_tools=(amp claude aider sgpt llm mods ollama)
+  local found_tools=()
+
+  echo "Scanning for LLM CLI tools..."
+  echo ""
+
+  for tool in "${known_tools[@]}"; do
+    if command -v "$tool" &>/dev/null; then
+      local tool_path
+      tool_path="$(command -v "$tool")"
+      found_tools+=("$tool")
+      echo "  ✓ $tool ($tool_path)"
+    fi
+  done
+
+  if [[ ${#found_tools[@]} -eq 0 ]]; then
+    echo "  No known LLM tools found on PATH."
+    echo ""
+    echo "You can manually set a tool:"
+    echo "  mkdir -p '$CONFIG_DIR' && echo 'LLMUX_TOOL=\"your-command\"' > '$CONFIG_FILE'"
+    exit 0
+  fi
+
+  echo ""
+  echo "Select a default tool to launch in new panes:"
+  echo ""
+  local i=1
+  for tool in "${found_tools[@]}"; do
+    echo "  $i) $tool"
+    ((i++))
+  done
+  echo "  0) none (just open a shell)"
+  echo ""
+
+  local choice
+  read -rp "Choice [1]: " choice
+  choice="${choice:-1}"
+
+  if [[ "$choice" == "0" ]]; then
+    mkdir -p "$CONFIG_DIR"
+    echo 'LLMUX_TOOL=""' > "$CONFIG_FILE"
+    echo ""
+    echo "Configured: no auto-launch (shell only)"
+  elif [[ "$choice" -ge 1 && "$choice" -le ${#found_tools[@]} ]]; then
+    local selected="${found_tools[$((choice - 1))]}"
+    mkdir -p "$CONFIG_DIR"
+    echo "LLMUX_TOOL=\"$selected\"" > "$CONFIG_FILE"
+    echo ""
+    echo "Configured: $selected will launch in new panes"
+  else
+    echo "Invalid choice"
+    exit 1
+  fi
+
+  echo "Config saved to $CONFIG_FILE"
+}
+
 # --- Main ---
 command="${1:-help}"
 shift || true
@@ -148,6 +228,7 @@ case "$command" in
   rm)     cmd_rm "$@" ;;
   ls)     cmd_ls "$@" ;;
   attach) cmd_attach "$@" ;;
+  setup)  cmd_setup "$@" ;;
   help)   usage ;;
   *)      echo "Unknown command: $command"; usage; exit 1 ;;
 esac
