@@ -508,7 +508,7 @@ cmd_resume() {
   local resume_cmd=""
   case "$tool" in
     claude) resume_cmd="$tool_cmd --resume $selected_id" ;;
-    amp)    resume_cmd="$tool_cmd --continue $selected_id" ;;
+    amp)    resume_cmd="$tool_cmd threads continue $selected_id" ;;
   esac
 
   # Create the pane and launch
