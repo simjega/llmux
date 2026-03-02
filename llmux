@@ -366,7 +366,7 @@ cmd_resume() {
         [[ -z "$sid" ]] && continue
         raw_lines+=("$sid|$dir|$ts|$summary")
         local short_dir="${dir/#$HOME/~}"
-        display_lines+=("$(printf '%-10s  %-50s  %s' "$ts" "${summary:0:50}" "$short_dir")")
+        display_lines+=("$(printf '%-10s │ %-50s │ %s' "$ts" "${summary:0:50}" "$short_dir")")
       done < <(harvest_claude_sessions)
       ;;
     amp)
@@ -374,7 +374,7 @@ cmd_resume() {
         [[ -z "$sid" ]] && continue
         raw_lines+=("$sid|$dir|$ts|$summary")
         local short_dir="${dir/#$HOME/~}"
-        display_lines+=("$(printf '%-10s  %-50s  %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
+        display_lines+=("$(printf '%-10s │ %-50s │ %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
       done < <(harvest_amp_sessions)
       ;;
     *)
@@ -393,9 +393,12 @@ cmd_resume() {
   selected_line=$(printf '%s\n' "${display_lines[@]}" | gum filter \
     --header "Resume a $tool session" \
     --indicator "▸" \
-    --indicator.foreground "39" \
-    --match.foreground "green" \
-    --header.foreground "99")
+    --indicator.foreground "212" \
+    --text.foreground "245" \
+    --match.foreground "212" \
+    --header.foreground "99" \
+    --prompt.foreground "39" \
+    --cursor-text.foreground "white")
 
   [[ -z "$selected_line" ]] && exit 0
 
