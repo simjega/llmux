@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION="llmux"
+
+usage() {
+  cat <<EOF
+llmux — multiplex LLM sessions in tmux
+
+Usage:
+  llmux add <name> [directory]   Add a new pane titled <name> (default dir: cwd)
+  llmux rm <name>                Remove pane by name
+  llmux ls                       List active panes
+  llmux attach                   Attach to the llmux session
+  llmux help                     Show this help
+
+Examples:
+  llmux add "auth-refactor" ~/code/myproject
+  llmux add "bug-investigation"
+  llmux rm "auth-refactor"
+EOF
+}
+
+ensure_session() {
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    tmux new-session -d -s "$SESSION" -x - -y -
+    # Enable pane titles in the border
+    tmux set-option -t "$SESSION" pane-border-status top
+    tmux set-option -t "$SESSION" pane-border-format ' #{pane_title} [#{pane_current_path}] '
+    # Style the borders for clarity
+    tmux set-option -t "$SESSION" pane-border-style 'fg=colour240'
+    tmux set-option -t "$SESSION" pane-active-border-style 'fg=colour39,bold'
+    # Kill the initial empty pane marker — we'll track it
+    INITIAL_PANE=1
+  fi
+}
+
+cmd_add() {
+  local name="${1:?Usage: llmux add <name> [directory]}"
+  local dir="${2:-$(pwd)}"
+  dir="$(cd "$dir" && pwd)" # resolve to absolute path
+
+  ensure_session
+
+  # Check if a pane with this name already exists
+  if tmux list-panes -t "$SESSION" -F '#{pane_title}' 2>/dev/null | grep -qxF "$name"; then
+    echo "Error: pane '$name' already exists"
+    exit 1
+  fi
+
+  # Count existing panes
+  local pane_count
+  pane_count=$(tmux list-panes -t "$SESSION" 2>/dev/null | wc -l | tr -d ' ')
+
+  if [[ "$pane_count" -eq 1 ]]; then
+    # First pane: check if the only pane is the default untitled one
+    local first_title
+    first_title=$(tmux list-panes -t "$SESSION" -F '#{pane_title}' | head -1)
+    if [[ -z "$first_title" || "$first_title" == "bash" || "$first_title" == "zsh" ]]; then
+      # Reuse the initial empty pane
+      tmux send-keys -t "$SESSION" "cd '$dir'" Enter
+      tmux select-pane -t "$SESSION" -T "$name"
+      tmux send-keys -t "$SESSION" "clear" Enter
+      echo "Created pane '$name' in $dir"
+      return
+    fi
+  fi
+
+  # Split and set up the new pane
+  tmux split-window -t "$SESSION" -c "$dir"
+  tmux select-pane -t "$SESSION" -T "$name"
+  tmux select-layout -t "$SESSION" tiled
+  echo "Created pane '$name' in $dir"
+}
+
+cmd_rm() {
+  local name="${1:?Usage: llmux rm <name>}"
+
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "Error: no llmux session running"
+    exit 1
+  fi
+
+  # Find the pane with this title
+  local target_pane=""
+  while IFS= read -r line; do
+    local pane_id pane_title
+    pane_id=$(echo "$line" | cut -d'|' -f1)
+    pane_title=$(echo "$line" | cut -d'|' -f2)
+    if [[ "$pane_title" == "$name" ]]; then
+      target_pane="$pane_id"
+      break
+    fi
+  done < <(tmux list-panes -t "$SESSION" -F '#{pane_id}|#{pane_title}')
+
+  if [[ -z "$target_pane" ]]; then
+    echo "Error: no pane named '$name'"
+    exit 1
+  fi
+
+  local pane_count
+  pane_count=$(tmux list-panes -t "$SESSION" | wc -l | tr -d ' ')
+
+  if [[ "$pane_count" -eq 1 ]]; then
+    # Last pane — kill the whole session
+    tmux kill-session -t "$SESSION"
+    echo "Removed pane '$name' (session ended)"
+  else
+    tmux kill-pane -t "$target_pane"
+    tmux select-layout -t "$SESSION" tiled
+    echo "Removed pane '$name'"
+  fi
+}
+
+cmd_ls() {
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "No llmux session running"
+    exit 0
+  fi
+
+  printf "%-4s  %-30s  %s\n" "IDX" "NAME" "DIRECTORY"
+  printf "%-4s  %-30s  %s\n" "---" "----" "---------"
+  local idx=0
+  while IFS= read -r line; do
+    local pane_title pane_path
+    pane_title=$(echo "$line" | cut -d'|' -f1)
+    pane_path=$(echo "$line" | cut -d'|' -f2)
+    printf "%-4s  %-30s  %s\n" "$idx" "$pane_title" "$pane_path"
+    ((idx++))
+  done < <(tmux list-panes -t "$SESSION" -F '#{pane_title}|#{pane_current_path}')
+}
+
+cmd_attach() {
+  ensure_session
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "$SESSION"
+  else
+    tmux attach-session -t "$SESSION"
+  fi
+}
+
+# --- Main ---
+command="${1:-help}"
+shift || true
+
+case "$command" in
+  add)    cmd_add "$@" ;;
+  rm)     cmd_rm "$@" ;;
+  ls)     cmd_ls "$@" ;;
+  attach) cmd_attach "$@" ;;
+  help)   usage ;;
+  *)      echo "Unknown command: $command"; usage; exit 1 ;;
+esac
