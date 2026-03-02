@@ -256,18 +256,49 @@ harvest_claude_sessions() {
   python3 << 'PYEOF'
 import json, os, glob, time
 
+def relative_time(mtime):
+    delta = int(time.time() - mtime)
+    if delta < 60:
+        return f"{delta}s ago"
+    elif delta < 3600:
+        return f"{delta // 60}m ago"
+    elif delta < 86400:
+        return f"{delta // 3600}h ago"
+    else:
+        days = delta // 86400
+        return f"{days}d ago"
+
+def decode_project_path(encoded):
+    """Decode Claude's project dir encoding by finding the real path on disk.
+    Tries /, ., and - as separators with backtracking to find a valid path."""
+    parts = encoded.lstrip("-").split("-")
+
+    def resolve(idx, current):
+        if idx == len(parts):
+            return current
+        part = parts[idx]
+        seps = ["/"] if not current else ["/", ".", "-"]
+        for sep in seps:
+            candidate = current + sep + part
+            result = resolve(idx + 1, candidate)
+            if result and os.path.exists(result):
+                return result
+        return current + "/" + part if idx == len(parts) - 1 else None
+
+    result = resolve(0, "")
+    return result if result and os.path.exists(result) else "/" + "/".join(parts)
+
 projects_dir = os.path.expanduser("~/.claude/projects")
 if not os.path.isdir(projects_dir):
     exit(0)
 
-sessions = []
+home = os.path.expanduser("~")
 for jsonl in sorted(glob.glob(f"{projects_dir}/*/*.jsonl"), key=os.path.getmtime, reverse=True)[:20]:
     project = os.path.basename(os.path.dirname(jsonl))
     session_id = os.path.basename(jsonl).replace(".jsonl", "")
     mtime = os.path.getmtime(jsonl)
 
-    # Decode project path: leading dash + dashes as /
-    proj_path = "/" + project.lstrip("-").replace("-", "/")
+    proj_path = decode_project_path(project)
 
     # Find first real user message as summary
     summary = ""
@@ -290,7 +321,7 @@ for jsonl in sorted(glob.glob(f"{projects_dir}/*/*.jsonl"), key=os.path.getmtime
             except:
                 pass
 
-    ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+    ts = relative_time(mtime)
     # Output pipe-delimited: session_id|project_path|timestamp|summary
     print(f"{session_id}|{proj_path}|{ts}|{summary or '(empty session)'}")
 PYEOF
@@ -329,14 +360,15 @@ cmd_resume() {
   local raw_lines=()
   local display_lines=()
 
+  local cyan=$'\033[36m' reset=$'\033[0m' dim=$'\033[2m'
+
   case "$tool" in
     claude)
       while IFS='|' read -r sid dir ts summary; do
         [[ -z "$sid" ]] && continue
         raw_lines+=("$sid|$dir|$ts|$summary")
-        # Clean display: short dir, truncated summary
         local short_dir="${dir/#$HOME/~}"
-        display_lines+=("$(printf '%-16s  %-50s  %s' "$ts" "${summary:0:50}" "$short_dir")")
+        display_lines+=("$(printf "${dim}%-10s${reset}  %-50s  ${cyan}%s${reset}" "$ts" "${summary:0:50}" "$short_dir")")
       done < <(harvest_claude_sessions)
       ;;
     amp)
@@ -344,7 +376,7 @@ cmd_resume() {
         [[ -z "$sid" ]] && continue
         raw_lines+=("$sid|$dir|$ts|$summary")
         local short_dir="${dir/#$HOME/~}"
-        display_lines+=("$(printf '%-16s  %-50s  %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
+        display_lines+=("$(printf "${dim}%-10s${reset}  %-50s  ${cyan}%s${reset}" "${ts:-?}" "${summary:0:50}" "$short_dir")")
       done < <(harvest_amp_sessions)
       ;;
     *)
@@ -360,7 +392,7 @@ cmd_resume() {
 
   # Pick a session
   local selected_line
-  selected_line=$(printf '%s\n' "${display_lines[@]}" | gum filter --height 20 --header "Resume a $tool session" --placeholder "Type to search...")
+  selected_line=$(printf '%s\n' "${display_lines[@]}" | gum filter --no-strip-ansi --height 20 --header "Resume a $tool session" --placeholder "Type to search...")
 
   [[ -z "$selected_line" ]] && exit 0
 

@@ -9,86 +9,69 @@ git clone https://github.com/simjega/llmux.git
 cd llmux
 chmod +x llmux
 
-# Symlink onto PATH (pick one)
-ln -sf "$(pwd)/llmux" ~/.local/bin/llmux    # if ~/.local/bin is on PATH
-ln -sf "$(pwd)/llmux" /usr/local/bin/llmux  # system-wide
+# Symlink onto PATH
+ln -sf "$(pwd)/llmux" ~/.local/bin/llmux
 
-# Install dependencies (gum, tmux, python3) and configure your LLM tool
+# Install dependencies & configure
 llmux setup
 ```
+
+`setup` installs `gum`, `tmux`, and `python3` via Homebrew if missing, then walks you through picking your LLM tool and any startup args.
 
 ## Quick start
 
 ```bash
-# 1. Install deps & configure (only needed once)
-llmux setup
-
-# 2. Add sessions
-llmux add "auth-refactor" ~/code/myproject
-llmux add "bug-hunt" ~/code/other
-
-# 3. Attach and start working
-llmux attach
+llmux setup                              # one-time: install deps + pick tool
+llmux add "auth-refactor" ~/code/project  # open a named session
+llmux add "bug-hunt"                      # another (defaults to cwd)
+llmux attach                              # jump in
 ```
 
 ## Commands
 
+| Command | Description |
+|---------|-------------|
+| `llmux setup` | Install dependencies and configure your LLM tool |
+| `llmux add <name> [dir]` | Create a new named pane, launch configured tool |
+| `llmux resume [name]` | Browse & resume a past session in a new pane |
+| `llmux grab <name> [pane]` | Move an existing tmux pane into llmux |
+| `llmux rm <name>` | Remove a pane by name |
+| `llmux ls` | List active panes |
+| `llmux attach` | Attach to the llmux session |
+
 ### `llmux setup`
 
-Installs dependencies (`gum`, `tmux`, `python3`) via Homebrew if missing, then scans for LLM CLI tools (`amp`, `claude`, `aider`, `sgpt`, `llm`, `mods`, `ollama`) and lets you pick a default. Also prompts for startup args (e.g. `--dangerously-skip-permissions` for Claude Code).
+Installs dependencies (`gum`, `tmux`, `python3`) via Homebrew, then lets you pick a default LLM CLI from what's on your machine (`amp`, `claude`, `aider`, `sgpt`, `llm`, `mods`, `ollama`) and set startup args (e.g. `--dangerously-skip-permissions`).
 
-Config is saved to `~/.config/llmux/config`.
+Config saved to `~/.config/llmux/config`.
 
 ### `llmux add <name> [directory]`
 
-Create a new pane titled `<name>`. Optionally specify a working directory (defaults to cwd). Automatically launches the configured LLM tool.
-
-```bash
-llmux add "feature-work" ~/code/myproject
-llmux add "quick-question"
-```
+Create a new pane titled `<name>`, optionally in a specific directory. Automatically launches the configured LLM tool.
 
 ### `llmux resume [name]`
 
-Harvest past sessions from your configured tool and pick one to resume in a new pane. Supports **Claude Code** (scans `~/.claude/projects/`) and **Amp** (`amp threads list`).
+Harvest past sessions from your configured tool and pick one to resume via a fuzzy-searchable picker (powered by `gum`). Sessions show relative timestamps, the first user message, and the project directory in color.
 
-Shows a numbered list with timestamps, first user message, session ID, and project directory. The pane auto-titles from the session summary, or pass a custom name.
-
-```bash
-llmux resume                  # interactive picker
-llmux resume "my-label"       # resume with a custom pane name
-```
+Supports **Claude Code** (scans `~/.claude/projects/`) and **Amp** (`amp threads list`).
 
 This is how you "move" a session from a regular terminal into llmux — just resume it.
 
-### `llmux grab <name> [source-pane]`
+### `llmux grab <name> [pane]`
 
-Move an existing tmux pane into the llmux session. Without a source, shows an interactive picker of all non-llmux panes. The running process is preserved.
-
-```bash
-llmux grab "ongoing-debug"                  # interactive picker
-llmux grab "my-session" othersession:0.1    # grab a specific pane
-```
+Move an existing tmux pane into the llmux session. Without a source, shows a fuzzy picker of all non-llmux panes. The running process is preserved.
 
 ### `llmux rm <name>`
 
 Remove a pane by name. If it's the last pane, the session ends.
 
-```bash
-llmux rm "auth-refactor"
-```
+## Dependencies
 
-### `llmux ls`
+All installed automatically by `llmux setup`:
 
-List all active panes with their index, name, and working directory.
-
-### `llmux attach`
-
-Attach to the llmux tmux session. If already inside tmux, switches the client.
-
-### `llmux help`
-
-Show usage summary.
+- **[gum](https://github.com/charmbracelet/gum)** — beautiful terminal UI for pickers and prompts
+- **tmux** — terminal multiplexer
+- **python3** — used for harvesting Claude Code session history
 
 ## How it works
 
