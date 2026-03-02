@@ -391,9 +391,7 @@ cmd_resume() {
   # Pick a session
   local selected_line
   selected_line=$(printf '%s\n' "${display_lines[@]}" | gum filter \
-    --height 20 \
     --header "Resume a $tool session" \
-    --placeholder "Type to search..." \
     --indicator "▸" \
     --indicator.foreground "39" \
     --match.foreground "green" \
