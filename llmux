@@ -11,6 +11,7 @@ llmux — multiplex LLM sessions in tmux
 
 Usage:
   llmux add <name> [directory]   Add a new pane titled <name> (default dir: cwd)
+  llmux resume [name]            Pick a past session to resume in a new pane
   llmux grab <name> [pane]       Move an existing tmux pane into llmux
   llmux rm <name>                Remove pane by name
   llmux ls                       List active panes
@@ -21,8 +22,10 @@ Usage:
 Examples:
   llmux add "auth-refactor" ~/code/myproject
   llmux add "bug-investigation"
-  llmux grab "ongoing-debug"                  # grab current pane
-  llmux grab "my-session" mysession:0.1       # grab specific pane
+  llmux resume                                     # pick a past session to resume
+  llmux resume "my-label"                           # resume with a custom pane name
+  llmux grab "ongoing-debug"                        # grab current pane
+  llmux grab "my-session" mysession:0.1             # grab specific pane
   llmux rm "auth-refactor"
 EOF
 }
@@ -240,6 +243,181 @@ CONF
   echo "Config saved to $CONFIG_FILE"
 }
 
+harvest_claude_sessions() {
+  python3 << 'PYEOF'
+import json, os, glob, time
+
+projects_dir = os.path.expanduser("~/.claude/projects")
+if not os.path.isdir(projects_dir):
+    exit(0)
+
+sessions = []
+for jsonl in sorted(glob.glob(f"{projects_dir}/*/*.jsonl"), key=os.path.getmtime, reverse=True)[:20]:
+    project = os.path.basename(os.path.dirname(jsonl))
+    session_id = os.path.basename(jsonl).replace(".jsonl", "")
+    mtime = os.path.getmtime(jsonl)
+
+    # Decode project path: leading dash + dashes as /
+    proj_path = "/" + project.lstrip("-").replace("-", "/")
+
+    # Find first real user message as summary
+    summary = ""
+    with open(jsonl) as f:
+        for line in f:
+            try:
+                msg = json.loads(line.strip())
+                if msg.get("type") != "user":
+                    continue
+                content = msg.get("message", {}).get("content", "")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = next((b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text"), "")
+                else:
+                    continue
+                if text and not text.startswith("<local-command") and not text.startswith("<command-name>"):
+                    summary = text[:80].replace("\n", " ").strip()
+                    break
+            except:
+                pass
+
+    ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+    # Output pipe-delimited: session_id|project_path|timestamp|summary
+    print(f"{session_id}|{proj_path}|{ts}|{summary or '(empty session)'}")
+PYEOF
+}
+
+harvest_amp_sessions() {
+  amp threads list 2>/dev/null | tail -n +3 | while IFS= read -r line; do
+    # Parse the table output: Title, Last Updated, Visibility, Messages, Thread ID
+    # The format is column-aligned, thread ID is the last field
+    local thread_id title updated
+    thread_id=$(echo "$line" | grep -oE 'T-[0-9a-f-]+' | head -1)
+    [[ -z "$thread_id" ]] && continue
+    # Extract title (everything before the first date-like pattern or time-ago)
+    title=$(echo "$line" | sed -E 's/[[:space:]]+(([0-9]+[smhd]|[0-9]+ (seconds?|minutes?|hours?|days?|weeks?|months?)) ago|[0-9]{4}-[0-9]{2}-[0-9]{2}).*//' | sed 's/[[:space:]]*$//')
+    updated=$(echo "$line" | grep -oE '([0-9]+[smhd]|[0-9]+ (seconds?|minutes?|hours?|days?|weeks?|months?)) ago' | head -1)
+    # Output: session_id|directory|timestamp|summary
+    echo "${thread_id}|$(pwd)|${updated:-unknown}|${title}"
+  done
+}
+
+cmd_resume() {
+  local custom_name="${1:-}"
+
+  # Determine configured tool
+  local tool=""
+  if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+    tool="${LLMUX_TOOL:-}"
+  fi
+
+  if [[ -z "$tool" ]]; then
+    echo "No tool configured. Run 'llmux setup' first."
+    exit 1
+  fi
+
+  # Harvest sessions based on tool
+  local sessions=()
+  local session_ids=()
+  local session_dirs=()
+  local idx=1
+
+  echo "Fetching past $tool sessions..."
+  echo ""
+
+  case "$tool" in
+    claude)
+      while IFS='|' read -r sid dir ts summary; do
+        [[ -z "$sid" ]] && continue
+        sessions+=("$sid|$dir|$ts|$summary")
+        session_ids+=("$sid")
+        session_dirs+=("$dir")
+        printf "  %2d) [%s] %s\n" "$idx" "$ts" "$summary"
+        printf "      %s @ %s\n" "$sid" "$dir"
+        ((idx++))
+      done < <(harvest_claude_sessions)
+      ;;
+    amp)
+      while IFS='|' read -r sid dir ts summary; do
+        [[ -z "$sid" ]] && continue
+        sessions+=("$sid|$dir|$ts|$summary")
+        session_ids+=("$sid")
+        session_dirs+=("$dir")
+        printf "  %2d) [%s] %s\n" "$idx" "${ts:-?}" "$summary"
+        printf "      %s\n" "$sid"
+        ((idx++))
+      done < <(harvest_amp_sessions)
+      ;;
+    *)
+      echo "Resume not supported for '$tool' yet."
+      echo "Supported: claude, amp"
+      exit 1
+      ;;
+  esac
+
+  if [[ ${#sessions[@]} -eq 0 ]]; then
+    echo "  No past sessions found."
+    exit 0
+  fi
+
+  echo ""
+  local choice
+  read -rp "Select session to resume [1]: " choice
+  choice="${choice:-1}"
+
+  if [[ "$choice" -lt 1 || "$choice" -gt ${#sessions[@]} ]]; then
+    echo "Invalid choice"
+    exit 1
+  fi
+
+  local selected_id="${session_ids[$((choice - 1))]}"
+  local selected_dir="${session_dirs[$((choice - 1))]}"
+
+  # Build the resume command
+  local resume_cmd=""
+  local tool_args="${LLMUX_TOOL_ARGS:-}"
+  case "$tool" in
+    claude) resume_cmd="$tool${tool_args:+ $tool_args} --resume $selected_id" ;;
+    amp)    resume_cmd="$tool${tool_args:+ $tool_args} --continue $selected_id" ;;
+  esac
+
+  # Derive pane name
+  local pane_name="$custom_name"
+  if [[ -z "$pane_name" ]]; then
+    # Use the summary as the pane name, truncated
+    local summary
+    summary=$(echo "${sessions[$((choice - 1))]}" | cut -d'|' -f4)
+    pane_name="${summary:0:40}"
+    [[ -z "$pane_name" ]] && pane_name="$selected_id"
+  fi
+
+  # Create the pane (reuse add logic but with custom launch)
+  ensure_session
+
+  local pane_count
+  pane_count=$(tmux list-panes -t "$SESSION" 2>/dev/null | wc -l | tr -d ' ')
+
+  if [[ "$pane_count" -eq 1 ]]; then
+    local first_title
+    first_title=$(tmux list-panes -t "$SESSION" -F '#{pane_title}' | head -1)
+    if [[ -z "$first_title" || "$first_title" == "bash" || "$first_title" == "zsh" ]]; then
+      tmux send-keys -t "$SESSION" "cd '$selected_dir'" Enter
+      tmux select-pane -t "$SESSION" -T "$pane_name"
+      tmux send-keys -t "$SESSION" "clear" Enter
+      tmux send-keys -t "$SESSION" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
+      echo "Resuming '$selected_id' as '$pane_name'"
+      return
+    fi
+  fi
+
+  tmux split-window -t "$SESSION" -c "$selected_dir"
+  tmux select-pane -t "$SESSION" -T "$pane_name"
+  tmux select-layout -t "$SESSION" tiled
+  tmux send-keys -t "$SESSION" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
+  echo "Resuming '$selected_id' as '$pane_name'"
+}
+
 cmd_grab() {
   local name="${1:?Usage: llmux grab <name> [source-pane]}"
   local source="${2:-}"
@@ -319,6 +497,7 @@ shift || true
 
 case "$command" in
   add)    cmd_add "$@" ;;
+  resume) cmd_resume "$@" ;;
   grab)   cmd_grab "$@" ;;
   rm)     cmd_rm "$@" ;;
   ls)     cmd_ls "$@" ;;
