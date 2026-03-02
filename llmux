@@ -10,22 +10,21 @@ usage() {
 llmux — multiplex LLM sessions in tmux
 
 Usage:
-  llmux add <name> [directory]   Add a new pane titled <name> (default dir: cwd)
-  llmux resume [name]            Pick a past session to resume in a new pane
-  llmux grab <name> [pane]       Move an existing tmux pane into llmux
-  llmux rm <name>                Remove pane by name
-  llmux ls                       List active panes
-  llmux attach                   Attach to the llmux session
-  llmux setup                    Install deps + configure LLM tool
-  llmux help                     Show this help
+  llmux add <name> [directory] [--tool <tool>]  Add a new pane (default tool from config)
+  llmux resume [--tool <tool>]                  Pick a past session to resume
+  llmux grab <name> [pane]                      Move an existing tmux pane into llmux
+  llmux rm <name>                               Remove pane by name
+  llmux ls                                      List active panes
+  llmux attach                                  Attach to the llmux session
+  llmux setup                                   Install deps + configure LLM tools
+  llmux help                                    Show this help
 
 Examples:
   llmux add "auth-refactor" ~/code/myproject
-  llmux add "bug-investigation"
-  llmux resume                                     # pick a past session to resume
-  llmux resume "my-label"                           # resume with a custom pane name
-  llmux grab "ongoing-debug"                        # grab current pane
-  llmux grab "my-session" mysession:0.1             # grab specific pane
+  llmux add "bug-hunt" --tool amp
+  llmux resume                                  # resume with default tool
+  llmux resume --tool claude                    # resume a claude session specifically
+  llmux grab "ongoing-debug"
   llmux rm "auth-refactor"
 EOF
 }
@@ -42,23 +41,48 @@ check_deps() {
   fi
 }
 
-get_tool_cmd() {
+KNOWN_TOOLS=(amp claude aider sgpt llm mods ollama)
+
+load_config() {
+  LLMUX_TOOL=""
+  LLMUX_TOOL_ARGS=""
   if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
-    local cmd="${LLMUX_TOOL:-}"
-    local args="${LLMUX_TOOL_ARGS:-}"
-    if [[ -n "$cmd" ]]; then
-      echo "$cmd${args:+ $args}"
-    fi
   fi
 }
 
-launch_tool() {
+get_tool_args() {
+  local tool="$1"
+  load_config
+  # Check for per-tool args first, then fall back to legacy LLMUX_TOOL_ARGS
+  local var="LLMUX_ARGS_${tool^^}"
+  var="${var//-/_}"
+  local args="${!var:-}"
+  if [[ -z "$args" && "$tool" == "${LLMUX_TOOL:-}" ]]; then
+    args="${LLMUX_TOOL_ARGS:-}"
+  fi
+  echo "$args"
+}
+
+build_tool_cmd() {
+  local tool="$1"
+  local args
+  args="$(get_tool_args "$tool")"
+  echo "$tool${args:+ $args}"
+}
+
+launch_tool_in_pane() {
   local pane_target="$1"
-  local tool_cmd
-  tool_cmd="$(get_tool_cmd)"
-  if [[ -n "$tool_cmd" ]]; then
-    # Unset env vars that cause nesting detection issues (e.g. Claude Code)
+  local tool="${2:-}"
+
+  if [[ -z "$tool" ]]; then
+    load_config
+    tool="${LLMUX_TOOL:-}"
+  fi
+
+  if [[ -n "$tool" ]]; then
+    local tool_cmd
+    tool_cmd="$(build_tool_cmd "$tool")"
     tmux send-keys -t "$pane_target" "unset CLAUDECODE CLAUDE_CODE_SESSION; $tool_cmd" Enter
   fi
 }
@@ -78,42 +102,54 @@ ensure_session() {
 }
 
 cmd_add() {
-  local name="${1:?Usage: llmux add <name> [directory]}"
-  local dir="${2:-$(pwd)}"
-  dir="$(cd "$dir" && pwd)" # resolve to absolute path
+  local name="" dir="" tool_override=""
+
+  # Parse args: name [directory] [--tool <tool>]
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tool) tool_override="${2:?--tool requires a value}"; shift 2 ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"
+        elif [[ -z "$dir" ]]; then
+          dir="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && { echo "Usage: llmux add <name> [directory] [--tool <tool>]"; exit 1; }
+  dir="${dir:-$(pwd)}"
+  dir="$(cd "$dir" && pwd)"
 
   ensure_session
 
-  # Check if a pane with this name already exists
   if tmux list-panes -t "$SESSION" -F '#{pane_title}' 2>/dev/null | grep -qxF "$name"; then
     echo "Error: pane '$name' already exists"
     exit 1
   fi
 
-  # Count existing panes
   local pane_count
   pane_count=$(tmux list-panes -t "$SESSION" 2>/dev/null | wc -l | tr -d ' ')
 
   if [[ "$pane_count" -eq 1 ]]; then
-    # First pane: check if the only pane is the default untitled one
     local first_title
     first_title=$(tmux list-panes -t "$SESSION" -F '#{pane_title}' | head -1)
     if [[ -z "$first_title" || "$first_title" == "bash" || "$first_title" == "zsh" ]]; then
-      # Reuse the initial empty pane
       tmux send-keys -t "$SESSION" "cd '$dir'" Enter
       tmux select-pane -t "$SESSION" -T "$name"
       tmux send-keys -t "$SESSION" "clear" Enter
-      launch_tool "$SESSION"
+      launch_tool_in_pane "$SESSION" "$tool_override"
       echo "Created pane '$name' in $dir"
       return
     fi
   fi
 
-  # Split and set up the new pane
   tmux split-window -t "$SESSION" -c "$dir"
   tmux select-pane -t "$SESSION" -T "$name"
   tmux select-layout -t "$SESSION" tiled
-  launch_tool "$SESSION"
+  launch_tool_in_pane "$SESSION" "$tool_override"
   echo "Created pane '$name' in $dir"
 }
 
@@ -212,42 +248,47 @@ cmd_setup() {
   echo "✓ All dependencies installed"
   echo ""
 
-  # --- Configure LLM tool ---
-  local known_tools=(amp claude aider sgpt llm mods ollama)
+  # --- Find available LLM tools ---
   local found_tools=()
-
-  for tool in "${known_tools[@]}"; do
-    if command -v "$tool" &>/dev/null; then
-      found_tools+=("$tool")
-    fi
+  for tool in "${KNOWN_TOOLS[@]}"; do
+    command -v "$tool" &>/dev/null && found_tools+=("$tool")
   done
 
   if [[ ${#found_tools[@]} -eq 0 ]]; then
     echo "No known LLM tools found on PATH."
-    echo "Set manually: mkdir -p '$CONFIG_DIR' && echo 'LLMUX_TOOL=\"cmd\"' > '$CONFIG_FILE'"
     exit 0
   fi
 
+  # --- Pick default tool ---
   local selected
-  selected=$(printf '%s\n' "(none)" "${found_tools[@]}" | gum choose --header "Select default LLM tool")
+  selected=$(printf '%s\n' "(none)" "${found_tools[@]}" | gum choose --header "Select DEFAULT LLM tool")
   [[ "$selected" == "(none)" ]] && selected=""
 
-  local args=""
-  if [[ -n "$selected" ]]; then
-    args=$(gum input --placeholder "e.g. --dangerously-skip-permissions" --header "Startup args for $selected (enter to skip)")
-  fi
-
+  # --- Configure args for each found tool ---
   mkdir -p "$CONFIG_DIR"
   cat > "$CONFIG_FILE" <<CONF
 LLMUX_TOOL="$selected"
-LLMUX_TOOL_ARGS="$args"
 CONF
 
   echo ""
+  for tool in "${found_tools[@]}"; do
+    local args
+    args=$(gum input --placeholder "e.g. --dangerously-skip-permissions" --header "Startup args for $tool (enter to skip)")
+    local var="LLMUX_ARGS_${tool^^}"
+    var="${var//-/_}"
+    echo "${var}=\"${args}\"" >> "$CONFIG_FILE"
+    if [[ -n "$args" ]]; then
+      echo "  $tool: $args"
+    else
+      echo "  $tool: (no args)"
+    fi
+  done
+
+  echo ""
   if [[ -n "$selected" ]]; then
-    echo "✓ Configured: $selected${args:+ $args}"
+    echo "✓ Default tool: $selected"
   else
-    echo "✓ Configured: no auto-launch (shell only)"
+    echo "✓ No default tool (shell only)"
   fi
   echo "  Saved to $CONFIG_FILE"
 }
@@ -343,20 +384,38 @@ harvest_amp_sessions() {
 }
 
 cmd_resume() {
-  local custom_name="${1:-}"
+  local tool_override=""
 
-  local tool=""
-  if [[ -f "$CONFIG_FILE" ]]; then
-    source "$CONFIG_FILE"
-    tool="${LLMUX_TOOL:-}"
-  fi
+  # Parse args: [--tool <tool>]
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tool) tool_override="${2:?--tool requires a value}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
 
+  # Determine which tool to browse
+  local tool="$tool_override"
   if [[ -z "$tool" ]]; then
-    echo "No tool configured. Run 'llmux setup' first."
-    exit 1
+    load_config
+    # Find all resumable tools on the system
+    local resumable=()
+    for t in claude amp; do
+      command -v "$t" &>/dev/null && resumable+=("$t")
+    done
+
+    if [[ ${#resumable[@]} -eq 0 ]]; then
+      echo "No resumable tools found (need claude or amp)."
+      exit 1
+    elif [[ ${#resumable[@]} -eq 1 ]]; then
+      tool="${resumable[0]}"
+    else
+      tool=$(printf '%s\n' "${resumable[@]}" | gum choose --header "Which tool's sessions?")
+      [[ -z "$tool" ]] && exit 0
+    fi
   fi
 
-  # Harvest sessions into parallel arrays
+  # Harvest sessions
   local raw_lines=()
   local display_lines=()
 
@@ -421,20 +480,21 @@ cmd_resume() {
   selected_dir=$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f2)
   selected_summary=$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f4)
 
-  # Build resume command
-  local tool_args="${LLMUX_TOOL_ARGS:-}"
+  # Prompt for pane name (default to summary)
+  local default_name="${selected_summary:0:40}"
+  [[ -z "$default_name" ]] && default_name="$selected_id"
+  local pane_name
+  pane_name=$(gum input --value "$default_name" --header "Pane name")
+  [[ -z "$pane_name" ]] && pane_name="$default_name"
+
+  # Build resume command with per-tool args
+  local tool_cmd
+  tool_cmd="$(build_tool_cmd "$tool")"
   local resume_cmd=""
   case "$tool" in
-    claude) resume_cmd="$tool${tool_args:+ $tool_args} --resume $selected_id" ;;
-    amp)    resume_cmd="$tool${tool_args:+ $tool_args} --continue $selected_id" ;;
+    claude) resume_cmd="$tool_cmd --resume $selected_id" ;;
+    amp)    resume_cmd="$tool_cmd --continue $selected_id" ;;
   esac
-
-  # Derive pane name
-  local pane_name="$custom_name"
-  if [[ -z "$pane_name" ]]; then
-    pane_name="${selected_summary:0:40}"
-    [[ -z "$pane_name" ]] && pane_name="$selected_id"
-  fi
 
   # Create the pane and launch
   ensure_session
