@@ -360,15 +360,13 @@ cmd_resume() {
   local raw_lines=()
   local display_lines=()
 
-  local cyan=$'\033[36m' reset=$'\033[0m' dim=$'\033[2m'
-
   case "$tool" in
     claude)
       while IFS='|' read -r sid dir ts summary; do
         [[ -z "$sid" ]] && continue
         raw_lines+=("$sid|$dir|$ts|$summary")
         local short_dir="${dir/#$HOME/~}"
-        display_lines+=("$(printf "${dim}%-10s${reset}  %-50s  ${cyan}%s${reset}" "$ts" "${summary:0:50}" "$short_dir")")
+        display_lines+=("$(printf '%-10s  %-50s  %s' "$ts" "${summary:0:50}" "$short_dir")")
       done < <(harvest_claude_sessions)
       ;;
     amp)
@@ -376,7 +374,7 @@ cmd_resume() {
         [[ -z "$sid" ]] && continue
         raw_lines+=("$sid|$dir|$ts|$summary")
         local short_dir="${dir/#$HOME/~}"
-        display_lines+=("$(printf "${dim}%-10s${reset}  %-50s  ${cyan}%s${reset}" "${ts:-?}" "${summary:0:50}" "$short_dir")")
+        display_lines+=("$(printf '%-10s  %-50s  %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
       done < <(harvest_amp_sessions)
       ;;
     *)
@@ -392,7 +390,14 @@ cmd_resume() {
 
   # Pick a session
   local selected_line
-  selected_line=$(printf '%s\n' "${display_lines[@]}" | gum filter --no-strip-ansi --height 20 --header "Resume a $tool session" --placeholder "Type to search...")
+  selected_line=$(printf '%s\n' "${display_lines[@]}" | gum filter \
+    --height 20 \
+    --header "Resume a $tool session" \
+    --placeholder "Type to search..." \
+    --indicator "▸" \
+    --indicator.foreground "39" \
+    --match.foreground "green" \
+    --header.foreground "99")
 
   [[ -z "$selected_line" ]] && exit 0
 
