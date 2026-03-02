@@ -265,8 +265,12 @@ cmd_setup() {
   : > "$CONFIG_FILE"
 
   for tool in "${found_tools[@]}"; do
+    local default_args=""
+    case "$tool" in
+      claude) default_args="--dangerously-skip-permissions" ;;
+    esac
     local args
-    args=$(gum input --header "Startup args for $tool (enter to skip)")
+    args=$(gum input --value "$default_args" --header "Startup args for $tool (enter to skip)")
     local upper
     upper=$(echo "$tool" | tr '[:lower:]-' '[:upper:]_')
     echo "LLMUX_ARGS_${upper}=\"${args}\"" >> "$CONFIG_FILE"
