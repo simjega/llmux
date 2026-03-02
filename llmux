@@ -16,6 +16,7 @@ Usage:
   llmux rm <name>                               Remove pane by name
   llmux ls                                      List active panes
   llmux attach                                  Attach to the llmux session
+  llmux refresh                                  Recreate session, drop idle panes
   llmux setup                                   Install deps + configure LLM tools
   llmux help                                    Show this help
 
@@ -97,7 +98,8 @@ ensure_session() {
     # Style the borders for clarity
     tmux set-option -t "$SESSION" pane-border-style 'fg=colour240'
     tmux set-option -t "$SESSION" pane-active-border-style 'fg=colour39,bold'
-    # Kill the initial empty pane marker — we'll track it
+    # Enable mouse for scrolling and pane selection
+    tmux set-option -t "$SESSION" mouse on
     INITIAL_PANE=1
   fi
 }
@@ -610,6 +612,62 @@ cmd_grab() {
   echo "Grabbed pane '$source' as '$name'"
 }
 
+cmd_refresh() {
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "No llmux session running"
+    exit 0
+  fi
+
+  # Snapshot current panes: title, directory, running command
+  local pane_data=()
+  while IFS='|' read -r title dir cmd; do
+    pane_data+=("$title|$dir|$cmd")
+  done < <(tmux list-panes -t "$SESSION" -F '#{pane_title}|#{pane_current_path}|#{pane_current_command}')
+
+  # Kill the old session
+  tmux kill-session -t "$SESSION"
+
+  # Filter to panes that were running an LLM tool (not just a shell)
+  local active=()
+  local skipped=()
+  for entry in "${pane_data[@]}"; do
+    local title dir cmd
+    title=$(echo "$entry" | cut -d'|' -f1)
+    dir=$(echo "$entry" | cut -d'|' -f2)
+    cmd=$(echo "$entry" | cut -d'|' -f3)
+
+    # Skip default/unnamed shell panes
+    if [[ "$title" == "bash" || "$title" == "zsh" || -z "$title" ]]; then
+      skipped+=("(unnamed shell in $dir)")
+      continue
+    fi
+
+    active+=("$title|$dir")
+  done
+
+  if [[ ${#active[@]} -eq 0 ]]; then
+    echo "No named panes to restore."
+    return
+  fi
+
+  # Recreate each pane
+  for entry in "${active[@]}"; do
+    local title dir
+    title=$(echo "$entry" | cut -d'|' -f1)
+    dir=$(echo "$entry" | cut -d'|' -f2)
+    cmd_add "$title" "$dir"
+  done
+
+  echo ""
+  echo "✓ Restored ${#active[@]} pane(s)"
+  for entry in "${active[@]}"; do
+    echo "  + $(echo "$entry" | cut -d'|' -f1)"
+  done
+  if [[ ${#skipped[@]} -gt 0 ]]; then
+    echo "  Dropped ${#skipped[@]} idle pane(s)"
+  fi
+}
+
 # --- Main ---
 command="${1:-help}"
 shift || true
@@ -621,13 +679,14 @@ case "$command" in
 esac
 
 case "$command" in
-  add)    cmd_add "$@" ;;
-  resume) cmd_resume "$@" ;;
-  grab)   cmd_grab "$@" ;;
-  rm)     cmd_rm "$@" ;;
-  ls)     cmd_ls "$@" ;;
-  attach) cmd_attach "$@" ;;
-  setup)  cmd_setup "$@" ;;
+  add)     cmd_add "$@" ;;
+  resume)  cmd_resume "$@" ;;
+  grab)    cmd_grab "$@" ;;
+  rm)      cmd_rm "$@" ;;
+  ls)      cmd_ls "$@" ;;
+  attach)  cmd_attach "$@" ;;
+  refresh) cmd_refresh "$@" ;;
+  setup)   cmd_setup "$@" ;;
   help)   usage ;;
   *)      echo "Unknown command: $command"; usage; exit 1 ;;
 esac
