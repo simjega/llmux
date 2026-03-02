@@ -24,20 +24,24 @@ Examples:
 EOF
 }
 
-get_tool() {
+get_tool_cmd() {
   if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
-    echo "${LLMUX_TOOL:-}"
+    local cmd="${LLMUX_TOOL:-}"
+    local args="${LLMUX_TOOL_ARGS:-}"
+    if [[ -n "$cmd" ]]; then
+      echo "$cmd${args:+ $args}"
+    fi
   fi
 }
 
 launch_tool() {
   local pane_target="$1"
-  local tool
-  tool="$(get_tool)"
-  if [[ -n "$tool" ]]; then
+  local tool_cmd
+  tool_cmd="$(get_tool_cmd)"
+  if [[ -n "$tool_cmd" ]]; then
     # Unset env vars that cause nesting detection issues (e.g. Claude Code)
-    tmux send-keys -t "$pane_target" "unset CLAUDECODE CLAUDE_CODE_SESSION; $tool" Enter
+    tmux send-keys -t "$pane_target" "unset CLAUDECODE CLAUDE_CODE_SESSION; $tool_cmd" Enter
   fi
 }
 
@@ -203,15 +207,28 @@ cmd_setup() {
 
   if [[ "$choice" == "0" ]]; then
     mkdir -p "$CONFIG_DIR"
-    echo 'LLMUX_TOOL=""' > "$CONFIG_FILE"
+    cat > "$CONFIG_FILE" <<'CONF'
+LLMUX_TOOL=""
+LLMUX_TOOL_ARGS=""
+CONF
     echo ""
     echo "Configured: no auto-launch (shell only)"
   elif [[ "$choice" -ge 1 && "$choice" -le ${#found_tools[@]} ]]; then
     local selected="${found_tools[$((choice - 1))]}"
-    mkdir -p "$CONFIG_DIR"
-    echo "LLMUX_TOOL=\"$selected\"" > "$CONFIG_FILE"
     echo ""
-    echo "Configured: $selected will launch in new panes"
+    local args=""
+    read -rp "Startup args for $selected (e.g. --dangerously-skip-permissions): " args
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<CONF
+LLMUX_TOOL="$selected"
+LLMUX_TOOL_ARGS="$args"
+CONF
+    echo ""
+    if [[ -n "$args" ]]; then
+      echo "Configured: $selected $args"
+    else
+      echo "Configured: $selected (no extra args)"
+    fi
   else
     echo "Invalid choice"
     exit 1
