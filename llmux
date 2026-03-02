@@ -270,9 +270,12 @@ cmd_setup() {
       claude) default_args="--dangerously-skip-permissions" ;;
     esac
     local args
-    echo ""
-    gum style --foreground 99 "Startup args for $tool (enter to skip)"
-    args=$(gum input --value "$default_args")
+    if [[ -n "$default_args" ]]; then
+      read -rp "Args for $tool [$default_args]: " args
+      [[ -z "$args" ]] && args="$default_args"
+    else
+      read -rp "Args for $tool (enter to skip): " args
+    fi
     local upper
     upper=$(echo "$tool" | tr '[:lower:]-' '[:upper:]_')
     echo "LLMUX_ARGS_${upper}=\"${args}\"" >> "$CONFIG_FILE"
@@ -496,8 +499,7 @@ cmd_resume() {
   local default_name="${selected_summary:0:40}"
   [[ -z "$default_name" ]] && default_name="$selected_id"
   local pane_name
-  gum style --foreground 99 "Pane name"
-  pane_name=$(gum input --value "$default_name")
+  read -rp "Pane name [$default_name]: " pane_name
   [[ -z "$pane_name" ]] && pane_name="$default_name"
 
   # Build resume command with per-tool args
