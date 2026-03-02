@@ -274,7 +274,7 @@ CONF
   echo ""
   for tool in "${found_tools[@]}"; do
     local args
-    args=$(gum input --placeholder "e.g. --dangerously-skip-permissions" --header "Startup args for $tool (enter to skip)")
+    args=$(gum input --header "Startup args for $tool (enter to skip)")
     local upper
     upper=$(echo "$tool" | tr '[:lower:]-' '[:upper:]_')
     echo "LLMUX_ARGS_${upper}=\"${args}\"" >> "$CONFIG_FILE"
