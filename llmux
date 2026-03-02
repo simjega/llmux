@@ -36,7 +36,8 @@ launch_tool() {
   local tool
   tool="$(get_tool)"
   if [[ -n "$tool" ]]; then
-    tmux send-keys -t "$pane_target" "$tool" Enter
+    # Unset env vars that cause nesting detection issues (e.g. Claude Code)
+    tmux send-keys -t "$pane_target" "unset CLAUDECODE CLAUDE_CODE_SESSION; $tool" Enter
   fi
 }
 
