@@ -12,12 +12,15 @@ chmod +x llmux
 # Symlink onto PATH (pick one)
 ln -sf "$(pwd)/llmux" ~/.local/bin/llmux    # if ~/.local/bin is on PATH
 ln -sf "$(pwd)/llmux" /usr/local/bin/llmux  # system-wide
+
+# Install dependencies (gum, tmux, python3) and configure your LLM tool
+llmux setup
 ```
 
 ## Quick start
 
 ```bash
-# 1. Configure your LLM tool
+# 1. Install deps & configure (only needed once)
 llmux setup
 
 # 2. Add sessions
@@ -32,7 +35,7 @@ llmux attach
 
 ### `llmux setup`
 
-Scans your machine for known LLM CLI tools (`amp`, `claude`, `aider`, `sgpt`, `llm`, `mods`, `ollama`), shows which ones are installed, and lets you pick a default. Also prompts for startup args (e.g. `--dangerously-skip-permissions` for Claude Code).
+Installs dependencies (`gum`, `tmux`, `python3`) via Homebrew if missing, then scans for LLM CLI tools (`amp`, `claude`, `aider`, `sgpt`, `llm`, `mods`, `ollama`) and lets you pick a default. Also prompts for startup args (e.g. `--dangerously-skip-permissions` for Claude Code).
 
 Config is saved to `~/.config/llmux/config`.
 

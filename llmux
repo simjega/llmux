@@ -16,7 +16,7 @@ Usage:
   llmux rm <name>                Remove pane by name
   llmux ls                       List active panes
   llmux attach                   Attach to the llmux session
-  llmux setup                    Detect LLM tools and pick a default
+  llmux setup                    Install deps + configure LLM tool
   llmux help                     Show this help
 
 Examples:
@@ -28,6 +28,18 @@ Examples:
   llmux grab "my-session" mysession:0.1             # grab specific pane
   llmux rm "auth-refactor"
 EOF
+}
+
+check_deps() {
+  local missing=()
+  for dep in gum tmux python3; do
+    command -v "$dep" &>/dev/null || missing+=("$dep")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Missing dependencies: ${missing[*]}"
+    echo "Run 'llmux setup' to install them."
+    exit 1
+  fi
 }
 
 get_tool_cmd() {
@@ -172,75 +184,72 @@ cmd_attach() {
 }
 
 cmd_setup() {
-  # Known LLM CLI tools to look for
+  # --- Install dependencies ---
+  local deps=(gum tmux python3)
+  local missing=()
+  for dep in "${deps[@]}"; do
+    command -v "$dep" &>/dev/null || missing+=("$dep")
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Installing missing dependencies: ${missing[*]}"
+    if command -v brew &>/dev/null; then
+      local brew_pkgs=()
+      for dep in "${missing[@]}"; do
+        case "$dep" in
+          python3) brew_pkgs+=("python") ;;
+          *)       brew_pkgs+=("$dep") ;;
+        esac
+      done
+      brew install "${brew_pkgs[@]}"
+    else
+      echo "Error: Homebrew not found. Install manually: ${missing[*]}"
+      exit 1
+    fi
+    echo ""
+  fi
+
+  echo "✓ All dependencies installed"
+  echo ""
+
+  # --- Configure LLM tool ---
   local known_tools=(amp claude aider sgpt llm mods ollama)
   local found_tools=()
 
-  echo "Scanning for LLM CLI tools..."
-  echo ""
-
   for tool in "${known_tools[@]}"; do
     if command -v "$tool" &>/dev/null; then
-      local tool_path
-      tool_path="$(command -v "$tool")"
       found_tools+=("$tool")
-      echo "  ✓ $tool ($tool_path)"
     fi
   done
 
   if [[ ${#found_tools[@]} -eq 0 ]]; then
-    echo "  No known LLM tools found on PATH."
-    echo ""
-    echo "You can manually set a tool:"
-    echo "  mkdir -p '$CONFIG_DIR' && echo 'LLMUX_TOOL=\"your-command\"' > '$CONFIG_FILE'"
+    echo "No known LLM tools found on PATH."
+    echo "Set manually: mkdir -p '$CONFIG_DIR' && echo 'LLMUX_TOOL=\"cmd\"' > '$CONFIG_FILE'"
     exit 0
   fi
 
-  echo ""
-  echo "Select a default tool to launch in new panes:"
-  echo ""
-  local i=1
-  for tool in "${found_tools[@]}"; do
-    echo "  $i) $tool"
-    ((i++))
-  done
-  echo "  0) none (just open a shell)"
-  echo ""
+  local selected
+  selected=$(printf '%s\n' "(none)" "${found_tools[@]}" | gum choose --header "Select default LLM tool")
+  [[ "$selected" == "(none)" ]] && selected=""
 
-  local choice
-  read -rp "Choice [1]: " choice
-  choice="${choice:-1}"
+  local args=""
+  if [[ -n "$selected" ]]; then
+    args=$(gum input --placeholder "e.g. --dangerously-skip-permissions" --header "Startup args for $selected (enter to skip)")
+  fi
 
-  if [[ "$choice" == "0" ]]; then
-    mkdir -p "$CONFIG_DIR"
-    cat > "$CONFIG_FILE" <<'CONF'
-LLMUX_TOOL=""
-LLMUX_TOOL_ARGS=""
-CONF
-    echo ""
-    echo "Configured: no auto-launch (shell only)"
-  elif [[ "$choice" -ge 1 && "$choice" -le ${#found_tools[@]} ]]; then
-    local selected="${found_tools[$((choice - 1))]}"
-    echo ""
-    local args=""
-    read -rp "Startup args for $selected (e.g. --dangerously-skip-permissions): " args
-    mkdir -p "$CONFIG_DIR"
-    cat > "$CONFIG_FILE" <<CONF
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_FILE" <<CONF
 LLMUX_TOOL="$selected"
 LLMUX_TOOL_ARGS="$args"
 CONF
-    echo ""
-    if [[ -n "$args" ]]; then
-      echo "Configured: $selected $args"
-    else
-      echo "Configured: $selected (no extra args)"
-    fi
-  else
-    echo "Invalid choice"
-    exit 1
-  fi
 
-  echo "Config saved to $CONFIG_FILE"
+  echo ""
+  if [[ -n "$selected" ]]; then
+    echo "✓ Configured: $selected${args:+ $args}"
+  else
+    echo "✓ Configured: no auto-launch (shell only)"
+  fi
+  echo "  Saved to $CONFIG_FILE"
 }
 
 harvest_claude_sessions() {
@@ -305,7 +314,6 @@ harvest_amp_sessions() {
 cmd_resume() {
   local custom_name="${1:-}"
 
-  # Determine configured tool
   local tool=""
   if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
@@ -317,66 +325,67 @@ cmd_resume() {
     exit 1
   fi
 
-  # Harvest sessions based on tool
-  local sessions=()
-  local session_ids=()
-  local session_dirs=()
-  local idx=1
-
-  echo "Fetching past $tool sessions..."
-  echo ""
+  # Harvest sessions into parallel arrays
+  local raw_lines=()
+  local display_lines=()
 
   case "$tool" in
     claude)
       while IFS='|' read -r sid dir ts summary; do
         [[ -z "$sid" ]] && continue
-        sessions+=("$sid|$dir|$ts|$summary")
-        session_ids+=("$sid")
-        session_dirs+=("$dir")
-        printf "  %2d) [%s] %s\n" "$idx" "$ts" "$summary"
-        printf "      %s @ %s\n" "$sid" "$dir"
-        ((idx++))
+        raw_lines+=("$sid|$dir|$ts|$summary")
+        # Clean display: short dir, truncated summary
+        local short_dir="${dir/#$HOME/~}"
+        display_lines+=("$(printf '%-16s  %-50s  %s' "$ts" "${summary:0:50}" "$short_dir")")
       done < <(harvest_claude_sessions)
       ;;
     amp)
       while IFS='|' read -r sid dir ts summary; do
         [[ -z "$sid" ]] && continue
-        sessions+=("$sid|$dir|$ts|$summary")
-        session_ids+=("$sid")
-        session_dirs+=("$dir")
-        printf "  %2d) [%s] %s\n" "$idx" "${ts:-?}" "$summary"
-        printf "      %s\n" "$sid"
-        ((idx++))
+        raw_lines+=("$sid|$dir|$ts|$summary")
+        local short_dir="${dir/#$HOME/~}"
+        display_lines+=("$(printf '%-16s  %-50s  %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
       done < <(harvest_amp_sessions)
       ;;
     *)
-      echo "Resume not supported for '$tool' yet."
-      echo "Supported: claude, amp"
+      echo "Resume not supported for '$tool'. Supported: claude, amp"
       exit 1
       ;;
   esac
 
-  if [[ ${#sessions[@]} -eq 0 ]]; then
-    echo "  No past sessions found."
+  if [[ ${#raw_lines[@]} -eq 0 ]]; then
+    echo "No past sessions found."
     exit 0
   fi
 
-  echo ""
-  local choice
-  read -rp "Select session to resume [1]: " choice
-  choice="${choice:-1}"
+  # Pick a session
+  local selected_line
+  selected_line=$(printf '%s\n' "${display_lines[@]}" | gum filter --height 20 --header "Resume a $tool session" --placeholder "Type to search...")
 
-  if [[ "$choice" -lt 1 || "$choice" -gt ${#sessions[@]} ]]; then
-    echo "Invalid choice"
+  [[ -z "$selected_line" ]] && exit 0
+
+  # Find the matching raw line
+  local match_idx=-1
+  for i in "${!display_lines[@]}"; do
+    if [[ "${display_lines[$i]}" == "$selected_line" ]]; then
+      match_idx=$i
+      break
+    fi
+  done
+
+  if [[ "$match_idx" -lt 0 ]]; then
+    echo "Error: could not match selection"
     exit 1
   fi
 
-  local selected_id="${session_ids[$((choice - 1))]}"
-  local selected_dir="${session_dirs[$((choice - 1))]}"
+  local selected_id selected_dir selected_summary
+  selected_id=$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f1)
+  selected_dir=$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f2)
+  selected_summary=$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f4)
 
-  # Build the resume command
-  local resume_cmd=""
+  # Build resume command
   local tool_args="${LLMUX_TOOL_ARGS:-}"
+  local resume_cmd=""
   case "$tool" in
     claude) resume_cmd="$tool${tool_args:+ $tool_args} --resume $selected_id" ;;
     amp)    resume_cmd="$tool${tool_args:+ $tool_args} --continue $selected_id" ;;
@@ -385,14 +394,11 @@ cmd_resume() {
   # Derive pane name
   local pane_name="$custom_name"
   if [[ -z "$pane_name" ]]; then
-    # Use the summary as the pane name, truncated
-    local summary
-    summary=$(echo "${sessions[$((choice - 1))]}" | cut -d'|' -f4)
-    pane_name="${summary:0:40}"
+    pane_name="${selected_summary:0:40}"
     [[ -z "$pane_name" ]] && pane_name="$selected_id"
   fi
 
-  # Create the pane (reuse add logic but with custom launch)
+  # Create the pane and launch
   ensure_session
 
   local pane_count
@@ -406,7 +412,7 @@ cmd_resume() {
       tmux select-pane -t "$SESSION" -T "$pane_name"
       tmux send-keys -t "$SESSION" "clear" Enter
       tmux send-keys -t "$SESSION" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
-      echo "Resuming '$selected_id' as '$pane_name'"
+      echo "✓ Resuming as '$pane_name'"
       return
     fi
   fi
@@ -415,7 +421,7 @@ cmd_resume() {
   tmux select-pane -t "$SESSION" -T "$pane_name"
   tmux select-layout -t "$SESSION" tiled
   tmux send-keys -t "$SESSION" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
-  echo "Resuming '$selected_id' as '$pane_name'"
+  echo "✓ Resuming as '$pane_name'"
 }
 
 cmd_grab() {
@@ -494,6 +500,12 @@ cmd_grab() {
 # --- Main ---
 command="${1:-help}"
 shift || true
+
+# setup and help don't need deps; everything else does
+case "$command" in
+  setup|help) ;;
+  *)          check_deps ;;
+esac
 
 case "$command" in
   add)    cmd_add "$@" ;;
