@@ -260,18 +260,10 @@ cmd_setup() {
     exit 0
   fi
 
-  # --- Pick default tool ---
-  local selected
-  selected=$(printf '%s\n' "(none)" "${found_tools[@]}" | gum choose --header "Select DEFAULT LLM tool")
-  [[ "$selected" == "(none)" ]] && selected=""
-
   # --- Configure args for each found tool ---
   mkdir -p "$CONFIG_DIR"
-  cat > "$CONFIG_FILE" <<CONF
-LLMUX_TOOL="$selected"
-CONF
+  : > "$CONFIG_FILE"
 
-  echo ""
   for tool in "${found_tools[@]}"; do
     local args
     args=$(gum input --header "Startup args for $tool (enter to skip)")
@@ -284,6 +276,19 @@ CONF
       echo "  $tool: (no args)"
     fi
   done
+
+  # --- Pick default tool ---
+  echo ""
+  local selected
+  selected=$(printf '%s\n' "(none)" "${found_tools[@]}" | gum choose --header "Select DEFAULT LLM tool")
+  [[ "$selected" == "(none)" ]] && selected=""
+
+  # Write default at the top of config
+  local tmp
+  tmp=$(mktemp)
+  echo "LLMUX_TOOL=\"$selected\"" > "$tmp"
+  cat "$CONFIG_FILE" >> "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
 
   echo ""
   if [[ -n "$selected" ]]; then
