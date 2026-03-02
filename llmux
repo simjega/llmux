@@ -11,6 +11,7 @@ llmux — multiplex LLM sessions in tmux
 
 Usage:
   llmux add <name> [directory]   Add a new pane titled <name> (default dir: cwd)
+  llmux grab <name> [pane]       Move an existing tmux pane into llmux
   llmux rm <name>                Remove pane by name
   llmux ls                       List active panes
   llmux attach                   Attach to the llmux session
@@ -20,6 +21,8 @@ Usage:
 Examples:
   llmux add "auth-refactor" ~/code/myproject
   llmux add "bug-investigation"
+  llmux grab "ongoing-debug"                  # grab current pane
+  llmux grab "my-session" mysession:0.1       # grab specific pane
   llmux rm "auth-refactor"
 EOF
 }
@@ -237,12 +240,86 @@ CONF
   echo "Config saved to $CONFIG_FILE"
 }
 
+cmd_grab() {
+  local name="${1:?Usage: llmux grab <name> [source-pane]}"
+  local source="${2:-}"
+
+  ensure_session
+
+  # Check if a pane with this name already exists
+  if tmux list-panes -t "$SESSION" -F '#{pane_title}' 2>/dev/null | grep -qxF "$name"; then
+    echo "Error: pane '$name' already exists"
+    exit 1
+  fi
+
+  # If no source given, show available panes to pick from
+  if [[ -z "$source" ]]; then
+    echo "Available tmux panes (excluding llmux):"
+    echo ""
+    local panes=()
+    local idx=1
+    while IFS= read -r line; do
+      local pane_target pane_title pane_cmd pane_path
+      pane_target=$(echo "$line" | cut -d'|' -f1)
+      pane_title=$(echo "$line" | cut -d'|' -f2)
+      pane_cmd=$(echo "$line" | cut -d'|' -f3)
+      pane_path=$(echo "$line" | cut -d'|' -f4)
+      # Skip panes in the llmux session
+      [[ "$pane_target" == "$SESSION:"* ]] && continue
+      panes+=("$pane_target")
+      printf "  %d) %s  [%s]  (%s)\n" "$idx" "$pane_target" "$pane_cmd" "$pane_path"
+      ((idx++))
+    done < <(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}|#{pane_title}|#{pane_current_command}|#{pane_current_path}')
+
+    if [[ ${#panes[@]} -eq 0 ]]; then
+      echo "  No other panes found."
+      exit 0
+    fi
+
+    echo ""
+    local choice
+    read -rp "Select pane to grab [1]: " choice
+    choice="${choice:-1}"
+    if [[ "$choice" -lt 1 || "$choice" -gt ${#panes[@]} ]]; then
+      echo "Invalid choice"
+      exit 1
+    fi
+    source="${panes[$((choice - 1))]}"
+  fi
+
+  # Check if the llmux session has only the default empty pane
+  local pane_count
+  pane_count=$(tmux list-panes -t "$SESSION" 2>/dev/null | wc -l | tr -d ' ')
+
+  if [[ "$pane_count" -eq 1 ]]; then
+    local first_title
+    first_title=$(tmux list-panes -t "$SESSION" -F '#{pane_title}' | head -1)
+    if [[ -z "$first_title" || "$first_title" == "bash" || "$first_title" == "zsh" ]]; then
+      # Swap the empty initial pane with the source
+      local empty_pane
+      empty_pane=$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | head -1)
+      tmux join-pane -s "$source" -t "$SESSION"
+      tmux kill-pane -t "$empty_pane"
+      tmux select-pane -t "$SESSION" -T "$name"
+      echo "Grabbed pane '$source' as '$name'"
+      return
+    fi
+  fi
+
+  # Join the source pane into llmux
+  tmux join-pane -s "$source" -t "$SESSION"
+  tmux select-pane -t "$SESSION" -T "$name"
+  tmux select-layout -t "$SESSION" tiled
+  echo "Grabbed pane '$source' as '$name'"
+}
+
 # --- Main ---
 command="${1:-help}"
 shift || true
 
 case "$command" in
   add)    cmd_add "$@" ;;
+  grab)   cmd_grab "$@" ;;
   rm)     cmd_rm "$@" ;;
   ls)     cmd_ls "$@" ;;
   attach) cmd_attach "$@" ;;
