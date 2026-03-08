@@ -13,7 +13,8 @@ Usage:
   llmux add <name> [directory] [--tool <tool>]  Add a new pane (default tool from config)
   llmux resume [--tool <tool>]                  Pick a past session to resume
   llmux grab <name> [pane]                      Move an existing tmux pane into llmux
-  llmux rm <name>                               Remove pane by name
+  llmux rm [name]                               Remove pane by name (or pick)
+  llmux kill                                    Kill the entire llmux session
   llmux ls                                      List active panes
   llmux attach                                  Attach to the llmux session
   llmux refresh                                  Recreate session, drop idle panes
@@ -42,7 +43,7 @@ check_deps() {
   fi
 }
 
-KNOWN_TOOLS=(amp claude aider sgpt llm mods ollama)
+KNOWN_TOOLS=(amp claude codex aider sgpt llm mods ollama)
 
 load_config() {
   LLMUX_TOOL=""
@@ -76,6 +77,7 @@ build_tool_cmd() {
 launch_tool_in_pane() {
   local pane_target="$1"
   local tool="${2:-}"
+  local session_name="${3:-}"
 
   if [[ -z "$tool" ]]; then
     load_config
@@ -83,10 +85,46 @@ launch_tool_in_pane() {
   fi
 
   if [[ -n "$tool" ]]; then
+    tmux set-option -p -t "$pane_target" @llmux_tool "$tool"
     local tool_cmd
     tool_cmd="$(build_tool_cmd "$tool")"
-    tmux send-keys -t "$pane_target" "unset CLAUDECODE CLAUDE_CODE_SESSION; $tool_cmd" Enter
+    local launch_cmd="unset CLAUDECODE CLAUDE_CODE_SESSION; "
+    if [[ -n "$session_name" && "$tool" == "amp" ]]; then
+      local args
+      args="$(get_tool_args "$tool")"
+      launch_cmd+="THREAD_ID=\$(amp threads new --no-color 2>/dev/null) && amp threads rename \"\$THREAD_ID\" $(printf '%q' "$session_name") 2>/dev/null; amp${args:+ $args} threads continue \"\$THREAD_ID\""
+    else
+      launch_cmd+="$tool_cmd"
+    fi
+    tmux send-keys -t "$pane_target" "$launch_cmd" Enter
+    if [[ -n "$session_name" && "$tool" == "claude" ]]; then
+      # Wait for Claude to start, then send /rename
+      (sleep 3 && tmux send-keys -t "$pane_target" "/rename $(printf '%q' "$session_name")" Enter) &
+      disown
+    fi
   fi
+}
+
+resume_tool_in_pane() {
+  local pane_target="$1"
+  local tool="$2"
+
+  local tool_cmd
+  tool_cmd="$(build_tool_cmd "$tool")"
+  local resume_cmd="unset CLAUDECODE CLAUDE_CODE_SESSION; "
+  case "$tool" in
+    claude) resume_cmd+="$tool_cmd --continue" ;;
+    codex)  resume_cmd+="$tool_cmd resume --last" ;;
+    amp)    resume_cmd+="$tool_cmd" ;;
+    *)      resume_cmd+="$tool_cmd" ;;
+  esac
+  tmux set-option -p -t "$pane_target" @llmux_tool "$tool"
+  tmux send-keys -t "$pane_target" "$resume_cmd" Enter
+}
+
+is_default_title() {
+  local title="$1"
+  [[ -z "$title" || "$title" == "bash" || "$title" == "zsh" || "$title" == "$(hostname)" || "$title" == "$(hostname -s 2>/dev/null)" ]]
 }
 
 ensure_session() {
@@ -94,13 +132,76 @@ ensure_session() {
     tmux new-session -d -s "$SESSION" -x - -y -
     # Enable pane titles in the border
     tmux set-option -t "$SESSION" pane-border-status top
-    tmux set-option -t "$SESSION" pane-border-format ' #{pane_title} [#{pane_current_path}] '
+    tmux set-option -t "$SESSION" pane-border-format ' #{?#{@llmux_name},#{@llmux_name},#{pane_title}} [#{pane_current_path}] '
     # Style the borders for clarity
     tmux set-option -t "$SESSION" pane-border-style 'fg=colour240'
     tmux set-option -t "$SESSION" pane-active-border-style 'fg=colour39,bold'
-    # Enable mouse for scrolling and pane selection
+    # Enable mouse for scrolling and pane selection (toggle with prefix + m)
     tmux set-option -t "$SESSION" mouse on
+    tmux bind-key -T prefix m set-option mouse
+    tmux set-option -t "$SESSION" status-right "#{?mouse, [mouse] ,} %H:%M "
+    # Allow mouse wheel to scroll in non-alternate-screen panes (plain shells)
+    tmux set-option -t "$SESSION" terminal-overrides 'xterm*:smcup@:rmcup@'
+    # Copy mouse selections to system clipboard
+    tmux set-option -s copy-command "pbcopy"
+    # Mark the initial pane as the dedicated terminal (left vertical slice)
+    tmux set-option -p -t "$SESSION" @llmux_terminal "1"
+    tmux set-option -p -t "$SESSION" @llmux_name "terminal"
+    tmux select-pane -t "$SESSION" -T "terminal"
     INITIAL_PANE=1
+  fi
+}
+
+# Get the pane_id of the dedicated terminal pane
+get_terminal_pane() {
+  tmux list-panes -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}' 2>/dev/null \
+    | grep '|1$' | head -1 | cut -d'|' -f1
+}
+
+# Re-layout: terminal pane as left vertical slice, LLM panes tiled on the right.
+# Uses a main-vertical-style layout with the terminal pane on the left occupying
+# ~30% of the window width.
+apply_layout() {
+  local term_pane
+  term_pane=$(get_terminal_pane)
+  [[ -z "$term_pane" ]] && return
+
+  local pane_count
+  pane_count=$(tmux list-panes -t "$SESSION" 2>/dev/null | wc -l | tr -d ' ')
+
+  if [[ "$pane_count" -le 1 ]]; then
+    return
+  fi
+
+  # Ensure terminal pane is first (index 0) so main-vertical puts it on the left
+  local first_pane
+  first_pane=$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | head -1)
+  if [[ "$first_pane" != "$term_pane" ]]; then
+    tmux swap-pane -s "$term_pane" -t "$first_pane"
+  fi
+
+  # Use main-vertical layout: left pane is the "main" pane, right side is tiled
+  local win_width
+  win_width=$(tmux display-message -t "$SESSION" -p '#{window_width}')
+  local main_width=$(( win_width * 30 / 100 ))
+  [[ "$main_width" -lt 40 ]] && main_width=40
+  tmux set-option -t "$SESSION" main-pane-width "$main_width"
+  tmux select-layout -t "$SESSION" main-vertical
+}
+
+attach_to_pane() {
+  local name="$1"
+  # Select the pane by llmux name
+  local pane_id
+  pane_id=$(tmux list-panes -t "$SESSION" -F '#{pane_id}|#{@llmux_name}' | grep "|${name}$" | head -1 | cut -d'|' -f1)
+  if [[ -n "$pane_id" ]]; then
+    tmux select-pane -t "$pane_id"
+  fi
+  # Attach or switch
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "$SESSION"
+  else
+    tmux attach-session -t "$SESSION"
   fi
 }
 
@@ -128,53 +229,77 @@ cmd_add() {
 
   ensure_session
 
-  if tmux list-panes -t "$SESSION" -F '#{pane_title}' 2>/dev/null | grep -qxF "$name"; then
+  if tmux list-panes -t "$SESSION" -F '#{@llmux_name}' 2>/dev/null | grep -qxF "$name"; then
     echo "Error: pane '$name' already exists"
     exit 1
   fi
 
-  local pane_count
-  pane_count=$(tmux list-panes -t "$SESSION" 2>/dev/null | wc -l | tr -d ' ')
-
-  if [[ "$pane_count" -eq 1 ]]; then
-    local first_title
-    first_title=$(tmux list-panes -t "$SESSION" -F '#{pane_title}' | head -1)
-    if [[ -z "$first_title" || "$first_title" == "bash" || "$first_title" == "zsh" ]]; then
-      tmux send-keys -t "$SESSION" "cd '$dir'" Enter
-      tmux select-pane -t "$SESSION" -T "$name"
-      tmux send-keys -t "$SESSION" "clear" Enter
-      launch_tool_in_pane "$SESSION" "$tool_override"
-      echo "Created pane '$name' in $dir"
-      return
-    fi
-  fi
-
-  tmux split-window -t "$SESSION" -c "$dir"
+  # Always split a new pane for the LLM tool (terminal pane stays on the left)
+  tmux split-window -t "$SESSION" -h -c "$dir"
   tmux select-pane -t "$SESSION" -T "$name"
-  tmux select-layout -t "$SESSION" tiled
-  launch_tool_in_pane "$SESSION" "$tool_override"
+  tmux set-option -p -t "$SESSION" @llmux_name "$name"
+  apply_layout
+  launch_tool_in_pane "$SESSION" "$tool_override" "$name"
   echo "Created pane '$name' in $dir"
+  attach_to_pane "$name"
 }
 
 cmd_rm() {
-  local name="${1:?Usage: llmux rm <name>}"
+  local name="${1:-}"
 
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "Error: no llmux session running"
     exit 1
   fi
 
-  # Find the pane with this title
+  # If no name given, show a picker (exclude the terminal pane)
+  if [[ -z "$name" ]]; then
+    local names=()
+    while IFS= read -r line; do
+      local n is_term
+      n=$(echo "$line" | cut -d'|' -f1)
+      is_term=$(echo "$line" | cut -d'|' -f2)
+      [[ -z "$n" ]] && continue
+      [[ "$is_term" == "1" ]] && continue
+      names+=("$n")
+    done < <(tmux list-panes -t "$SESSION" -F '#{@llmux_name}|#{@llmux_terminal}')
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+      echo "No named panes to remove."
+      exit 0
+    fi
+
+    name=$(printf '%s\n' "${names[@]}" | gum filter \
+      --header "Remove which pane?" \
+      --indicator "▸" \
+      --indicator.foreground "212" \
+      --match.foreground "212" \
+      --header.foreground "99" \
+      --prompt.foreground "39")
+    [[ -z "$name" ]] && exit 0
+  fi
+
+  # Prevent removing the terminal pane
+  if [[ "$name" == "terminal" ]]; then
+    local term_pane
+    term_pane=$(get_terminal_pane)
+    if [[ -n "$term_pane" ]]; then
+      echo "Error: cannot remove the terminal pane"
+      exit 1
+    fi
+  fi
+
+  # Find the pane with this llmux name
   local target_pane=""
   while IFS= read -r line; do
-    local pane_id pane_title
+    local pane_id pane_name
     pane_id=$(echo "$line" | cut -d'|' -f1)
-    pane_title=$(echo "$line" | cut -d'|' -f2)
-    if [[ "$pane_title" == "$name" ]]; then
+    pane_name=$(echo "$line" | cut -d'|' -f2)
+    if [[ "$pane_name" == "$name" ]]; then
       target_pane="$pane_id"
       break
     fi
-  done < <(tmux list-panes -t "$SESSION" -F '#{pane_id}|#{pane_title}')
+  done < <(tmux list-panes -t "$SESSION" -F '#{pane_id}|#{@llmux_name}')
 
   if [[ -z "$target_pane" ]]; then
     echo "Error: no pane named '$name'"
@@ -184,13 +309,13 @@ cmd_rm() {
   local pane_count
   pane_count=$(tmux list-panes -t "$SESSION" | wc -l | tr -d ' ')
 
-  if [[ "$pane_count" -eq 1 ]]; then
-    # Last pane — kill the whole session
-    tmux kill-session -t "$SESSION"
-    echo "Removed pane '$name' (session ended)"
+  if [[ "$pane_count" -le 2 ]]; then
+    # Only terminal + this pane left — kill just the LLM pane, keep terminal
+    tmux kill-pane -t "$target_pane"
+    echo "Removed pane '$name'"
   else
     tmux kill-pane -t "$target_pane"
-    tmux select-layout -t "$SESSION" tiled
+    apply_layout
     echo "Removed pane '$name'"
   fi
 }
@@ -201,16 +326,20 @@ cmd_ls() {
     exit 0
   fi
 
-  printf "%-4s  %-30s  %s\n" "IDX" "NAME" "DIRECTORY"
-  printf "%-4s  %-30s  %s\n" "---" "----" "---------"
+  printf "%-4s  %-30s  %-6s  %s\n" "IDX" "NAME" "TYPE" "DIRECTORY"
+  printf "%-4s  %-30s  %-6s  %s\n" "---" "----" "----" "---------"
   local idx=0
   while IFS= read -r line; do
-    local pane_title pane_path
-    pane_title=$(echo "$line" | cut -d'|' -f1)
+    local pane_name pane_path is_term pane_type
+    pane_name=$(echo "$line" | cut -d'|' -f1)
     pane_path=$(echo "$line" | cut -d'|' -f2)
-    printf "%-4s  %-30s  %s\n" "$idx" "$pane_title" "$pane_path"
+    is_term=$(echo "$line" | cut -d'|' -f3)
+    [[ -z "$pane_name" ]] && pane_name="(unnamed)"
+    pane_type="llm"
+    [[ "$is_term" == "1" ]] && pane_type="term"
+    printf "%-4s  %-30s  %-6s  %s\n" "$idx" "$pane_name" "$pane_type" "$pane_path"
     ((idx++))
-  done < <(tmux list-panes -t "$SESSION" -F '#{pane_title}|#{pane_current_path}')
+  done < <(tmux list-panes -t "$SESSION" -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_terminal}')
 }
 
 cmd_attach() {
@@ -270,6 +399,7 @@ cmd_setup() {
     local default_args=""
     case "$tool" in
       claude) default_args="--dangerously-skip-permissions" ;;
+      codex)  default_args="--full-auto" ;;
     esac
     local args
     if [[ -n "$default_args" ]]; then
@@ -400,6 +530,27 @@ harvest_amp_sessions() {
   done
 }
 
+harvest_codex_sessions() {
+  local db="$HOME/.codex/state_5.sqlite"
+  [[ -f "$db" ]] || return
+  sqlite3 -separator '|' "$db" \
+    "SELECT id, cwd, updated_at, REPLACE(SUBSTR(title, 1, 80), CHAR(10), ' ')
+     FROM threads WHERE archived = 0
+     ORDER BY updated_at DESC LIMIT 50" 2>/dev/null | while IFS='|' read -r sid cwd ts title; do
+    [[ -z "$sid" ]] && continue
+    local rel_ts
+    rel_ts=$(python3 -c "
+import time
+diff = int(time.time()) - int('$ts')
+if diff < 60: print(f'{diff}s ago')
+elif diff < 3600: print(f'{diff//60}m ago')
+elif diff < 86400: print(f'{diff//3600}h ago')
+else: print(f'{diff//86400}d ago')
+" 2>/dev/null)
+    echo "${sid}|${cwd}|${rel_ts:-unknown}|${title}"
+  done
+}
+
 cmd_resume() {
   local tool_override=""
 
@@ -417,12 +568,12 @@ cmd_resume() {
     load_config
     # Find all resumable tools on the system
     local resumable=()
-    for t in claude amp; do
+    for t in claude amp codex; do
       command -v "$t" &>/dev/null && resumable+=("$t")
     done
 
     if [[ ${#resumable[@]} -eq 0 ]]; then
-      echo "No resumable tools found (need claude or amp)."
+      echo "No resumable tools found (need claude, amp, or codex)."
       exit 1
     elif [[ ${#resumable[@]} -eq 1 ]]; then
       tool="${resumable[0]}"
@@ -453,8 +604,16 @@ cmd_resume() {
         display_lines+=("$(printf '%-10s │ %-50s │ %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
       done < <(harvest_amp_sessions)
       ;;
+    codex)
+      while IFS='|' read -r sid dir ts summary; do
+        [[ -z "$sid" ]] && continue
+        raw_lines+=("$sid|$dir|$ts|$summary")
+        local short_dir="${dir/#$HOME/~}"
+        display_lines+=("$(printf '%-10s │ %-50s │ %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
+      done < <(harvest_codex_sessions)
+      ;;
     *)
-      echo "Resume not supported for '$tool'. Supported: claude, amp"
+      echo "Resume not supported for '$tool'. Supported: claude, amp, codex"
       exit 1
       ;;
   esac
@@ -511,30 +670,16 @@ cmd_resume() {
   case "$tool" in
     claude) resume_cmd="$tool_cmd --resume $selected_id" ;;
     amp)    resume_cmd="$tool_cmd threads continue $selected_id" ;;
+    codex)  resume_cmd="$tool_cmd resume $selected_id" ;;
   esac
 
   # Create the pane and launch
   ensure_session
 
-  local pane_count
-  pane_count=$(tmux list-panes -t "$SESSION" 2>/dev/null | wc -l | tr -d ' ')
-
-  if [[ "$pane_count" -eq 1 ]]; then
-    local first_title
-    first_title=$(tmux list-panes -t "$SESSION" -F '#{pane_title}' | head -1)
-    if [[ -z "$first_title" || "$first_title" == "bash" || "$first_title" == "zsh" ]]; then
-      tmux send-keys -t "$SESSION" "cd '$selected_dir'" Enter
-      tmux select-pane -t "$SESSION" -T "$pane_name"
-      tmux send-keys -t "$SESSION" "clear" Enter
-      tmux send-keys -t "$SESSION" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
-      echo "✓ Resuming as '$pane_name'"
-      return
-    fi
-  fi
-
-  tmux split-window -t "$SESSION" -c "$selected_dir"
+  tmux split-window -t "$SESSION" -h -c "$selected_dir"
   tmux select-pane -t "$SESSION" -T "$pane_name"
-  tmux select-layout -t "$SESSION" tiled
+  tmux set-option -p -t "$SESSION" @llmux_name "$pane_name"
+  apply_layout
   tmux send-keys -t "$SESSION" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
   echo "✓ Resuming as '$pane_name'"
 }
@@ -546,7 +691,7 @@ cmd_grab() {
   ensure_session
 
   # Check if a pane with this name already exists
-  if tmux list-panes -t "$SESSION" -F '#{pane_title}' 2>/dev/null | grep -qxF "$name"; then
+  if tmux list-panes -t "$SESSION" -F '#{@llmux_name}' 2>/dev/null | grep -qxF "$name"; then
     echo "Error: pane '$name' already exists"
     exit 1
   fi
@@ -586,30 +731,21 @@ cmd_grab() {
     source="${panes[$((choice - 1))]}"
   fi
 
-  # Check if the llmux session has only the default empty pane
-  local pane_count
-  pane_count=$(tmux list-panes -t "$SESSION" 2>/dev/null | wc -l | tr -d ' ')
-
-  if [[ "$pane_count" -eq 1 ]]; then
-    local first_title
-    first_title=$(tmux list-panes -t "$SESSION" -F '#{pane_title}' | head -1)
-    if [[ -z "$first_title" || "$first_title" == "bash" || "$first_title" == "zsh" ]]; then
-      # Swap the empty initial pane with the source
-      local empty_pane
-      empty_pane=$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | head -1)
-      tmux join-pane -s "$source" -t "$SESSION"
-      tmux kill-pane -t "$empty_pane"
-      tmux select-pane -t "$SESSION" -T "$name"
-      echo "Grabbed pane '$source' as '$name'"
-      return
-    fi
-  fi
-
-  # Join the source pane into llmux
-  tmux join-pane -s "$source" -t "$SESSION"
+  # Join the source pane into llmux (terminal pane stays on the left)
+  tmux join-pane -s "$source" -t "$SESSION" -h
   tmux select-pane -t "$SESSION" -T "$name"
-  tmux select-layout -t "$SESSION" tiled
+  tmux set-option -p -t "$SESSION" @llmux_name "$name"
+  apply_layout
   echo "Grabbed pane '$source' as '$name'"
+}
+
+cmd_kill() {
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "No llmux session running"
+    exit 0
+  fi
+  tmux kill-session -t "$SESSION"
+  echo "Killed llmux session"
 }
 
 cmd_refresh() {
@@ -618,45 +754,64 @@ cmd_refresh() {
     exit 0
   fi
 
-  # Snapshot current panes: title, directory, running command
+  # Snapshot current panes: llmux name, directory, tool, terminal flag
   local pane_data=()
-  while IFS='|' read -r title dir cmd; do
-    pane_data+=("$title|$dir|$cmd")
-  done < <(tmux list-panes -t "$SESSION" -F '#{pane_title}|#{pane_current_path}|#{pane_current_command}')
+  while IFS='|' read -r name dir tool is_term; do
+    pane_data+=("$name|$dir|$tool|$is_term")
+  done < <(tmux list-panes -t "$SESSION" -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_terminal}')
 
   # Kill the old session
   tmux kill-session -t "$SESSION"
 
-  # Filter to panes that were running an LLM tool (not just a shell)
+  # Filter to named non-terminal panes only
   local active=()
   local skipped=()
   for entry in "${pane_data[@]}"; do
-    local title dir cmd
-    title=$(echo "$entry" | cut -d'|' -f1)
+    local name dir tool is_term
+    name=$(echo "$entry" | cut -d'|' -f1)
     dir=$(echo "$entry" | cut -d'|' -f2)
-    cmd=$(echo "$entry" | cut -d'|' -f3)
+    tool=$(echo "$entry" | cut -d'|' -f3)
+    is_term=$(echo "$entry" | cut -d'|' -f4)
 
-    # Skip default/unnamed shell panes
-    if [[ "$title" == "bash" || "$title" == "zsh" || -z "$title" ]]; then
+    # Skip the terminal pane — it will be recreated by ensure_session
+    [[ "$is_term" == "1" ]] && continue
+
+    if [[ -z "$name" ]]; then
       skipped+=("(unnamed shell in $dir)")
       continue
     fi
 
-    active+=("$title|$dir")
+    active+=("$name|$dir|$tool")
   done
+
+  # Recreate session (this creates the terminal pane)
+  ensure_session
 
   if [[ ${#active[@]} -eq 0 ]]; then
     echo "No named panes to restore."
     return
   fi
 
-  # Recreate each pane
+  # Recreate each LLM pane on the right side
   for entry in "${active[@]}"; do
-    local title dir
-    title=$(echo "$entry" | cut -d'|' -f1)
+    local name dir tool
+    name=$(echo "$entry" | cut -d'|' -f1)
     dir=$(echo "$entry" | cut -d'|' -f2)
-    cmd_add "$title" "$dir"
+    tool=$(echo "$entry" | cut -d'|' -f3)
+
+    tmux split-window -t "$SESSION" -h -c "$dir"
+    tmux select-pane -t "$SESSION" -T "$name"
+    tmux set-option -p -t "$SESSION" @llmux_name "$name"
+    if [[ -z "$tool" ]]; then
+      load_config
+      tool="${LLMUX_TOOL:-}"
+    fi
+    if [[ -n "$tool" ]]; then
+      resume_tool_in_pane "$SESSION" "$tool"
+    fi
   done
+
+  apply_layout
 
   echo ""
   echo "✓ Restored ${#active[@]} pane(s)"
@@ -686,6 +841,7 @@ case "$command" in
   ls)      cmd_ls "$@" ;;
   attach)  cmd_attach "$@" ;;
   refresh) cmd_refresh "$@" ;;
+  kill)    cmd_kill "$@" ;;
   setup)   cmd_setup "$@" ;;
   help)   usage ;;
   *)      echo "Unknown command: $command"; usage; exit 1 ;;
