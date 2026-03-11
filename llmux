@@ -148,6 +148,8 @@ ensure_session() {
     tmux set-option -p -t "$SESSION" @llmux_terminal "1"
     tmux set-option -p -t "$SESSION" @llmux_name "terminal"
     tmux select-pane -t "$SESSION" -T "terminal"
+    # Auto re-layout when a pane exits (e.g. user exits a tool manually)
+    tmux set-hook -t "$SESSION" pane-exited "select-layout main-horizontal"
     INITIAL_PANE=1
   fi
 }
