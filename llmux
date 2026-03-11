@@ -235,11 +235,12 @@ cmd_add() {
   fi
 
   # Always split a new pane for the LLM tool (terminal pane stays on top)
-  tmux split-window -t "$SESSION" -v -c "$dir"
-  tmux select-pane -t "$SESSION" -T "$name"
-  tmux set-option -p -t "$SESSION" @llmux_name "$name"
+  local new_pane
+  new_pane=$(tmux split-window -t "$SESSION" -v -c "$dir" -P -F '#{pane_id}')
+  tmux select-pane -t "$new_pane" -T "$name"
+  tmux set-option -p -t "$new_pane" @llmux_name "$name"
   apply_layout
-  launch_tool_in_pane "$SESSION" "$tool_override" "$name"
+  launch_tool_in_pane "$new_pane" "$tool_override" "$name"
   echo "Created pane '$name' in $dir"
   attach_to_pane "$name"
 }
@@ -676,11 +677,12 @@ cmd_resume() {
   # Create the pane and launch
   ensure_session
 
-  tmux split-window -t "$SESSION" -v -c "$selected_dir"
-  tmux select-pane -t "$SESSION" -T "$pane_name"
-  tmux set-option -p -t "$SESSION" @llmux_name "$pane_name"
+  local new_pane
+  new_pane=$(tmux split-window -t "$SESSION" -v -c "$selected_dir" -P -F '#{pane_id}')
+  tmux select-pane -t "$new_pane" -T "$pane_name"
+  tmux set-option -p -t "$new_pane" @llmux_name "$pane_name"
   apply_layout
-  tmux send-keys -t "$SESSION" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
+  tmux send-keys -t "$new_pane" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
   echo "✓ Resuming as '$pane_name'"
 }
 
@@ -799,15 +801,16 @@ cmd_refresh() {
     dir=$(echo "$entry" | cut -d'|' -f2)
     tool=$(echo "$entry" | cut -d'|' -f3)
 
-    tmux split-window -t "$SESSION" -v -c "$dir"
-    tmux select-pane -t "$SESSION" -T "$name"
-    tmux set-option -p -t "$SESSION" @llmux_name "$name"
+    local new_pane
+    new_pane=$(tmux split-window -t "$SESSION" -v -c "$dir" -P -F '#{pane_id}')
+    tmux select-pane -t "$new_pane" -T "$name"
+    tmux set-option -p -t "$new_pane" @llmux_name "$name"
     if [[ -z "$tool" ]]; then
       load_config
       tool="${LLMUX_TOOL:-}"
     fi
     if [[ -n "$tool" ]]; then
-      resume_tool_in_pane "$SESSION" "$tool"
+      resume_tool_in_pane "$new_pane" "$tool"
     fi
   done
 
