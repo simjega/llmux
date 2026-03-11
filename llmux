@@ -144,7 +144,7 @@ ensure_session() {
     tmux set-option -t "$SESSION" terminal-overrides 'xterm*:smcup@:rmcup@'
     # Copy mouse selections to system clipboard
     tmux set-option -s copy-command "pbcopy"
-    # Mark the initial pane as the dedicated terminal (left vertical slice)
+    # Mark the initial pane as the dedicated terminal (top horizontal slice)
     tmux set-option -p -t "$SESSION" @llmux_terminal "1"
     tmux set-option -p -t "$SESSION" @llmux_name "terminal"
     tmux select-pane -t "$SESSION" -T "terminal"
@@ -158,9 +158,9 @@ get_terminal_pane() {
     | grep '|1$' | head -1 | cut -d'|' -f1
 }
 
-# Re-layout: terminal pane as left vertical slice, LLM panes tiled on the right.
-# Uses a main-vertical-style layout with the terminal pane on the left occupying
-# ~30% of the window width.
+# Re-layout: terminal pane as top horizontal slice, LLM panes tiled below.
+# Uses a main-horizontal-style layout with the terminal pane on top occupying
+# ~25% of the window height.
 apply_layout() {
   local term_pane
   term_pane=$(get_terminal_pane)
@@ -173,20 +173,20 @@ apply_layout() {
     return
   fi
 
-  # Ensure terminal pane is first (index 0) so main-vertical puts it on the left
+  # Ensure terminal pane is first (index 0) so main-horizontal puts it on top
   local first_pane
   first_pane=$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | head -1)
   if [[ "$first_pane" != "$term_pane" ]]; then
     tmux swap-pane -s "$term_pane" -t "$first_pane"
   fi
 
-  # Use main-vertical layout: left pane is the "main" pane, right side is tiled
-  local win_width
-  win_width=$(tmux display-message -t "$SESSION" -p '#{window_width}')
-  local main_width=$(( win_width * 30 / 100 ))
-  [[ "$main_width" -lt 40 ]] && main_width=40
-  tmux set-option -t "$SESSION" main-pane-width "$main_width"
-  tmux select-layout -t "$SESSION" main-vertical
+  # Use main-horizontal layout: top pane is the "main" pane, bottom is tiled
+  local win_height
+  win_height=$(tmux display-message -t "$SESSION" -p '#{window_height}')
+  local main_height=$(( win_height * 25 / 100 ))
+  [[ "$main_height" -lt 10 ]] && main_height=10
+  tmux set-option -t "$SESSION" main-pane-height "$main_height"
+  tmux select-layout -t "$SESSION" main-horizontal
 }
 
 attach_to_pane() {
@@ -234,8 +234,8 @@ cmd_add() {
     exit 1
   fi
 
-  # Always split a new pane for the LLM tool (terminal pane stays on the left)
-  tmux split-window -t "$SESSION" -h -c "$dir"
+  # Always split a new pane for the LLM tool (terminal pane stays on top)
+  tmux split-window -t "$SESSION" -v -c "$dir"
   tmux select-pane -t "$SESSION" -T "$name"
   tmux set-option -p -t "$SESSION" @llmux_name "$name"
   apply_layout
@@ -676,7 +676,7 @@ cmd_resume() {
   # Create the pane and launch
   ensure_session
 
-  tmux split-window -t "$SESSION" -h -c "$selected_dir"
+  tmux split-window -t "$SESSION" -v -c "$selected_dir"
   tmux select-pane -t "$SESSION" -T "$pane_name"
   tmux set-option -p -t "$SESSION" @llmux_name "$pane_name"
   apply_layout
@@ -731,8 +731,8 @@ cmd_grab() {
     source="${panes[$((choice - 1))]}"
   fi
 
-  # Join the source pane into llmux (terminal pane stays on the left)
-  tmux join-pane -s "$source" -t "$SESSION" -h
+  # Join the source pane into llmux (terminal pane stays on top)
+  tmux join-pane -s "$source" -t "$SESSION" -v
   tmux select-pane -t "$SESSION" -T "$name"
   tmux set-option -p -t "$SESSION" @llmux_name "$name"
   apply_layout
@@ -792,14 +792,14 @@ cmd_refresh() {
     return
   fi
 
-  # Recreate each LLM pane on the right side
+  # Recreate each LLM pane below the terminal
   for entry in "${active[@]}"; do
     local name dir tool
     name=$(echo "$entry" | cut -d'|' -f1)
     dir=$(echo "$entry" | cut -d'|' -f2)
     tool=$(echo "$entry" | cut -d'|' -f3)
 
-    tmux split-window -t "$SESSION" -h -c "$dir"
+    tmux split-window -t "$SESSION" -v -c "$dir"
     tmux select-pane -t "$SESSION" -T "$name"
     tmux set-option -p -t "$SESSION" @llmux_name "$name"
     if [[ -z "$tool" ]]; then
