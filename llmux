@@ -4,28 +4,32 @@ set -euo pipefail
 SESSION="llmux"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/llmux"
 CONFIG_FILE="$CONFIG_DIR/config"
+PAUSED_FILE="$CONFIG_DIR/paused.json"
 
 usage() {
   cat <<EOF
 llmux — multiplex LLM sessions in tmux
 
 Usage:
-  llmux add <name> [directory] [--tool <tool>]  Add a new pane (default tool from config)
+  llmux add <name> [dir] [--tool <tool>] [--worktree]  Add a new pane
   llmux resume [--tool <tool>]                  Pick a past session to resume
   llmux grab <name> [pane]                      Move an existing tmux pane into llmux
   llmux rm [name]                               Remove pane by name (or pick)
+  llmux worktree <name> [branch]                Tag a pane with a worktree branch
   llmux kill                                    Kill the entire llmux session
-  llmux ls                                      List active panes
+  llmux ls                                      List panes with worktree + infra info
   llmux attach                                  Attach to the llmux session
-  llmux refresh                                  Recreate session, drop idle panes
+  llmux refresh                                 Recreate session, drop idle panes
   llmux setup                                   Install deps + configure LLM tools
   llmux help                                    Show this help
 
 Examples:
   llmux add "auth-refactor" ~/code/myproject
+  llmux add "auth-refactor" --worktree          # creates git worktree + launches
   llmux add "bug-hunt" --tool amp
   llmux resume                                  # resume with default tool
   llmux resume --tool claude                    # resume a claude session specifically
+  llmux worktree "my-pane" feature/branch       # manually tag a pane's worktree
   llmux grab "ongoing-debug"
   llmux rm "auth-refactor"
 EOF
@@ -72,6 +76,61 @@ build_tool_cmd() {
   local args
   args="$(get_tool_args "$tool")"
   echo "$tool${args:+ $args}"
+}
+
+# Read paused.json, output pipe-delimited lines: name|dir|tool|worktree|paused_at|session_id
+read_paused() {
+  [[ -f "$PAUSED_FILE" ]] || return 0
+  python3 -c "
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except:
+    sys.exit(0)
+for p in data:
+    print('|'.join(str(p.get(k, '')) for k in ['name','dir','tool','worktree','paused_at','session_id']))
+" "$PAUSED_FILE"
+}
+
+# Append a paused pane entry. Args: name dir tool worktree session_id
+add_paused() {
+  local name="$1" dir="$2" tool="${3:-}" worktree="${4:-}" session_id="${5:-}"
+  python3 -c "
+import json, sys, time
+path = sys.argv[1]
+try:
+    data = json.load(open(path))
+except:
+    data = []
+data.append({
+    'name': sys.argv[2],
+    'dir': sys.argv[3],
+    'tool': sys.argv[4],
+    'worktree': sys.argv[5],
+    'session_id': sys.argv[6],
+    'paused_at': int(time.time())
+})
+json.dump(data, open(path, 'w'), indent=2)
+" "$PAUSED_FILE" "$name" "$dir" "$tool" "$worktree" "$session_id"
+}
+
+# Remove a paused entry by name. Returns 0 if found, 1 if not.
+remove_paused() {
+  local name="$1"
+  python3 -c "
+import json, sys
+path = sys.argv[1]
+name = sys.argv[2]
+try:
+    data = json.load(open(path))
+except:
+    sys.exit(1)
+before = len(data)
+data = [p for p in data if p['name'] != name]
+if len(data) == before:
+    sys.exit(1)
+json.dump(data, open(path, 'w'), indent=2)
+" "$PAUSED_FILE" "$name"
 }
 
 launch_tool_in_pane() {
@@ -129,10 +188,10 @@ is_default_title() {
 
 ensure_session() {
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-    tmux new-session -d -s "$SESSION" -x - -y -
+    tmux new-session -d -s "$SESSION" -x 200 -y 50
     # Enable pane titles in the border
     tmux set-option -t "$SESSION" pane-border-status top
-    tmux set-option -t "$SESSION" pane-border-format ' #{?#{@llmux_name},#{@llmux_name},#{pane_title}} [#{pane_current_path}] '
+    tmux set-option -t "$SESSION" pane-border-format ' #{?#{@llmux_name},#{@llmux_name},#{pane_title}} [#{pane_current_path}]#{?#{@llmux_worktree}, (#{@llmux_worktree}),} '
     # Style the borders for clarity
     tmux set-option -t "$SESSION" pane-border-style 'fg=colour240'
     tmux set-option -t "$SESSION" pane-active-border-style 'fg=colour39,bold'
@@ -207,13 +266,60 @@ attach_to_pane() {
   fi
 }
 
-cmd_add() {
-  local name="" dir="" tool_override=""
+create_worktree_for_pane() {
+  local name="$1"
+  local repo_root
+  repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "Error: not inside a git repository"
+    exit 1
+  }
 
-  # Parse args: name [directory] [--tool <tool>]
+  # Determine worktree base directory
+  local wt_base=""
+  if [[ -d "$repo_root/.worktrees" ]]; then
+    wt_base="$repo_root/.worktrees"
+  elif [[ -d "$repo_root/.workspaces" ]]; then
+    wt_base="$repo_root/.workspaces"
+  elif [[ -d "$repo_root/worktrees" ]]; then
+    wt_base="$repo_root/worktrees"
+  else
+    wt_base="$repo_root/.worktrees"
+    mkdir -p "$wt_base"
+  fi
+
+  # Ensure the worktree directory is gitignored
+  local wt_rel="${wt_base#$repo_root/}"
+  if ! git -C "$repo_root" check-ignore -q "$wt_rel" 2>/dev/null; then
+    echo "$wt_rel" >> "$repo_root/.gitignore"
+    echo "Added $wt_rel to .gitignore"
+  fi
+
+  # Sanitize name for branch/directory (replace spaces with dashes)
+  local safe_name
+  safe_name=$(echo "$name" | tr ' ' '-' | tr -cd '[:alnum:]._-/')
+
+  local wt_dir="$wt_base/$safe_name"
+  local branch_name="$safe_name"
+
+  if [[ -d "$wt_dir" ]]; then
+    echo "Worktree already exists at $wt_dir"
+    echo "$wt_dir"
+    return 0
+  fi
+
+  echo "Creating worktree: $wt_dir (branch: $branch_name)"
+  git -C "$repo_root" worktree add "$wt_dir" -b "$branch_name" 2>&1
+  echo "$wt_dir"
+}
+
+cmd_add() {
+  local name="" dir="" tool_override="" use_worktree=false
+
+  # Parse args: name [directory] [--tool <tool>] [--worktree]
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --tool) tool_override="${2:?--tool requires a value}"; shift 2 ;;
+      --worktree|--wt) use_worktree=true; shift ;;
       *)
         if [[ -z "$name" ]]; then
           name="$1"
@@ -225,7 +331,24 @@ cmd_add() {
     esac
   done
 
-  [[ -z "$name" ]] && { echo "Usage: llmux add <name> [directory] [--tool <tool>]"; exit 1; }
+  [[ -z "$name" ]] && { echo "Usage: llmux add <name> [directory] [--tool <tool>] [--worktree]"; exit 1; }
+
+  if $use_worktree; then
+    local wt_dir
+    wt_dir=$(create_worktree_for_pane "$name")
+    # Last line of output is the directory
+    dir=$(echo "$wt_dir" | tail -1)
+
+    # Run post-worktree hook if present in the repo
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    local hook="$repo_root/.llmux/post-worktree"
+    if [[ -x "$hook" ]]; then
+      echo "Running post-worktree hook..."
+      "$hook" "$dir" 2>&1 || true
+    fi
+  fi
+
   dir="${dir:-$(pwd)}"
   dir="$(cd "$dir" && pwd)"
 
@@ -241,6 +364,7 @@ cmd_add() {
   new_pane=$(tmux split-window -t "$SESSION" -v -c "$dir" -P -F '#{pane_id}')
   tmux select-pane -t "$new_pane" -T "$name"
   tmux set-option -p -t "$new_pane" @llmux_name "$name"
+  tag_pane_worktree "$new_pane" "$dir"
   apply_layout
   launch_tool_in_pane "$new_pane" "$tool_override" "$name"
   echo "Created pane '$name' in $dir"
@@ -323,26 +447,121 @@ cmd_rm() {
   fi
 }
 
+detect_worktree() {
+  local dir="$1"
+  [[ ! -d "$dir" ]] && return 0
+  local git_dir git_common
+  git_dir=$(git -C "$dir" rev-parse --git-dir 2>/dev/null) || return 0
+  git_common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 0
+  # If git-dir != git-common-dir, this is a worktree
+  local abs_git_dir abs_common
+  abs_git_dir=$(cd "$dir" && cd "$git_dir" && pwd)
+  abs_common=$(cd "$dir" && cd "$git_common" && pwd)
+  if [[ "$abs_git_dir" != "$abs_common" ]]; then
+    local branch
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    echo "${branch:-detached}"
+  fi
+}
+
+tag_pane_worktree() {
+  local pane_target="$1"
+  local dir="$2"
+  local wt
+  wt=$(detect_worktree "$dir")
+  if [[ -n "$wt" ]]; then
+    tmux set-option -p -t "$pane_target" @llmux_worktree "$wt"
+  fi
+}
+
+cmd_worktree() {
+  local name="${1:-}"
+  local branch="${2:-}"
+
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "Error: no llmux session running"
+    exit 1
+  fi
+
+  [[ -z "$name" ]] && { echo "Usage: llmux worktree <pane-name> [branch]"; exit 1; }
+
+  # Find the pane
+  local pane_id=""
+  local pane_path=""
+  while IFS='|' read -r pid pname ppath; do
+    if [[ "$pname" == "$name" ]]; then
+      pane_id="$pid"
+      pane_path="$ppath"
+      break
+    fi
+  done < <(tmux list-panes -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}')
+
+  [[ -z "$pane_id" ]] && { echo "Error: no pane named '$name'"; exit 1; }
+
+  if [[ -z "$branch" ]]; then
+    # Auto-detect from pane's current directory
+    branch=$(detect_worktree "$pane_path")
+    [[ -z "$branch" ]] && { echo "Error: pane '$name' is not in a worktree. Pass branch explicitly: llmux worktree '$name' <branch>"; exit 1; }
+  fi
+
+  tmux set-option -p -t "$pane_id" @llmux_worktree "$branch"
+  echo "Tagged '$name' → $branch"
+}
+
 cmd_ls() {
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "No llmux session running"
     exit 0
   fi
 
-  printf "%-4s  %-30s  %-6s  %s\n" "IDX" "NAME" "TYPE" "DIRECTORY"
-  printf "%-4s  %-30s  %-6s  %s\n" "---" "----" "----" "---------"
+  # Query owner-dev for shared resource info (best-effort)
+  local owner_status=""
+  local owner_infra=""
+  local owner_root=""
+  if command -v owner-dev &>/dev/null; then
+    owner_status=$(owner-dev status --json 2>/dev/null || true)
+    if [[ -n "$owner_status" ]]; then
+      owner_root=$(echo "$owner_status" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('root','') or '')" 2>/dev/null || true)
+      owner_infra=$(echo "$owner_status" | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join(d.get('infra',[])))" 2>/dev/null || true)
+    fi
+  fi
+
+  printf "%-4s  %-30s  %-6s  %-25s  %s\n" "IDX" "NAME" "TYPE" "WORKTREE" "DIRECTORY"
+  printf "%-4s  %-30s  %-6s  %-25s  %s\n" "---" "----" "----" "--------" "---------"
   local idx=0
   while IFS= read -r line; do
-    local pane_name pane_path is_term pane_type
-    pane_name=$(echo "$line" | cut -d'|' -f1)
-    pane_path=$(echo "$line" | cut -d'|' -f2)
-    is_term=$(echo "$line" | cut -d'|' -f3)
+    local pane_id pane_name pane_path is_term pane_type wt_info existing_wt
+    pane_id=$(echo "$line" | cut -d'|' -f1)
+    pane_name=$(echo "$line" | cut -d'|' -f2)
+    pane_path=$(echo "$line" | cut -d'|' -f3)
+    is_term=$(echo "$line" | cut -d'|' -f4)
+    existing_wt=$(echo "$line" | cut -d'|' -f5)
     [[ -z "$pane_name" ]] && pane_name="(unnamed)"
     pane_type="llm"
     [[ "$is_term" == "1" ]] && pane_type="term"
-    printf "%-4s  %-30s  %-6s  %s\n" "$idx" "$pane_name" "$pane_type" "$pane_path"
-    ((idx++))
-  done < <(tmux list-panes -t "$SESSION" -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_terminal}')
+
+    # Re-scan CWD for worktree, fall back to existing tag
+    wt_info=$(detect_worktree "$pane_path")
+    if [[ -n "$wt_info" ]]; then
+      # Update the tag if CWD changed to a worktree
+      tmux set-option -p -t "$pane_id" @llmux_worktree "$wt_info" 2>/dev/null || true
+    elif [[ -n "$existing_wt" ]]; then
+      # Keep the manually-set or previously-detected tag
+      wt_info="$existing_wt"
+    else
+      wt_info="—"
+    fi
+
+    printf "%-4s  %-30s  %-6s  %-25s  %s\n" "$idx" "$pane_name" "$pane_type" "$wt_info" "$pane_path"
+    idx=$((idx + 1))
+  done < <(tmux list-panes -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_terminal}|#{@llmux_worktree}')
+
+  # Show shared resource footer if owner-dev is running
+  if [[ -n "$owner_infra" && "$owner_infra" != "" ]]; then
+    echo ""
+    echo "Shared infra (via owner-dev): $owner_infra"
+    [[ -n "$owner_root" ]] && echo "  root: $owner_root"
+  fi
 }
 
 cmd_attach() {
@@ -554,6 +773,105 @@ else: print(f'{diff//86400}d ago')
   done
 }
 
+fetch_thread_title() {
+  local tool="$1" thread_id="$2"
+  case "$tool" in
+    amp)
+      amp threads search --json --no-color --no-ide --limit 1 "$thread_id" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['title'] if d else '')" 2>/dev/null
+      ;;
+    *) echo "" ;;
+  esac
+}
+
+# Show related threads as a drop-down after initial selection.
+# For Amp: uses cluster_of: search. For Claude: no-op.
+# Sets _related_result to the final thread ID to resume.
+show_related_threads() {
+  local tool="$1" thread_id="$2" summary="$3"
+  _related_result="$thread_id"
+
+  [[ "$tool" != "amp" ]] && return 0
+
+  echo "  Fetching related threads…"
+  local related_json=""
+  related_json=$(amp threads search --json --no-color --no-ide --limit 15 "cluster_of:$thread_id" 2>/dev/null) || return 0
+
+  # Parse JSON into parallel arrays via temp file (tree-formatted display lines)
+  local tmpfile
+  tmpfile=$(mktemp)
+  python3 -c "
+import sys, json, time, datetime
+try:
+    data = json.loads(sys.argv[1])
+except:
+    sys.exit(0)
+if len(data) <= 1:
+    sys.exit(0)
+original = sys.argv[2]
+for i, t in enumerate(data):
+    tid = t.get('id', '')
+    title = t.get('title', '(untitled)')[:50]
+    msgs = t.get('messageCount', 0)
+    updated = t.get('updatedAt', '')
+    ts = '?'
+    if updated:
+        try:
+            dt = datetime.datetime.fromisoformat(updated.replace('Z', '+00:00'))
+            delta = int(time.time() - dt.timestamp())
+            if delta < 60: ts = f'{delta}s ago'
+            elif delta < 3600: ts = f'{delta // 60}m ago'
+            elif delta < 86400: ts = f'{delta // 3600}h ago'
+            else: ts = f'{delta // 86400}d ago'
+        except:
+            pass
+    is_last = (i == len(data) - 1)
+    branch = '└──' if is_last else '├──'
+    marker = ' ◀' if tid == original else ''
+    print(f'{tid}\t{branch} {ts:<8} {title:<50} {msgs:>3} msgs{marker}')
+" "$related_json" "$thread_id" > "$tmpfile" 2>/dev/null || true
+
+  local related_ids=()
+  local related_display=()
+  while IFS=$'\t' read -r rid rline; do
+    [[ -z "$rid" ]] && continue
+    related_ids+=("$rid")
+    related_display+=("$rline")
+  done < "$tmpfile"
+  rm -f "$tmpfile"
+
+  if [[ ${#related_display[@]} -le 1 ]]; then
+    return 0
+  fi
+
+  # Find the index of the originally selected thread for --cursor
+  local cursor_idx=0
+  for i in "${!related_ids[@]}"; do
+    if [[ "${related_ids[$i]}" == "$thread_id" ]]; then
+      cursor_idx=$((i + 1))
+      break
+    fi
+  done
+
+  local picked
+  picked=$(printf '%s\n' "${related_display[@]}" | gum choose \
+    --header "  Workstream (${#related_display[@]} threads)" \
+    --cursor "▸ " \
+    --cursor.foreground "212" \
+    --header.foreground "99" \
+    --item.foreground "245" \
+    --height "${#related_display[@]}") || true
+
+  [[ -z "$picked" ]] && return 0
+
+  for i in "${!related_display[@]}"; do
+    if [[ "${related_display[$i]}" == "$picked" ]]; then
+      _related_result="${related_ids[$i]}"
+      return 0
+    fi
+  done
+}
+
 cmd_resume() {
   local tool_override=""
 
@@ -659,6 +977,15 @@ cmd_resume() {
   selected_dir=$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f2)
   selected_summary=$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f4)
 
+  # Drop-down: show related threads so the user can pick a specific workstream
+  show_related_threads "$tool" "$selected_id" "$selected_summary"
+  selected_id="$_related_result"
+
+  # Re-fetch summary if we switched to a related thread
+  if [[ "$selected_id" != "$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f1)" ]]; then
+    selected_summary=$(fetch_thread_title "$tool" "$selected_id")
+  fi
+
   # Prompt for pane name (default to summary)
   local default_name="${selected_summary:0:40}"
   [[ -z "$default_name" ]] && default_name="$selected_id"
@@ -683,6 +1010,7 @@ cmd_resume() {
   new_pane=$(tmux split-window -t "$SESSION" -v -c "$selected_dir" -P -F '#{pane_id}')
   tmux select-pane -t "$new_pane" -T "$pane_name"
   tmux set-option -p -t "$new_pane" @llmux_name "$pane_name"
+  tag_pane_worktree "$new_pane" "$selected_dir"
   apply_layout
   tmux send-keys -t "$new_pane" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
   echo "✓ Resuming as '$pane_name'"
@@ -739,6 +1067,9 @@ cmd_grab() {
   tmux join-pane -s "$source" -t "$SESSION" -v
   tmux select-pane -t "$SESSION" -T "$name"
   tmux set-option -p -t "$SESSION" @llmux_name "$name"
+  local grab_dir
+  grab_dir=$(tmux display-message -p -t "$SESSION" '#{pane_current_path}')
+  tag_pane_worktree "$SESSION" "$grab_dir"
   apply_layout
   echo "Grabbed pane '$source' as '$name'"
 }
@@ -807,6 +1138,7 @@ cmd_refresh() {
     new_pane=$(tmux split-window -t "$SESSION" -v -c "$dir" -P -F '#{pane_id}')
     tmux select-pane -t "$new_pane" -T "$name"
     tmux set-option -p -t "$new_pane" @llmux_name "$name"
+    tag_pane_worktree "$new_pane" "$dir"
     if [[ -z "$tool" ]]; then
       load_config
       tool="${LLMUX_TOOL:-}"
@@ -839,15 +1171,16 @@ case "$command" in
 esac
 
 case "$command" in
-  add)     cmd_add "$@" ;;
-  resume)  cmd_resume "$@" ;;
-  grab)    cmd_grab "$@" ;;
-  rm)      cmd_rm "$@" ;;
-  ls)      cmd_ls "$@" ;;
-  attach)  cmd_attach "$@" ;;
-  refresh) cmd_refresh "$@" ;;
-  kill)    cmd_kill "$@" ;;
-  setup)   cmd_setup "$@" ;;
-  help)   usage ;;
-  *)      echo "Unknown command: $command"; usage; exit 1 ;;
+  add)      cmd_add "$@" ;;
+  resume)   cmd_resume "$@" ;;
+  grab)     cmd_grab "$@" ;;
+  rm)       cmd_rm "$@" ;;
+  ls)       cmd_ls "$@" ;;
+  worktree) cmd_worktree "$@" ;;
+  attach)   cmd_attach "$@" ;;
+  refresh)  cmd_refresh "$@" ;;
+  kill)     cmd_kill "$@" ;;
+  setup)    cmd_setup "$@" ;;
+  help)    usage ;;
+  *)       echo "Unknown command: $command"; usage; exit 1 ;;
 esac
