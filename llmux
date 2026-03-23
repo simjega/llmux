@@ -15,6 +15,7 @@ Usage:
   llmux resume [--tool <tool>]                  Pick a past session to resume
   llmux grab <name> [pane]                      Move an existing tmux pane into llmux
   llmux rm [name]                               Remove pane by name (or pick)
+  llmux pause [name]                               Pause a pane (hide, keep metadata)
   llmux worktree <name> [branch]                Tag a pane with a worktree branch
   llmux kill                                    Kill the entire llmux session
   llmux ls                                      List panes with worktree + infra info
@@ -445,6 +446,80 @@ cmd_rm() {
     apply_layout
     echo "Removed pane '$name'"
   fi
+}
+
+cmd_pause() {
+  local name="${1:-}"
+
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "Error: no llmux session running"
+    exit 1
+  fi
+
+  # If no name given, show a picker (exclude terminal pane)
+  if [[ -z "$name" ]]; then
+    local names=()
+    while IFS= read -r line; do
+      local n is_term
+      n=$(echo "$line" | cut -d'|' -f1)
+      is_term=$(echo "$line" | cut -d'|' -f2)
+      [[ -z "$n" ]] && continue
+      [[ "$is_term" == "1" ]] && continue
+      names+=("$n")
+    done < <(tmux list-panes -t "$SESSION" -F '#{@llmux_name}|#{@llmux_terminal}')
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+      echo "No panes to pause."
+      exit 0
+    fi
+
+    name=$(printf '%s\n' "${names[@]}" | gum filter \
+      --header "Pause which pane?" \
+      --indicator "▸" \
+      --indicator.foreground "212" \
+      --match.foreground "212" \
+      --header.foreground "99" \
+      --prompt.foreground "39")
+    [[ -z "$name" ]] && exit 0
+  fi
+
+  # Prevent pausing the terminal pane
+  if [[ "$name" == "terminal" ]]; then
+    echo "Error: cannot pause the terminal pane"
+    exit 1
+  fi
+
+  # Find the pane and collect its metadata
+  local target_pane="" pane_dir="" pane_tool="" pane_wt=""
+  while IFS='|' read -r pid pname pdir ptool pwt pterm; do
+    if [[ "$pname" == "$name" ]]; then
+      target_pane="$pid"
+      pane_dir="$pdir"
+      pane_tool="$ptool"
+      pane_wt="$pwt"
+      break
+    fi
+  done < <(tmux list-panes -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}')
+
+  if [[ -z "$target_pane" ]]; then
+    echo "Error: no pane named '$name'"
+    exit 1
+  fi
+
+  # Check if already paused
+  if read_paused | grep -q "^${name}|"; then
+    echo "Error: '$name' is already paused"
+    exit 1
+  fi
+
+  # Save to paused file
+  add_paused "$name" "$pane_dir" "$pane_tool" "$pane_wt" ""
+
+  # Kill the pane
+  tmux kill-pane -t "$target_pane"
+  apply_layout
+
+  echo "Paused '$name' — resume anytime with: llmux resume"
 }
 
 detect_worktree() {
@@ -1175,6 +1250,7 @@ case "$command" in
   resume)   cmd_resume "$@" ;;
   grab)     cmd_grab "$@" ;;
   rm)       cmd_rm "$@" ;;
+  pause)    cmd_pause "$@" ;;
   ls)       cmd_ls "$@" ;;
   worktree) cmd_worktree "$@" ;;
   attach)   cmd_attach "$@" ;;
