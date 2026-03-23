@@ -15,7 +15,7 @@ Usage:
   llmux resume [--tool <tool>]                  Pick a past session to resume
   llmux grab <name> [pane]                      Move an existing tmux pane into llmux
   llmux rm [name]                               Remove pane by name (or pick)
-  llmux pause [name]                               Pause a pane (hide, keep metadata)
+  llmux pause [name]                            Pause a pane (hide, keep metadata)
   llmux worktree <name> [branch]                Tag a pane with a worktree branch
   llmux kill                                    Kill the entire llmux session
   llmux ls                                      List panes with worktree + infra info
