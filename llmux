@@ -950,7 +950,6 @@ for i, t in enumerate(data):
 cmd_resume() {
   local tool_override=""
 
-  # Parse args: [--tool <tool>]
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --tool) tool_override="${2:?--tool requires a value}"; shift 2 ;;
@@ -958,71 +957,111 @@ cmd_resume() {
     esac
   done
 
-  # Determine which tool to browse
+  # --- Collect paused panes ---
+  local paused_raw=()
+  local paused_display=()
+  while IFS='|' read -r pname pdir ptool pwt paused_at psid; do
+    [[ -z "$pname" ]] && continue
+    paused_raw+=("paused|$pname|$pdir|$ptool|$pwt|$psid")
+    local short_dir="${pdir/#$HOME/\~}"
+    local ts=""
+    if [[ -n "$paused_at" ]]; then
+      ts=$(python3 -c "
+import time
+delta = int(time.time()) - int($paused_at)
+if delta < 60: print(f'{delta}s ago')
+elif delta < 3600: print(f'{delta // 60}m ago')
+elif delta < 86400: print(f'{delta // 3600}h ago')
+else: print(f'{delta // 86400}d ago')
+" 2>/dev/null)
+    fi
+    local tool_tag="${ptool:+ [$ptool]}"
+    paused_display+=("$(printf '  %-10s │ %-50s │ %s' "${ts:-?}" "${pname}${tool_tag}" "$short_dir")")
+  done < <(read_paused)
+
+  # --- Determine tool for session history ---
   local tool="$tool_override"
   if [[ -z "$tool" ]]; then
     load_config
-    # Find all resumable tools on the system
     local resumable=()
     for t in claude amp codex; do
       command -v "$t" &>/dev/null && resumable+=("$t")
     done
 
-    if [[ ${#resumable[@]} -eq 0 ]]; then
-      echo "No resumable tools found (need claude, amp, or codex)."
+    if [[ ${#resumable[@]} -eq 0 && ${#paused_raw[@]} -eq 0 ]]; then
+      echo "No resumable tools found and no paused panes."
       exit 1
     elif [[ ${#resumable[@]} -eq 1 ]]; then
       tool="${resumable[0]}"
-    else
+    elif [[ ${#resumable[@]} -gt 1 ]]; then
       tool=$(printf '%s\n' "${resumable[@]}" | gum choose --header "Which tool's sessions?")
       [[ -z "$tool" ]] && exit 0
     fi
   fi
 
-  # Harvest sessions
-  local raw_lines=()
-  local display_lines=()
+  # --- Collect tool session history ---
+  local session_raw=()
+  local session_display=()
 
-  case "$tool" in
-    claude)
-      while IFS='|' read -r sid dir ts summary; do
-        [[ -z "$sid" ]] && continue
-        raw_lines+=("$sid|$dir|$ts|$summary")
-        local short_dir="${dir/#$HOME/~}"
-        display_lines+=("$(printf '%-10s │ %-50s │ %s' "$ts" "${summary:0:50}" "$short_dir")")
-      done < <(harvest_claude_sessions)
-      ;;
-    amp)
-      while IFS='|' read -r sid dir ts summary; do
-        [[ -z "$sid" ]] && continue
-        raw_lines+=("$sid|$dir|$ts|$summary")
-        local short_dir="${dir/#$HOME/~}"
-        display_lines+=("$(printf '%-10s │ %-50s │ %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
-      done < <(harvest_amp_sessions)
-      ;;
-    codex)
-      while IFS='|' read -r sid dir ts summary; do
-        [[ -z "$sid" ]] && continue
-        raw_lines+=("$sid|$dir|$ts|$summary")
-        local short_dir="${dir/#$HOME/~}"
-        display_lines+=("$(printf '%-10s │ %-50s │ %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
-      done < <(harvest_codex_sessions)
-      ;;
-    *)
-      echo "Resume not supported for '$tool'. Supported: claude, amp, codex"
-      exit 1
-      ;;
-  esac
+  if [[ -n "$tool" ]]; then
+    case "$tool" in
+      claude)
+        while IFS='|' read -r sid dir ts summary; do
+          [[ -z "$sid" ]] && continue
+          session_raw+=("session|$sid|$dir|$tool||")
+          local short_dir="${dir/#$HOME/\~}"
+          session_display+=("$(printf '  %-10s │ %-50s │ %s' "$ts" "${summary:0:50}" "$short_dir")")
+        done < <(harvest_claude_sessions)
+        ;;
+      amp)
+        while IFS='|' read -r sid dir ts summary; do
+          [[ -z "$sid" ]] && continue
+          session_raw+=("session|$sid|$dir|$tool||")
+          local short_dir="${dir/#$HOME/\~}"
+          session_display+=("$(printf '  %-10s │ %-50s │ %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
+        done < <(harvest_amp_sessions)
+        ;;
+      codex)
+        while IFS='|' read -r sid dir ts summary; do
+          [[ -z "$sid" ]] && continue
+          session_raw+=("session|$sid|$dir|$tool||")
+          local short_dir="${dir/#$HOME/\~}"
+          session_display+=("$(printf '  %-10s │ %-50s │ %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
+        done < <(harvest_codex_sessions)
+        ;;
+    esac
+  fi
 
-  if [[ ${#raw_lines[@]} -eq 0 ]]; then
-    echo "No past sessions found."
+  # --- Build unified picker ---
+  local all_raw=()
+  local all_display=()
+
+  if [[ ${#paused_display[@]} -gt 0 ]]; then
+    all_raw+=("header||||||")
+    all_display+=("PAUSED")
+    for i in "${!paused_raw[@]}"; do
+      all_raw+=("${paused_raw[$i]}")
+      all_display+=("${paused_display[$i]}")
+    done
+  fi
+
+  if [[ ${#session_display[@]} -gt 0 ]]; then
+    all_raw+=("header||||||")
+    all_display+=("SESSIONS")
+    for i in "${!session_raw[@]}"; do
+      all_raw+=("${session_raw[$i]}")
+      all_display+=("${session_display[$i]}")
+    done
+  fi
+
+  if [[ ${#all_display[@]} -eq 0 ]]; then
+    echo "No paused panes or past sessions found."
     exit 0
   fi
 
-  # Pick a session
   local selected_line
-  selected_line=$(printf '%s\n' "${display_lines[@]}" | gum filter \
-    --header "Resume a $tool session" \
+  selected_line=$(printf '%s\n' "${all_display[@]}" | gum filter \
+    --header "Resume" \
     --indicator "▸" \
     --indicator.foreground "212" \
     --text.foreground "245" \
@@ -1033,62 +1072,98 @@ cmd_resume() {
 
   [[ -z "$selected_line" ]] && exit 0
 
-  # Find the matching raw line
+  # Skip if they selected a section header
+  if [[ "$selected_line" == "PAUSED" || "$selected_line" == "SESSIONS" ]]; then
+    echo "Please select a specific entry, not a section header."
+    exit 0
+  fi
+
+  # Find matching raw entry
   local match_idx=-1
-  for i in "${!display_lines[@]}"; do
-    if [[ "${display_lines[$i]}" == "$selected_line" ]]; then
+  for i in "${!all_display[@]}"; do
+    if [[ "${all_display[$i]}" == "$selected_line" ]]; then
       match_idx=$i
       break
     fi
   done
 
-  if [[ "$match_idx" -lt 0 ]]; then
-    echo "Error: could not match selection"
-    exit 1
+  [[ "$match_idx" -lt 0 ]] && { echo "Error: could not match selection"; exit 1; }
+
+  local entry_type entry_id entry_dir entry_tool entry_wt entry_sid
+  IFS='|' read -r entry_type entry_id entry_dir entry_tool entry_wt entry_sid <<< "${all_raw[$match_idx]}"
+
+  if [[ "$entry_type" == "paused" ]]; then
+    # --- Unpause flow ---
+    local pane_name="$entry_id"
+    local pane_dir="$entry_dir"
+    local pane_tool="$entry_tool"
+
+    remove_paused "$pane_name" || echo "Warning: could not remove '$pane_name' from paused list"
+
+    # Validate directory still exists (e.g., worktree may have been cleaned up)
+    if [[ ! -d "$pane_dir" ]]; then
+      echo "Warning: directory $pane_dir no longer exists, using home directory"
+      pane_dir="$HOME"
+    fi
+
+    ensure_session
+
+    local new_pane
+    new_pane=$(tmux split-window -t "$SESSION" -v -c "$pane_dir" -P -F '#{pane_id}')
+    tmux select-pane -t "$new_pane" -T "$pane_name"
+    tmux set-option -p -t "$new_pane" @llmux_name "$pane_name"
+    [[ -n "$entry_wt" ]] && tmux set-option -p -t "$new_pane" @llmux_worktree "$entry_wt"
+    tag_pane_worktree "$new_pane" "$pane_dir"
+    apply_layout
+
+    if [[ -n "$pane_tool" ]]; then
+      resume_tool_in_pane "$new_pane" "$pane_tool"
+    fi
+
+    echo "Resumed '$pane_name'"
+    attach_to_pane "$pane_name"
+
+  else
+    # --- Original session resume flow ---
+    local selected_id="$entry_id"
+    local selected_dir="$entry_dir"
+    local selected_tool="$entry_tool"
+
+    # Amp: show related threads
+    show_related_threads "$selected_tool" "$selected_id" ""
+    selected_id="$_related_result"
+
+    local selected_summary=""
+    if [[ "$selected_id" != "$entry_id" ]]; then
+      selected_summary=$(fetch_thread_title "$selected_tool" "$selected_id")
+    fi
+
+    local default_name="${selected_summary:0:40}"
+    [[ -z "$default_name" ]] && default_name="$selected_id"
+    local pane_name
+    read -rp "Pane name [$default_name]: " pane_name
+    [[ -z "$pane_name" ]] && pane_name="$default_name"
+
+    local tool_cmd
+    tool_cmd="$(build_tool_cmd "$selected_tool")"
+    local resume_cmd=""
+    case "$selected_tool" in
+      claude) resume_cmd="$tool_cmd --resume $selected_id" ;;
+      amp)    resume_cmd="$tool_cmd threads continue $selected_id" ;;
+      codex)  resume_cmd="$tool_cmd resume $selected_id" ;;
+    esac
+
+    ensure_session
+
+    local new_pane
+    new_pane=$(tmux split-window -t "$SESSION" -v -c "$selected_dir" -P -F '#{pane_id}')
+    tmux select-pane -t "$new_pane" -T "$pane_name"
+    tmux set-option -p -t "$new_pane" @llmux_name "$pane_name"
+    tag_pane_worktree "$new_pane" "$selected_dir"
+    apply_layout
+    tmux send-keys -t "$new_pane" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
+    echo "Resuming as '$pane_name'"
   fi
-
-  local selected_id selected_dir selected_summary
-  selected_id=$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f1)
-  selected_dir=$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f2)
-  selected_summary=$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f4)
-
-  # Drop-down: show related threads so the user can pick a specific workstream
-  show_related_threads "$tool" "$selected_id" "$selected_summary"
-  selected_id="$_related_result"
-
-  # Re-fetch summary if we switched to a related thread
-  if [[ "$selected_id" != "$(echo "${raw_lines[$match_idx]}" | cut -d'|' -f1)" ]]; then
-    selected_summary=$(fetch_thread_title "$tool" "$selected_id")
-  fi
-
-  # Prompt for pane name (default to summary)
-  local default_name="${selected_summary:0:40}"
-  [[ -z "$default_name" ]] && default_name="$selected_id"
-  local pane_name
-  read -rp "Pane name [$default_name]: " pane_name
-  [[ -z "$pane_name" ]] && pane_name="$default_name"
-
-  # Build resume command with per-tool args
-  local tool_cmd
-  tool_cmd="$(build_tool_cmd "$tool")"
-  local resume_cmd=""
-  case "$tool" in
-    claude) resume_cmd="$tool_cmd --resume $selected_id" ;;
-    amp)    resume_cmd="$tool_cmd threads continue $selected_id" ;;
-    codex)  resume_cmd="$tool_cmd resume $selected_id" ;;
-  esac
-
-  # Create the pane and launch
-  ensure_session
-
-  local new_pane
-  new_pane=$(tmux split-window -t "$SESSION" -v -c "$selected_dir" -P -F '#{pane_id}')
-  tmux select-pane -t "$new_pane" -T "$pane_name"
-  tmux set-option -p -t "$new_pane" @llmux_name "$pane_name"
-  tag_pane_worktree "$new_pane" "$selected_dir"
-  apply_layout
-  tmux send-keys -t "$new_pane" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
-  echo "✓ Resuming as '$pane_name'"
 }
 
 cmd_grab() {
