@@ -31,6 +31,8 @@ Examples:
   llmux resume                                  # resume with default tool
   llmux resume --tool claude                    # resume a claude session specifically
   llmux worktree "my-pane" feature/branch       # manually tag a pane's worktree
+  llmux pause "auth-refactor"                      # pause pane, free up grid space
+  llmux resume                                     # shows paused panes first, then sessions
   llmux grab "ongoing-debug"
   llmux rm "auth-refactor"
 EOF
@@ -357,6 +359,11 @@ cmd_add() {
 
   if tmux list-panes -t "$SESSION" -F '#{@llmux_name}' 2>/dev/null | grep -qxF "$name"; then
     echo "Error: pane '$name' already exists"
+    exit 1
+  fi
+
+  if read_paused | grep -q "^${name}|"; then
+    echo "Error: pane '$name' is paused — resume it first with: llmux resume"
     exit 1
   fi
 
