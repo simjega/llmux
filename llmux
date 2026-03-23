@@ -631,6 +631,20 @@ cmd_ls() {
     idx=$((idx + 1))
   done < <(tmux list-panes -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_terminal}|#{@llmux_worktree}')
 
+  # Show paused panes
+  local has_paused=false
+  while IFS='|' read -r pname pdir ptool pwt paused_at psid; do
+    [[ -z "$pname" ]] && continue
+    if ! $has_paused; then
+      echo ""
+      printf "%-4s  %-30s  %-6s  %-25s  %s\n" "" "PAUSED" "" "" ""
+      printf "%-4s  %-30s  %-6s  %-25s  %s\n" "---" "----" "----" "--------" "---------"
+      has_paused=true
+    fi
+    local wt_display="${pwt:-—}"
+    printf "%-4s  %-30s  %-6s  %-25s  %s\n" "  ~" "$pname" "${ptool:-—}" "$wt_display" "$pdir"
+  done < <(read_paused)
+
   # Show shared resource footer if owner-dev is running
   if [[ -n "$owner_infra" && "$owner_infra" != "" ]]; then
     echo ""
