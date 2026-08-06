@@ -221,6 +221,13 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
     (llmux _pr-refresh >/dev/null 2>&1 || true) &
   fi
 
+  # Mirror the live session to disk every ~60s. tmux pane options die with the
+  # server, so without this a crash loses every running thread -- names, projects,
+  # and the claude session ids that make them resumable.
+  if [ $((cycle % 12)) -eq 5 ]; then
+    (llmux _snapshot >/dev/null 2>&1 || true) &
+  fi
+
   while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor; do
     [ "$is_term" = "1" ] && continue
     [ -z "$pane_id" ] && continue
