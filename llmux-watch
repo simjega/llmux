@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+# llmux-watch (ralph wiggum) — background daemon that detects when LLM panes
+# are waiting for input. Updates @llmux_status per pane and sends macOS
+# notifications on working→waiting transitions.
+#
+# Notification logic: only notify ONCE per waiting episode. A waiting episode
+# ends when the pane produces sustained new content (3+ consecutive hash
+# changes = 15+ seconds of active output), not just a cursor blink.
+
+SESSION="llmux"
+WATCH_STATE_DIR="/tmp/llmux-watch"
+WATCH_PIDFILE="/tmp/llmux-watch.pid"
+
+mkdir -p "$WATCH_STATE_DIR"
+echo $$ > "$WATCH_PIDFILE"
+# Only clear the pidfile if it still names US.
+#
+# watch_start calls watch_stop, which pkills the outgoing watcher — but pkill is
+# async, so the outgoing process often handled its TERM *after* the incoming one had
+# already written its own pid. An unconditional `rm` then deleted the live watcher's
+# pidfile, leaving it permanently absent: watch_stop's pid-based kill silently
+# no-ops forever (only its pkill fallback still works), and "is the watcher
+# running?" can no longer be answered from the pidfile at all.
+release_pidfile() {
+  [ -f "$WATCH_PIDFILE" ] || return 0
+  [ "$(cat "$WATCH_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_PIDFILE"
+  return 0
+}
+trap 'release_pidfile; exit 0' INT TERM
+
+notify() {
+  local pane_name="$1"
+  local tool="$2"
+  local pane_id="$3"
+  local state="${4:-idle}"
+  # Subtitle and sound by state. A thread that STOPPED on a question deserves a
+  # different alert from one that merely finished its turn — they were both
+  # "Waiting on you" before, which trained you to ignore both.
+  local subtitle sound
+  case "$state" in
+    blocked) subtitle="🙋 Needs an answer";  sound="Ping" ;;
+    perm)    subtitle="🔐 Needs approval";   sound="Basso" ;;
+    *)       subtitle="💤 Done — at the prompt"; sound="Glass" ;;
+  esac
+  # NOTE: do NOT add `-sender com.apple.Terminal`. It makes the notification
+  # impersonate Terminal.app, which requires Terminal.app itself to hold
+  # notification permission — it doesn't, so macOS silently drops the
+  # notification (exit 0, nothing shown). Posting under terminal-notifier's
+  # own (authorized) identity delivers; `-activate` still focuses Terminal
+  # on click.
+  terminal-notifier \
+    -title "llmux" \
+    -subtitle "$subtitle" \
+    -message "${pane_name} (${tool})" \
+    -sound "$sound" \
+    -group "llmux-${pane_id}" \
+    -activate com.apple.Terminal \
+    2>/dev/null &
+}
+
+# Compute Claude context-window % consumed for a given pane.
+# Echoes "<pct>%[\t<session-uuid>]" — the optional second tab-separated field
+# is a newly-resolved session UUID the caller should cache as @llmux_claude_session
+# on the pane (so future cycles don't have to rediscover it).
+#
+# Resolution order — needed because multiple panes can run claude in the same
+# cwd, so cwd alone can't disambiguate which transcript belongs to which pane:
+#   1. Cached session UUID (from a prior resolution).
+#   2. lsof on pane's process tree → finds an open ~/.claude/tasks/<uuid>/ dir,
+#      which uses the same UUID as the corresponding ...projects/<slug>/<uuid>.jsonl.
+#      Claude only opens this dir intermittently while processing, so this is
+#      best-effort — when it lands, we cache it.
+#   3. mtime-newest jsonl in the slug dir. Last resort; ambiguous when multiple
+#      sessions share a cwd, so we don't cache the result.
+compute_claude_ctx() {
+  local cwd="$1" pane_pid="${2:-}" cached_session="${3:-}"
+  python3 - "$cwd" "$pane_pid" "$cached_session" <<'PY' 2>/dev/null
+import json, os, sys, glob, subprocess, re
+cwd = sys.argv[1]
+pane_pid = sys.argv[2] if len(sys.argv) > 2 else ""
+cached_session = sys.argv[3] if len(sys.argv) > 3 else ""
+
+# Raw 1M input context window — what the user actually pays for on the 1M
+# plan. Claude's own status bar reports against the effective 850k (1M minus
+# a ~150k output reservation), but since we're showing raw token counts on
+# the pane border, comparing against the full 1M is what users actually
+# expect when they read "left." The output reservation is an internal Claude
+# implementation detail that shouldn't leak into a user-facing counter.
+WINDOW = 1_000_000
+proj_root = os.path.expanduser('~/.claude/projects')
+tasks_root = os.path.expanduser('~/.claude/tasks')
+UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+def slug_dirs():
+    s = {cwd.replace('/', '-'), cwd.replace('/', '-').replace('.', '-')}
+    return [os.path.join(proj_root, x) for x in s if os.path.isdir(os.path.join(proj_root, x))]
+
+def jsonl_for_uuid(uuid):
+    for d in slug_dirs():
+        p = os.path.join(d, f'{uuid}.jsonl')
+        if os.path.isfile(p):
+            return p
+    return None
+
+def descendants(pid):
+    seen, queue = set(), [pid]
+    while queue:
+        p = queue.pop()
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        try:
+            out = subprocess.run(
+                ['pgrep', '-P', str(p)], capture_output=True, text=True, timeout=2,
+            ).stdout.strip()
+            if out:
+                queue.extend(out.split())
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    return seen
+
+def session_via_lsof(pid):
+    """Look for an open ~/.claude/tasks/<uuid>/ directory in the pane's
+    process tree. Claude opens this dir while actively processing a turn —
+    intermittent, but when present it's authoritative."""
+    if not pid:
+        return None
+    for p in descendants(pid):
+        try:
+            out = subprocess.run(
+                ['lsof', '-p', str(p), '-Fn'],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+        for line in out.splitlines():
+            if not line.startswith('n'):
+                continue
+            path = line[1:]
+            if path.startswith(tasks_root + '/'):
+                m = UUID_RE.search(path)
+                if m:
+                    return m.group(0)
+    return None
+
+# 1. Cached session UUID
+jsonl = jsonl_for_uuid(cached_session) if cached_session else None
+discovered_session = ""
+
+# 2. lsof (records the discovery for caching)
+if not jsonl:
+    uuid = session_via_lsof(pane_pid)
+    if uuid:
+        jsonl = jsonl_for_uuid(uuid)
+        if jsonl:
+            discovered_session = uuid
+
+# 3. mtime-newest fallback (NOT cached — ambiguous).
+# Only safe to use when there's a single jsonl in the slug dir. Otherwise
+# multiple panes sharing the cwd would all resolve to the same jsonl and
+# show identical (wrong) context % on every border (#cwd-collision-bug).
+if not jsonl:
+    candidates = []
+    for d in slug_dirs():
+        candidates.extend(glob.glob(os.path.join(d, '*.jsonl')))
+    if len(candidates) == 1:
+        jsonl = candidates[0]
+    # else: ambiguous — emit nothing rather than a misleading shared value.
+
+if not jsonl or not os.path.isfile(jsonl):
+    sys.exit(0)
+
+total = 0
+with open(jsonl, 'rb') as f:
+    lines = f.readlines()
+for raw in reversed(lines):
+    try:
+        d = json.loads(raw)
+    except Exception:
+        continue
+    msg = d.get('message')
+    if not isinstance(msg, dict):
+        continue
+    u = msg.get('usage')
+    if isinstance(u, dict):
+        total = (
+            (u.get('input_tokens') or 0)
+            + (u.get('cache_creation_input_tokens') or 0)
+            + (u.get('cache_read_input_tokens') or 0)
+            + (u.get('output_tokens') or 0)
+        )
+        break
+if total:
+    used_k = round(total / 1000)
+    left_k = max(0, round((WINDOW - total) / 1000))
+    # Format: "<used>k/<left>k" — used on the left of the slash, remaining
+    # on the right. Replaces the older %-of-window format because raw token
+    # counts give a more direct sense of how much room is left for the next
+    # turn (especially as you approach the auto-compact threshold).
+    ctx = f'{used_k}k/{left_k}k'
+    # If we just resolved the session via lsof, emit it so the caller can
+    # cache it on the pane and skip rediscovery on subsequent ticks.
+    if discovered_session:
+        print(f'{ctx}\t{discovered_session}')
+    else:
+        print(ctx)
+PY
+}
+
+cycle=0
+while tmux has-session -t "$SESSION" 2>/dev/null; do
+  cycle=$((cycle + 1))
+  # Update context % every other cycle (~10s, since base cadence is 5s).
+  update_ctx=0
+  [ $((cycle % 2)) -eq 0 ] && update_ctx=1
+
+  # Registered-PR state every 24th cycle (~2min). One `gh pr view` per PR at ~1s
+  # each, so it rides the existing daemon on a slow timer rather than becoming a
+  # second one — and never runs in the sidebar's 2s render loop.
+  if [ $((cycle % 24)) -eq 1 ]; then
+    (llmux _pr-refresh >/dev/null 2>&1 || true) &
+  fi
+
+  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor; do
+    [ "$is_term" = "1" ] && continue
+    [ -z "$pane_id" ] && continue
+    # Now that -s exposes them: the sidebar is a display that repaints every 2s
+    # (its hash would never settle) and the parked anchor is a sleep loop. Neither
+    # is a thread, and both would otherwise cost an lsof+python sweep per cycle.
+    [ "$is_sidebar" = "1" ] && continue
+    [ "$is_anchor" = "1" ] && continue
+
+    # Context counting is claude-only — it reads claude's own transcripts. Running
+    # it for every pane burned a python+lsof sweep per non-claude pane per cycle.
+    if [ "$update_ctx" = "1" ] && [ -n "$pane_cwd" ] && [ "${pane_tool:-}" = "claude" ]; then
+      # Resolve which jsonl belongs to THIS pane (cwd alone can't disambiguate
+      # multiple claude sessions in the same cwd). Helper output:
+      #   "<pct>%"                  → cached or fallback resolution
+      #   "<pct>%<TAB><uuid>"       → freshly discovered via lsof; cache the uuid
+      ctx_raw=$(compute_claude_ctx "$pane_cwd" "$pane_pid" "$pane_session")
+      ctx="${ctx_raw%%	*}"
+      new_session=""
+      [[ "$ctx_raw" == *$'\t'* ]] && new_session="${ctx_raw#*	}"
+      tmux set-option -p -t "$pane_id" @llmux_ctx "${ctx:-}" 2>/dev/null || true
+      if [ -n "$new_session" ] && [ "$new_session" != "$pane_session" ]; then
+        tmux set-option -p -t "$pane_id" @llmux_claude_session "$new_session" 2>/dev/null || true
+      fi
+    fi
+
+    content=$(tmux capture-pane -t "$pane_id" -p -S -25 2>/dev/null) || continue
+
+    # For claude/amp, hash only the conversation area above the input box.
+    # Claude's UI puts a live-updating footer below the prompt (background-task
+    # elapsed timers, statusline bars) which would otherwise prevent the hash
+    # from settling when waiting. The input box always begins with a line of
+    # ─ characters spanning the pane width (with or without an embedded title).
+    case "${pane_tool:-}" in
+      claude|amp)
+        hashed_content=$(printf '%s\n' "$content" | awk '/^─/ { exit } { print }')
+        [ -n "$hashed_content" ] || hashed_content="$content"
+        ;;
+      *)
+        hashed_content="$content"
+        ;;
+    esac
+    hash=$(printf '%s' "$hashed_content" | md5 -q 2>/dev/null || printf '%s' "$hashed_content" | md5sum | cut -d' ' -f1)
+
+    safe_id="${pane_id//%/}"
+    hash_file="$WATCH_STATE_DIR/${safe_id}.hash"
+    time_file="$WATCH_STATE_DIR/${safe_id}.time"
+    notified_file="$WATCH_STATE_DIR/${safe_id}.notified"
+    active_file="$WATCH_STATE_DIR/${safe_id}.active"
+
+    prev_hash=""
+    [ -f "$hash_file" ] && prev_hash=$(cat "$hash_file")
+    prev_time=0
+    [ -f "$time_file" ] && prev_time=$(cat "$time_file")
+    notified=""
+    [ -f "$notified_file" ] && notified=$(cat "$notified_file")
+    active_count=0
+    [ -f "$active_file" ] && active_count=$(cat "$active_file")
+    now=$(date +%s)
+
+    if [ "$hash" != "$prev_hash" ]; then
+      # Content changed
+      printf '%s' "$hash" > "$hash_file"
+      printf '%s' "$now" > "$time_file"
+      active_count=$((active_count + 1))
+      printf '%s' "$active_count" > "$active_file"
+
+      # Only clear notified state after 3+ consecutive cycles of real activity
+      # (15+ seconds of sustained output, not just cursor blinks)
+      if [ "$active_count" -ge 3 ]; then
+        rm -f "$notified_file"
+        # `busy` = producing output continuously for 2+ minutes (24 cycles at 5s)
+        # and asking for nothing. This is the ONLY producer of ⏳, which is why it
+        # stays rare: most turns finish well before this, and any turn that stops
+        # to ask lands in blocked/perm instead.
+        if [ "$active_count" -ge 24 ]; then
+          tmux set-option -p -t "$pane_id" @llmux_status "busy" 2>/dev/null || true
+        else
+          tmux set-option -p -t "$pane_id" @llmux_status "" 2>/dev/null || true
+        fi
+        # Behind the same 3-cycle gate as the notified marker, so a cursor blink
+        # can't reset an age you were reading.
+        tmux set-option -p -t "$pane_id" @llmux_done_at "" 2>/dev/null || true
+      fi
+    else
+      # Content unchanged — reset active counter
+      printf '0' > "$active_file"
+      elapsed=$((now - prev_time))
+
+      # Search the full capture for waiting indicators. The `❯` prompt line
+      # lives below the strip point used for hashing, so we search $content
+      # (the unstripped capture) here, not $hashed_content.
+      # Precedence is deliberate: perm > blocked > idle.
+      #
+      # A permission prompt and an AskUserQuestion choice list BOTH render as a
+      # numbered menu with the same "Enter to select / Esc to cancel" footer, so
+      # the menu footer alone cannot tell them apart — the permission wording has
+      # to be tested first or every approval gate would report as `blocked`.
+      #
+      # The choice-list case is why this rewrite exists: a thread sitting on an
+      # unanswered question matched none of the old patterns (no bare `❯` prompt,
+      # no Allow/Deny), so it only became `waiting` via the 30s idle fallback —
+      # half a minute late, and then indistinguishable from a finished turn.
+      detected=""
+      case "${pane_tool:-}" in
+        claude)
+          # Deliberately NARROWER than the old pattern, which matched a bare
+          # "Allow", "Deny" or "approve" anywhere in the capture. That was
+          # survivable when everything collapsed to a mild ⏳, but `perm` now
+          # paints a loud red "APPROVE?" on the border — so a thread that merely
+          # WRITES the word "approve" (reviewing a PR, quoting a policy) must not
+          # trip it. Allow/Deny/Yes only count as a numbered menu option, which is
+          # how an actual permission gate renders them.
+          if printf '%s\n' "$content" | grep -qE "(Do you want to|don't ask again|\(y/n\)|\[Y/n\]|^[[:space:]]*❯?[[:space:]]*[0-9]+\.[[:space:]]*(Yes|Allow|Deny)\b)"; then
+            detected="perm"
+          elif printf '%s\n' "$content" | grep -qE '(Enter to select|↑/↓ to navigate|Esc to cancel)'; then
+            detected="blocked"
+          elif printf '%s\n' "$content" | grep -qE '^❯[[:space:]]*$'; then
+            detected="idle"
+          elif [ "$elapsed" -gt 30 ]; then
+            detected="idle"
+          fi
+          ;;
+        amp)
+          if printf '%s\n' "$content" | grep -qE '(Enter to select|Esc to cancel)'; then
+            detected="blocked"
+          elif printf '%s\n' "$content" | grep -qE '^❯[[:space:]]*$'; then
+            detected="idle"
+          elif [ "$elapsed" -gt 30 ]; then
+            detected="idle"
+          fi
+          ;;
+      esac
+
+      if [ -n "$detected" ]; then
+        tmux set-option -p -t "$pane_id" @llmux_status "$detected" 2>/dev/null || true
+        # The notified marker stores the STATE, not just "1", so an escalation
+        # (idle → blocked, e.g. a turn ends and then asks a question) re-notifies.
+        # Keying on a bare flag swallowed exactly the alert you most wanted.
+        if [ "$notified" != "$detected" ]; then
+          printf '%s' "$detected" > "$notified_file"
+          notify "${pane_name:-unnamed}" "${pane_tool:-shell}" "$pane_id" "$detected"
+          # On the transition edge only: re-stamping each tick while the thread sits
+          # idle would freeze the age at "now" forever.
+          if [ "$detected" = "idle" ]; then
+            tmux set-option -p -t "$pane_id" @llmux_done_at "$now" 2>/dev/null || true
+          fi
+        fi
+      fi
+    fi
+    # -s (ALL windows), not the default active-window-only listing. Sidebar mode
+  # parks every inactive thread in a hidden `_parked` window, so without -s this
+  # loop only ever saw the ONE visible thread — every parked thread got no status
+  # updates at all. That is precisely why a thread blocked on a question showed no
+  # indicator: it was parked, so nothing ever looked at it.
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}' 2>/dev/null)
+
+  sleep 5
+done
+
+release_pidfile
