@@ -337,6 +337,15 @@ for p in _load(sys.argv[1])["prs"]:
 ' "$PAUSED_FILE"
 }
 
+# Drop the render cache so the next paint rebuilds the PR rows. Registry writes must
+# call this: the cache signature includes paused.json's mtime, which `stat` reports in
+# whole SECONDS — so a registration landing in the same second as the previous paint
+# leaves the signature identical and the new row would not appear until the minute
+# bucket rolled over. An agent registering a PR expects to see it, not to wait a minute.
+invalidate_pr_rows() {
+  tmux set-option -t "$SESSION" @llmux_pr_rows_sig "" 2>/dev/null || true
+}
+
 # Upsert by repo#number so re-registering updates rather than duplicating — an
 # agent that re-runs `pr add` after a retitle should not create a second row.
 add_pr() {
@@ -921,16 +930,20 @@ STATUS_FLAGS=(
 #
 # `waiting` is a legacy alias mapped to `idle`: panes tagged by an older
 # llmux-watch keep rendering sensibly instead of losing their flag mid-upgrade.
+# Also sets R_STATUS_META so the render loop can read the result without a $(…) fork —
+# it calls this once per row, per paint.
 status_meta() {
   local key="$1" spec
-  [[ -z "$key" ]] && { printf '||'; return 0; }
-  for spec in "${STATUS_FLAGS[@]}"; do
-    if [[ "${spec%%|*}" == "$key" ]]; then
-      printf '%s' "${spec#*|}"
-      return 0
-    fi
-  done
-  printf '||'
+  R_STATUS_META='||'
+  if [[ -n "$key" ]]; then
+    for spec in "${STATUS_FLAGS[@]}"; do
+      if [[ "${spec%%|*}" == "$key" ]]; then
+        R_STATUS_META="${spec#*|}"
+        break
+      fi
+    done
+  fi
+  printf '%s' "$R_STATUS_META"
 }
 
 # ── Finished-and-unseen fade ─────────────────────────────────────────────────
@@ -951,21 +964,28 @@ DONE_FADE=(
 )
 DONE_FADE_FLOOR=236
 
+# Also sets R_FADE so the render loop can read the result without a $(…) fork —
+# it calls this once per row, per paint.
 done_fade_colour() {
   local age="$1" spec
+  R_FADE="$DONE_FADE_FLOOR"
   for spec in "${DONE_FADE[@]}"; do
-    (( age < ${spec%%|*} )) && { printf '%s' "${spec##*|}"; return 0; }
+    (( age < ${spec%%|*} )) && { R_FADE="${spec##*|}"; break; }
   done
-  printf '%s' "$DONE_FADE_FLOOR"
+  printf '%s' "$R_FADE"
 }
 
 # At most 3 characters wide — the row's width budget depends on it.
+# Also sets R_AGE so the render loop can read the result without a $(…) fork —
+# it calls this once per row, per paint.
 fmt_age_short() {
   local s="$1"
-  (( s < 60 ))    && { printf 'now'; return 0; }
-  (( s < 3600 ))  && { printf '%dm' $(( s / 60 )); return 0; }
-  (( s < 86400 )) && { printf '%dh' $(( s / 3600 )); return 0; }
-  printf '%dd' $(( s / 86400 ))
+  if   (( s < 60 ));    then R_AGE="now"
+  elif (( s < 3600 ));  then printf -v R_AGE '%dm' $(( s / 60 ))
+  elif (( s < 86400 )); then printf -v R_AGE '%dh' $(( s / 3600 ))
+  else                       printf -v R_AGE '%dd' $(( s / 86400 ))
+  fi
+  printf '%s' "$R_AGE"
 }
 
 # The 0 sentinel, not an empty value: llmux-watch stamps on the finish EDGE and
@@ -1012,13 +1032,16 @@ TOOL_COLOUR_FALLBACK=245
 
 # Colour for a platform. An empty tool or @llmux_terminal=1 is a plain shell and
 # takes the terminal colour, matching thread_icon's ❯ for the same cases.
+# Also sets R_TOOL_COLOUR so the render loop can read the result without a $(…) fork —
+# it calls this once per row, per paint.
 tool_colour() {
   local tool="${1:-}" is_terminal="${2:-0}" spec want="$1"
   [[ "$is_terminal" == "1" || -z "$tool" ]] && want="term"
+  R_TOOL_COLOUR="$TOOL_COLOUR_FALLBACK"
   for spec in "${TOOL_COLOURS[@]}"; do
-    [[ "${spec%%|*}" == "$want" ]] && { printf '%s' "${spec##*|}"; return 0; }
+    [[ "${spec%%|*}" == "$want" ]] && { R_TOOL_COLOUR="${spec##*|}"; break; }
   done
-  printf '%s' "$TOOL_COLOUR_FALLBACK"
+  printf '%s' "$R_TOOL_COLOUR"
 }
 
 # Preferred colour for a project: sum of the name's bytes, modulo the palette. The
@@ -1594,21 +1617,24 @@ list_threads() {
 # Sidebar glyph per thread. Deliberately single-width BMP glyphs rather than
 # emoji: emoji are double-width in most terminals and mixing widths across rows
 # makes the 30-column list ragged.
+# Also sets R_THREAD_ICON so the render loop can read the result without a $(…) fork —
+# it calls this once per row, per paint.
 thread_icon() {
   local tool="$1" is_terminal="$2"
   if [[ "$is_terminal" == "1" ]]; then
-    echo "❯"
-    return
+    R_THREAD_ICON="❯"
+  else
+    case "$tool" in
+      claude)   R_THREAD_ICON="✳" ;;
+      codex)    R_THREAD_ICON="◇" ;;
+      opencode) R_THREAD_ICON="▣" ;;
+      amp)      R_THREAD_ICON="◆" ;;
+      aider)    R_THREAD_ICON="◈" ;;
+      "")       R_THREAD_ICON="❯" ;;
+      *)        R_THREAD_ICON="●" ;;
+    esac
   fi
-  case "$tool" in
-    claude)   echo "✳" ;;
-    codex)    echo "◇" ;;
-    opencode) echo "▣" ;;
-    amp)      echo "◆" ;;
-    aider)    echo "◈" ;;
-    "")       echo "❯" ;;
-    *)        echo "●" ;;
-  esac
+  printf '%s\n' "$R_THREAD_ICON"
 }
 
 # One section heading: coloured project label, a dim rule, and optionally a "+"
@@ -1711,10 +1737,13 @@ park_pane() {
 # Python, not bash: this needs a real graph walk over the chain edges plus a sort,
 # and the same structured-data reasons the harvesters use python apply here.
 build_pr_rows() {
-  local expanded
-  expanded=$(tmux show-option -t "$SESSION" -qv @llmux_pr_expanded 2>/dev/null || true)
-  local blob
-  blob=$(tmux show-option -t "$SESSION" -qv @llmux_prs_state 2>/dev/null || true)
+  # Taken as args when the caller already read them (render_sidebar needs both for
+  # its cache signature), so this doesn't repeat two tmux round-trips per paint.
+  local blob="${1-}" expanded="${2-}"
+  if [[ $# -lt 2 ]]; then
+    blob=$(tmux show-option -t "$SESSION" -qv @llmux_prs_state 2>/dev/null || true)
+    expanded=$(tmux show-option -t "$SESSION" -qv @llmux_pr_expanded 2>/dev/null || true)
+  fi
   python3 -c "$PY_PAUSED_IO"'
 import sys, time
 path, blob, expanded, stale_days = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
@@ -1855,13 +1884,24 @@ render_sidebar() {
   # Tally the states that mean "a thread has stopped and needs you" BEFORE drawing,
   # so the title row can carry the count. Without it, a blocked thread below the
   # fold — or one whose section you aren't looking at — announces itself nowhere.
+  # list_threads spawns tmux + awk + sort, and it used to run TWICE per paint: once
+  # for this tally and again for the draw snapshot. Snapshot once, count off the
+  # snapshot.
+  local threads_snap=() tline
+  while IFS= read -r tline; do
+    [[ -n "$tline" ]] && threads_snap+=("$tline")
+  done < <(list_threads)
+
   local n_blocked=0 n_perm=0 st
-  while IFS='|' read -r _p _n _t st _rest; do
+  for tline in ${threads_snap[@]+"${threads_snap[@]}"}; do
+    # Inline parameter expansion, not $(cut_field4 …) — a command substitution is a
+    # fork, which is the exact cost this loop is trying to avoid.
+    st="${tline#*|}"; st="${st#*|}"; st="${st#*|}"; st="${st%%|*}"
     case "$st" in
       blocked) ((n_blocked++)) ;;
       perm)    ((n_perm++)) ;;
     esac
-  done < <(list_threads)
+  done
 
   local out=""
   # Two columns short of SIDEBAR_RULE_WIDTH: the rule stops, then a space, then
@@ -1888,11 +1928,12 @@ render_sidebar() {
   # them in this same sequence.
   local lines=() pane_id name tool status win is_term group
   local idx=0
-  while IFS='|' read -r pane_id name tool status win is_term group; do
+  for tline in ${threads_snap[@]+"${threads_snap[@]}"}; do
+    IFS='|' read -r pane_id name tool status win is_term group <<< "$tline"
     [[ -z "$pane_id" ]] && continue
     ((idx++))
     lines+=("${idx}|${pane_id}|${name}|${tool}|${status}|${is_term}|${group}")
-  done < <(list_threads)
+  done
 
   # Two maps, both published with the pixels below:
   #
@@ -1914,13 +1955,37 @@ render_sidebar() {
   # PR rows, precomputed per project so the draw loop below stays a straight walk.
   # Each element: "project<TAB>kind<TAB>label<TAB>url<TAB>extra" where kind is
   # `pr` or `stack`. Built once because grouping needs to see every PR at once.
-  local pr_rows=()
-  if [[ -n "$(read_prs | head -1)" ]]; then
-    local prline
-    while IFS= read -r prline; do
-      [[ -n "$prline" ]] && pr_rows+=("$prline")
-    done < <(build_pr_rows)
+  # ONE python3 invocation, not two. The old emptiness guard called read_prs purely
+  # to ask "are there any?" and then build_pr_rows asked again — and a python3 start
+  # is ~95ms, so that guard cost more than the work it was trying to skip. An empty
+  # registry now costs one interpreter start instead of two, and a non-empty one
+  # costs one instead of two.
+  # Cached behind a cheap signature. build_pr_rows costs one python3 start (~140ms
+  # under load) and the paint runs every 2s, but its inputs change only when a PR is
+  # registered (file mtime), when llmux-watch refreshes state (the blob), or when a
+  # stack is toggled (the expanded set) — so recomputing every tick was most of the
+  # paint's wall time spent re-deriving an identical answer.
+  #
+  # The minute bucket is what makes staleness still work: PR_STALE_DAYS is evaluated
+  # against "now", so without it a PR crossing the 14-day line would keep drawing
+  # until something else invalidated the cache.
+  local pr_blob pr_exp pr_sig pr_sig_old pr_raw
+  pr_blob=$(tmux show-option -t "$SESSION" -qv @llmux_prs_state 2>/dev/null || true)
+  pr_exp=$(tmux show-option -t "$SESSION" -qv @llmux_pr_expanded 2>/dev/null || true)
+  pr_sig="$({ stat -f %m "$PAUSED_FILE" 2>/dev/null || echo 0; })|${pr_blob}|${pr_exp}|$(( $(date +%s) / 60 ))"
+  pr_sig_old=$(tmux show-option -t "$SESSION" -qv @llmux_pr_rows_sig 2>/dev/null || true)
+  if [[ -n "$pr_sig_old" && "$pr_sig_old" == "$pr_sig" ]]; then
+    pr_raw=$(tmux show-option -t "$SESSION" -qv @llmux_pr_rows 2>/dev/null || true)
+  else
+    pr_raw=$(build_pr_rows "$pr_blob" "$pr_exp")
+    tmux set-option -t "$SESSION" @llmux_pr_rows "$pr_raw" 2>/dev/null || true
+    tmux set-option -t "$SESSION" @llmux_pr_rows_sig "$pr_sig" 2>/dev/null || true
   fi
+
+  local pr_rows=() prline
+  while IFS= read -r prline; do
+    [[ -n "$prline" ]] && pr_rows+=("$prline")
+  done <<< "$pr_raw"
 
   # Kept out of list_threads on purpose: its positional field contract has a dozen
   # read sites of varying arity, and widening it would touch every one.
@@ -1972,7 +2037,7 @@ render_sidebar() {
       # carried by BOLD plus the ▶ marker instead — the marker is why that still
       # reads at a glance.
       local tcolour marker=" "
-      tcolour=$(tool_colour "$tool" "$is_term")
+      tool_colour "$tool" "$is_term" >/dev/null; tcolour="$R_TOOL_COLOUR"
       local name_col="\033[38;5;${gcolour}m" idx_col="\033[38;5;${gcolour}m"
       local icon_col="\033[38;5;${tcolour}m"
       if [[ "$pane_id" == "$active" ]]; then
@@ -1987,7 +2052,7 @@ render_sidebar() {
       # an answer has to win the eye against eleven that aren't, and the ▶ marker
       # still distinguishes which one is on screen.
       local smeta semoji scolour flag=""
-      smeta=$(status_meta "$status")
+      status_meta "$status" >/dev/null; smeta="$R_STATUS_META"
       semoji="${smeta%%|*}"
       scolour="${smeta#*|}"; scolour="${scolour%%|*}"
       if [[ -n "$semoji" ]]; then
@@ -1998,7 +2063,7 @@ render_sidebar() {
         fi
       fi
       local icon
-      icon=$(thread_icon "$tool" "$is_term")
+      thread_icon "$tool" "$is_term" >/dev/null; icon="$R_THREAD_ICON"
 
       # Only when no status flag is drawn: a stale stamp can outlive an
       # idle→blocked escalation, and the louder state wins the row.
@@ -2007,8 +2072,8 @@ render_sidebar() {
         local done_at=""
         [[ "$done_map" =~ (^|$'\n')"${pane_id}"\|([0-9]+) ]] && done_at="${BASH_REMATCH[2]}"
         if [[ -n "$done_at" && "$done_at" != "0" ]] && (( now_ts >= done_at )); then
-          age_txt=$(fmt_age_short $(( now_ts - done_at )))
-          fade=$(done_fade_colour $(( now_ts - done_at )))
+          fmt_age_short $(( now_ts - done_at )) >/dev/null; age_txt="$R_AGE"
+          done_fade_colour $(( now_ts - done_at )) >/dev/null; fade="$R_FADE"
         fi
       fi
 
@@ -3116,7 +3181,16 @@ cmd_sidebar() {
   # one stops itself instead of dueling — at most one loop paints, always.
   local inner=""
   [[ -n "${LLMUX_SESSION:-}" ]] && inner+="LLMUX_SESSION=$(printf '%q' "$LLMUX_SESSION") "
-  inner+="llmux _sidebar-loop"
+  # Forward the config root too, and re-invoke THIS script by absolute path rather
+  # than whatever `llmux` resolves to on the pane shell's PATH. Without both, a
+  # second llmux running from another checkout (the isolated dev environment) had
+  # its sidebar painted by the PRODUCTION binary reading the PRODUCTION config —
+  # so the thing under test was never the thing running.
+  [[ -n "${XDG_CONFIG_HOME:-}" ]] && inner+="XDG_CONFIG_HOME=$(printf '%q' "$XDG_CONFIG_HOME") "
+  local self
+  self="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)/$(basename "$(readlink -f "$0" 2>/dev/null || echo "$0")")"
+  [[ -x "$self" ]] || self="llmux"
+  inner+="$(printf '%q' "$self") _sidebar-loop"
   local loop_cmd="clear; while :; do ${inner} || break; sleep 1; done"
   tmux send-keys -t "$sb" "$loop_cmd" Enter
   tmux select-pane -t "$first_pane" 2>/dev/null || true
@@ -5110,6 +5184,7 @@ print("%s,%d,%d" % (d.get("state","") , 1 if d.get("isDraft") else 0, ep))
     blob+="${repo}#${number}=${parsed};"
   done < <(read_prs)
   tmux set-option -t "$SESSION" @llmux_prs_state "${blob%;}" 2>/dev/null || true
+  invalidate_pr_rows
 }
 
 cmd_pr() {
@@ -5140,6 +5215,7 @@ cmd_pr() {
       fi
       [[ -z "$repo" ]] && { echo "Error: could not determine repo — pass the PR URL" >&2; return 1; }
       if remove_pr "$repo" "$num"; then
+        invalidate_pr_rows
         echo "Unregistered ${repo}#${num}."
         render_sidebar 2>/dev/null || true
       else
@@ -5196,6 +5272,7 @@ cmd_pr() {
   [[ -z "$title" ]] && title="$gh_title"
 
   add_pr "$repo" "$num" "$url" "$title" "$project" "$branch" "$base" "$stack"
+  invalidate_pr_rows
   echo "Registered ${repo}#${num} → ${project:-scratch}${stack:+ [stack: $stack]}"
   echo "  $title"
   cmd__pr_refresh 2>/dev/null || true
@@ -5203,6 +5280,17 @@ cmd_pr() {
 }
 
 cmd__slot_status() {
+  # Cached for 60s. This shells out to `git rev-parse` once per slot and the Owner
+  # monorepo has nine of them, so a live call costs ~700ms — paid by the tmux status
+  # line every status-interval, which is what made the whole session feel sluggish.
+  # Slot ownership changes on the scale of minutes, not seconds.
+  local _cache _at _now
+  _now=$(date +%s)
+  _at=$(tmux show-option -t "$SESSION" -qv @llmux_slotstatus_at 2>/dev/null || true)
+  if [[ "$_at" =~ ^[0-9]+$ ]] && (( _now - _at < 60 )); then
+    tmux show-option -t "$SESSION" -qv @llmux_slotstatus 2>/dev/null || true
+    return 0
+  fi
   [[ -d "$OWNER_SLOTS_DIR" ]] || return 0
 
   local out=""
@@ -5221,6 +5309,8 @@ cmd__slot_status() {
   done
   shopt -u nullglob
 
+  tmux set-option -t "$SESSION" @llmux_slotstatus "$out" 2>/dev/null || true
+  tmux set-option -t "$SESSION" @llmux_slotstatus_at "$_now" 2>/dev/null || true
   printf '%s' "$out"
 }
 
@@ -5558,6 +5648,7 @@ case "$command" in
   top)       cmd_top "$@" ;;
   _relayout)     apply_layout ;;
   _sidebar-loop) sidebar_loop ;;
+  _render)       render_sidebar ;;
   _click)        sidebar_click "$@" ;;
   _newthread)    cmd__newthread "$@" ;;
   _movethread)   cmd__movethread "$@" ;;
