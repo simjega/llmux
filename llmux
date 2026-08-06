@@ -89,9 +89,10 @@ Usage:
                                                 Unleash service is inferred from the flag
                                                 prefix (owner-<prefix>) unless given;
                                                 --url overrides the generated link.
-                                                Both render as clickable (Monitor) (Flag)
-                                                on their own row under the project title;
-                                                no argument lists what is attached.
+                                                Renders as a clickable link labelled with
+                                                the flag name minus its service prefix,
+                                                beside (Monitor) on their own row under
+                                                the project title; no argument lists them.
   llmux pr add <number|url> [--title T]         Register a PR under a project so it lists in
              [--project P] [--stack S]          the sidebar. Project defaults to the calling
                                                 pane's section; title to the PR's own. PRs
@@ -369,6 +370,17 @@ unleash_service_for() {
     "$flag")      R_UNLEASH_SVC="default" ;;   # no dotted prefix to infer from
     *)            R_UNLEASH_SVC="owner-${prefix}" ;;
   esac
+}
+
+# What a flag link is LABELLED with. The service prefix is the least informative part
+# -- every Hermes flag starts "hermes." -- so it is dropped and the remainder shown,
+# clipped to whatever the row has left. Only the FIRST segment goes: a flag like
+# olympus.checkout.newFeeCalculation keeps "checkout.newFeeCalculation", because that
+# middle segment is real context, not boilerplate.
+flag_label() {
+  local flag="$1" width="${2:-18}" body="${1#*.}"
+  [[ "$body" == "$flag" ]] && body="$flag"   # no dotted prefix to strip
+  R_FLAG_LABEL="${body:0:width}"
 }
 
 read_flags() {
@@ -2193,8 +2205,12 @@ render_sidebar() {
         lcol=$(( lcol + 10 )); out+=" "
       fi
       if [[ -n "$flg_url" ]]; then
-        out+="\033[4;38;5;${gcolour}m(Flag)\033[0m"
-        linkmap+="${row}:${lcol}:$(( lcol + 5 )):${flg_url}"$'\n'
+        # Whatever the row has left after the indent and any (Monitor).
+        flag_label "$flg_name" $(( sb_w - lcol ))
+        if [[ -n "$R_FLAG_LABEL" ]]; then
+          out+="\033[4;38;5;${gcolour}m${R_FLAG_LABEL}\033[0m"
+          linkmap+="${row}:${lcol}:$(( lcol + ${#R_FLAG_LABEL} - 1 )):${flg_url}"$'\n'
+        fi
       fi
       out+=$'\n'
       ((row++))
