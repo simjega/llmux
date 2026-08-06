@@ -85,7 +85,10 @@ Usage:
   llmux project unlink <key>                    Detach the notes (they are left alone)
   llmux project open <key>                      Open the project's hub note
   llmux project monitor [<key> <url|--clear>]   Attach a monitoring dashboard to a project
-  llmux project flag [<key> <flag> [service]]   Attach an Unleash flag to a project. The
+  llmux project flag [<key> <flag> [service]]   Attach an Unleash flag to a project (a
+             [--remove <flag>] [--clear]        project may have several; re-adding one
+                                                updates it). --remove drops one,
+                                                --clear drops all. The
                                                 Unleash service is inferred from the flag
                                                 prefix (owner-<prefix>) unless given;
                                                 --url overrides the generated link.
@@ -387,24 +390,41 @@ read_flags() {
   [[ -f "$PAUSED_FILE" ]] || return 0
   python3 -c "$PY_PAUSED_IO"'
 import sys
+# A project can be gated on more than one flag -- custom campaigns has a variant
+# flag AND a reads flag -- so the value is a LIST. Older files stored a single
+# dict; accept both so an in-flight session keeps working.
 for k, v in (_load(sys.argv[1]).get("flags") or {}).items():
-    if isinstance(v, dict) and v.get("flag"):
-        print("%s\t%s\t%s\t%s" % (k, v.get("flag",""), v.get("service",""), v.get("url","")))
+    entries = v if isinstance(v, list) else [v]
+    for e in entries:
+        if isinstance(e, dict) and e.get("flag"):
+            print("%s\t%s\t%s\t%s" % (k, e.get("flag",""), e.get("service",""), e.get("url","")))
 ' "$PAUSED_FILE"
 }
 
 set_flag() {
   python3 -c "$PY_PAUSED_IO"'
 import sys
-path, key, flag, service, url = sys.argv[1:6]
+path, key, flag, service, url, mode = (sys.argv[1:6] + ["add"])[:6]
+if len(sys.argv) > 6:
+    mode = sys.argv[6]
 _lk = _lock(path)
 d = _load(path)
-if flag:
-    d["flags"][key] = {"flag": flag, "service": service, "url": url}
+cur = d["flags"].get(key)
+entries = cur if isinstance(cur, list) else ([cur] if isinstance(cur, dict) and cur.get("flag") else [])
+if mode == "remove":
+    entries = [e for e in entries if e.get("flag") != flag]
+elif flag:
+    # Re-registering the same flag updates it in place rather than duplicating.
+    entries = [e for e in entries if e.get("flag") != flag]
+    entries.append({"flag": flag, "service": service, "url": url})
+else:
+    entries = []
+if entries:
+    d["flags"][key] = entries
 else:
     d["flags"].pop(key, None)
 _save(path, d)
-' "$PAUSED_FILE" "$1" "${2:-}" "${3:-}" "${4:-}"
+' "$PAUSED_FILE" "$1" "${2:-}" "${3:-}" "${4:-}" "${5:-add}"
 }
 
 # ── Project monitoring links ─────────────────────────────────────────────────
@@ -2198,12 +2218,11 @@ render_sidebar() {
     # 20-character project name plus "(Monitor) (Flag)" cannot fit 30 columns, and
     # the loser is always the thing you wanted to click. A dedicated row spills
     # once, deliberately, instead of fighting for width on every project.
-    local mon_url="" flg_url="" flg_name=""
+    local mon_url="" flg_url=""
     if [[ -n "$mon_map" ]]; then
       mon_url=$(printf '%s' "$mon_map" | awk -F'\t' -v k="$key" '$1==k {print $2; exit}')
     fi
     if [[ -n "$flag_map" ]]; then
-      flg_name=$(printf '%s' "$flag_map" | awk -F'\t' -v k="$key" '$1==k {print $2; exit}')
       flg_url=$(printf '%s' "$flag_map" | awk -F'\t' -v k="$key" '$1==k {print $4; exit}')
     fi
     if [[ -n "$mon_url" || -n "$flg_url" ]]; then
@@ -2214,14 +2233,22 @@ render_sidebar() {
         linkmap+="${row}:${lcol}:$(( lcol + 8 )):${mon_url}"$'\n'
         lcol=$(( lcol + 10 )); out+=" "
       fi
-      if [[ -n "$flg_url" ]]; then
-        # Whatever the row has left after the indent and any (Monitor).
-        flag_label "$flg_name" $(( sb_w - lcol ))
-        if [[ -n "$R_FLAG_LABEL" ]]; then
-          out+="\033[4;38;5;${gcolour}m${R_FLAG_LABEL}\033[0m"
-          linkmap+="${row}:${lcol}:$(( lcol + ${#R_FLAG_LABEL} - 1 )):${flg_url}"$'\n'
-        fi
-      fi
+      # Every flag the project carries, until the row runs out. A stub of four or
+      # fewer characters identifies nothing and cannot be aimed at, so stop rather
+      # than draw one.
+      local fl_name fl_url first_flag=1
+      while IFS=$'\t' read -r fl_name fl_url; do
+        [[ -z "$fl_url" ]] && continue
+        (( sb_w - lcol < 5 )) && break
+        if (( ! first_flag )); then out+=" "; lcol=$(( lcol + 1 )); fi
+        (( sb_w - lcol < 5 )) && break
+        flag_label "$fl_name" $(( sb_w - lcol ))
+        [[ -z "$R_FLAG_LABEL" ]] && break
+        out+="\033[4;38;5;${gcolour}m${R_FLAG_LABEL}\033[0m"
+        linkmap+="${row}:${lcol}:$(( lcol + ${#R_FLAG_LABEL} - 1 )):${fl_url}"$'\n'
+        lcol=$(( lcol + ${#R_FLAG_LABEL} ))
+        first_flag=0
+      done < <(printf '%s' "$flag_map" | awk -F'\t' -v k="$key" '$1==k {print $2"\t"$4}')
       out+=$'\n'
       ((row++))
     fi
@@ -2979,8 +3006,15 @@ cmd_project() {
       fi
       fkey=$(sanitize_project "$fkey")
       if [[ "$fname" == "--clear" || "$fname" == "none" ]]; then
-        set_flag "$fkey" "" "" ""
-        echo "Cleared flag for $fkey."
+        set_flag "$fkey" "" "" "" clear
+        echo "Cleared all flags for $fkey."
+        render_sidebar 2>/dev/null || true
+        return 0
+      fi
+      if [[ "$fname" == "--remove" ]]; then
+        [[ -z "${3:-}" ]] && { echo "Usage: llmux project flag <key> --remove <flag-name>" >&2; return 1; }
+        set_flag "$fkey" "$3" "" "" remove
+        echo "Removed $3 from $fkey."
         render_sidebar 2>/dev/null || true
         return 0
       fi
@@ -2990,7 +3024,7 @@ cmd_project() {
       [[ "${4:-}" == "--url" ]] && furl="${5:-}"
       if [[ -z "$fsvc" ]]; then unleash_service_for "$fname"; fsvc="$R_UNLEASH_SVC"; fi
       [[ -z "$furl" ]] && furl="${UNLEASH_BASE}/projects/${fsvc}/features/${fname}"
-      set_flag "$fkey" "$fname" "$fsvc" "$furl"
+      set_flag "$fkey" "$fname" "$fsvc" "$furl" add
       echo "$fkey → $fname [$fsvc]"
       echo "  $furl"
       render_sidebar 2>/dev/null || true
