@@ -2030,10 +2030,20 @@ render_sidebar() {
   # Treat the width the pane is actually at as the width you want, so dragging the
   # divider is all it takes to change it — and sidebar_apply_layout restores that
   # instead of the constant on the next switch.
-  local want_w
-  want_w=$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_width 2>/dev/null || true)
-  [[ "$want_w" == "$sb_w" ]] || \
-    tmux set-option -t "$SESSION" @llmux_sidebar_width "$sb_w" 2>/dev/null || true
+  #
+  # ONLY while the sidebar is sharing its window with a thread. Removing the visible
+  # thread leaves the sidebar briefly alone, and tmux stretches it to the full window;
+  # recording THAT as intent meant the next switch restored a full-width sidebar and
+  # squeezed the incoming thread to a single column. A width measured with nothing
+  # beside it is an artefact of the layout, not a choice anyone made.
+  local sb_win npanes want_w
+  sb_win=$(tmux display-message -p -t "$sb" '#{window_index}' 2>/dev/null || true)
+  npanes=$({ tmux list-panes -t "$SESSION:${sb_win:-0}" -F x 2>/dev/null | wc -l | tr -d ' '; } || echo 1)
+  if [[ "$npanes" -gt 1 ]]; then
+    want_w=$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_width 2>/dev/null || true)
+    [[ "$want_w" == "$sb_w" ]] || \
+      tmux set-option -t "$SESSION" @llmux_sidebar_width "$sb_w" 2>/dev/null || true
+  fi
 
   # Tally the states that mean "a thread has stopped and needs you" BEFORE drawing,
   # so the title row can carry the count. Without it, a blocked thread below the
@@ -3045,9 +3055,18 @@ sidebar_apply_layout() {
   # SIDEBAR_WIDTH on every switch, so widening the sidebar to read longer names
   # survived only until the next thread change. render_sidebar records a manual
   # drag into @llmux_sidebar_width, and this restores that.
-  local want
+  local want winw
   want=$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_width 2>/dev/null || true)
   [[ "$want" =~ ^[0-9]+$ ]] || want="$SIDEBAR_WIDTH"
+  # Clamp, so a poisoned value can never wedge the layout — and so a session that
+  # already stored one heals itself on the next layout instead of needing a manual
+  # fix. The thread is the point of the window; the sidebar never gets most of it.
+  winw=$(tmux display-message -p -t "$sb" '#{window_width}' 2>/dev/null || true)
+  if [[ "$winw" =~ ^[0-9]+$ ]] && (( winw > 40 )); then
+    local maxw=$(( winw / 2 ))
+    (( want > maxw )) && want="$SIDEBAR_WIDTH"
+  fi
+  (( want < 10 )) && want="$SIDEBAR_WIDTH"
   tmux resize-pane -t "$sb" -x "$want" 2>/dev/null || true
 }
 
