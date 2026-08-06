@@ -84,8 +84,13 @@ Usage:
                                                 when no slug is given)
   llmux project unlink <key>                    Detach the notes (they are left alone)
   llmux project open <key>                      Open the project's hub note
-  llmux project monitor [<key> <url|--clear>]   Attach a monitoring dashboard to a project.
-                                                Its heading gains a clickable "(Monitor)";
+  llmux project monitor [<key> <url|--clear>]   Attach a monitoring dashboard to a project
+  llmux project flag [<key> <flag> [service]]   Attach an Unleash flag to a project. The
+                                                Unleash service is inferred from the flag
+                                                prefix (owner-<prefix>) unless given;
+                                                --url overrides the generated link.
+                                                Both render as clickable (Monitor) (Flag)
+                                                on their own row under the project title;
                                                 no argument lists what is attached.
   llmux pr add <number|url> [--title T]         Register a PR under a project so it lists in
              [--project P] [--stack S]          the sidebar. Project defaults to the calling
@@ -234,6 +239,7 @@ def _load(path):
     d.setdefault("prs", [])
     d.setdefault("session", {})
     d.setdefault("monitors", {})
+    d.setdefault("flags", {})
     return d
 
 def _save(path, d):
@@ -347,6 +353,46 @@ open_url() {
   [[ -n "${1:-}" ]] || return 0
   command -v open >/dev/null 2>&1 || return 0
   (open "$1" >/dev/null 2>&1 &) || true
+}
+
+
+# Unleash link, best effort. The URL needs the Unleash PROJECT, which the flag name
+# alone does not give you -- hermes.* and olympus.* live in different projects -- so
+# the project ("service") is stored alongside the flag rather than guessed at click
+# time. Observed convention is owner-<prefix>, with auth-service as its own project.
+UNLEASH_BASE="https://us.app.unleash-hosted.com/usgg0011"
+
+unleash_service_for() {
+  local flag="$1" prefix="${1%%.*}"
+  case "$prefix" in
+    auth-service) R_UNLEASH_SVC="auth-service" ;;
+    "$flag")      R_UNLEASH_SVC="default" ;;   # no dotted prefix to infer from
+    *)            R_UNLEASH_SVC="owner-${prefix}" ;;
+  esac
+}
+
+read_flags() {
+  [[ -f "$PAUSED_FILE" ]] || return 0
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+for k, v in (_load(sys.argv[1]).get("flags") or {}).items():
+    if isinstance(v, dict) and v.get("flag"):
+        print("%s\t%s\t%s\t%s" % (k, v.get("flag",""), v.get("service",""), v.get("url","")))
+' "$PAUSED_FILE"
+}
+
+set_flag() {
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+path, key, flag, service, url = sys.argv[1:6]
+_lk = _lock(path)
+d = _load(path)
+if flag:
+    d["flags"][key] = {"flag": flag, "service": service, "url": url}
+else:
+    d["flags"].pop(key, None)
+_save(path, d)
+' "$PAUSED_FILE" "$1" "${2:-}" "${3:-}" "${4:-}"
 }
 
 # ── Project monitoring links ─────────────────────────────────────────────────
@@ -1740,25 +1786,11 @@ thread_icon() {
 # for the whole sidebar (on the rule row), because a new thread now needs a
 # platform chosen and that question belongs to the thread, not the section.
 sidebar_section_header() {
-  local key="$1" with_plus="${2:-0}" mon_url="${3:-}"
+  local key="$1" with_plus="${2:-0}"
   local meta label colour rule="" i=0 rule_len
   project_meta "$key" >/dev/null; meta="$R_PROJECT_META"
   label="${meta%%|*}"
   colour="${meta##*|}"
-
-  # "(Monitor)" is the affordance; the label is context. So when the pane is too
-  # narrow for both, the LABEL gives ground — a clipped project name is still
-  # recognisable, whereas a clipped "(Monito" is both unreadable and unclickable.
-  # R_SECTION_MON is "startcol endcol" for the click map, empty when not drawn.
-  R_SECTION_MON=""
-  local mon_txt=""
-  if [[ -n "$mon_url" ]]; then
-    local avail=$(( ${R_SECTION_W:-$SIDEBAR_WIDTH} - 1 - 10 ))
-    (( avail < 4 )) && avail=4
-    (( ${#label} > avail )) && label="${label:0:avail}"
-    mon_txt=" (Monitor)"
-    R_SECTION_MON="$(( 1 + ${#label} + 1 )) $(( 1 + ${#label} + 9 ))"
-  fi
   if [[ "$with_plus" == "1" ]]; then
     # Stop the rule so the "+" lands exactly in SIDEBAR_PLUS_COL for every
     # section: 1 leading space + label + 1 space + rule + 1 space + "+".
@@ -1767,14 +1799,10 @@ sidebar_section_header() {
     # Plus-less sections keep the rule flush with the title divider.
     rule_len=$(( SIDEBAR_RULE_WIDTH - ${#label} - 1 ))
   fi
-  [[ -n "$mon_txt" ]] && rule_len=$(( rule_len - 10 ))
+
   (( rule_len < 0 )) && rule_len=0
   while (( i < rule_len )); do rule+="─"; ((i++)); done
-  # Monitor link takes the section colour but is underlined, so it reads as the one
-  # clickable thing on an otherwise inert heading row.
-  local mon_ansi=""
-  [[ -n "$mon_txt" ]] && printf -v mon_ansi ' \033[4;38;5;%sm(Monitor)\033[0m' "$colour"
-  printf -v R_SECTION_HEADER ' \033[1;38;5;%sm%s\033[0m%s \033[38;5;236m%s\033[0m' "$colour" "$label" "$mon_ansi" "$rule"
+  printf -v R_SECTION_HEADER ' \033[1;38;5;%sm%s\033[0m \033[38;5;236m%s\033[0m' "$colour" "$label" "$rule"
   [[ "$with_plus" == "1" ]] && printf -v R_SECTION_HEADER '%s \033[1;38;5;%sm+\033[0m' "$R_SECTION_HEADER" "$colour"
   printf '%s' "$R_SECTION_HEADER"
   return 0
@@ -2063,7 +2091,7 @@ render_sidebar() {
   #
   # Absolute rows mean spacers and headings appear in neither map, so clicking
   # them is a no-op for free.
-  local rowmap="" addmap="1:*," prmap="" monmap=""
+  local rowmap="" addmap="1:*," prmap="" linkmap=""
   local key meta label gcolour drawn=0 entry eidx
 
   # PR rows, precomputed per project so the draw loop below stays a straight walk.
@@ -2102,6 +2130,11 @@ render_sidebar() {
     [[ -n "$monline" ]] && mon_map+="${monline}"$'\n'
   done < <(read_monitors)
 
+  local flag_map="" flagline
+  while IFS= read -r flagline; do
+    [[ -n "$flagline" ]] && flag_map+="${flagline}"$'\n'
+  done < <(read_flags)
+
   local pr_rows=() prline
   while IFS= read -r prline; do
     [[ -n "$prline" ]] && pr_rows+=("$prline")
@@ -2135,18 +2168,37 @@ render_sidebar() {
       ((row++))
     fi
     drawn=1
-    local mon_url=""
+    sidebar_section_header "$key" 0 >/dev/null
+    out+="${R_SECTION_HEADER}"$'\n'
+    ((row++))
+
+    # Links get their OWN row under the heading rather than sharing it. Inline, a
+    # 20-character project name plus "(Monitor) (Flag)" cannot fit 30 columns, and
+    # the loser is always the thing you wanted to click. A dedicated row spills
+    # once, deliberately, instead of fighting for width on every project.
+    local mon_url="" flg_url="" flg_name=""
     if [[ -n "$mon_map" ]]; then
       mon_url=$(printf '%s' "$mon_map" | awk -F'\t' -v k="$key" '$1==k {print $2; exit}')
     fi
-    R_SECTION_W="$sb_w"
-    sidebar_section_header "$key" 0 "$mon_url" >/dev/null
-    out+="${R_SECTION_HEADER}"$'\n'
-    # Published in the same call that paints the row, like rowmap/prmap: a heading
-    # row is otherwise inert, so only these exact columns become clickable.
-    [[ -n "$R_SECTION_MON" && -n "$mon_url" ]] && \
-      monmap+="${row}:${R_SECTION_MON// /:}:${mon_url},"
-    ((row++))
+    if [[ -n "$flag_map" ]]; then
+      flg_name=$(printf '%s' "$flag_map" | awk -F'\t' -v k="$key" '$1==k {print $2; exit}')
+      flg_url=$(printf '%s' "$flag_map" | awk -F'\t' -v k="$key" '$1==k {print $4; exit}')
+    fi
+    if [[ -n "$mon_url" || -n "$flg_url" ]]; then
+      local lrow="" lcol=2
+      out+="  "
+      if [[ -n "$mon_url" ]]; then
+        out+="\033[4;38;5;${gcolour}m(Monitor)\033[0m"
+        linkmap+="${row}:${lcol}:$(( lcol + 8 )):${mon_url}"$'\n'
+        lcol=$(( lcol + 10 )); out+=" "
+      fi
+      if [[ -n "$flg_url" ]]; then
+        out+="\033[4;38;5;${gcolour}m(Flag)\033[0m"
+        linkmap+="${row}:${lcol}:$(( lcol + 5 )):${flg_url}"$'\n'
+      fi
+      out+=$'\n'
+      ((row++))
+    fi
 
     for entry in ${lines[@]+"${lines[@]}"}; do
       [[ "${entry##*|}" == "$key" ]] || continue
@@ -2287,7 +2339,7 @@ render_sidebar() {
   # in the call that paints it, so a click can never resolve against an order the
   # pixels no longer show.
   tmux set-option -t "$SESSION" @llmux_sidebar_prmap "${prmap%,}" 2>/dev/null || true
-  tmux set-option -t "$SESSION" @llmux_sidebar_monmap "${monmap%,}" 2>/dev/null || true
+  tmux set-option -t "$SESSION" @llmux_sidebar_linkmap "$linkmap" 2>/dev/null || true
 
   # respawn-pane would kill the loop; write straight into the pane instead.
   tmux send-keys -t "$sb" "" 2>/dev/null || true
@@ -2411,26 +2463,21 @@ sidebar_click() {
 
   (( y < SIDEBAR_HEADER_LINES )) && return 0
 
-  # Monitor links live ON a heading row, which carries no thread, so this is checked
-  # before the thread maps and is column-scoped — clicking the label or the rule stays
-  # inert, exactly as it was.
-  local monmap mpair
-  monmap=$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_monmap 2>/dev/null || true)
-  if [[ -n "$monmap" && -n "$x" ]]; then
-    local IFS_MON="$IFS"
-    IFS=','
-    for mpair in $monmap; do
-      IFS="$IFS_MON"
-      local m_row="${mpair%%:*}" m_rest="${mpair#*:}"
-      local m_s="${m_rest%%:*}"; m_rest="${m_rest#*:}"
-      local m_e="${m_rest%%:*}"; local m_url="${m_rest#*:}"
-      if [[ "$m_row" == "$y" ]] && (( x >= m_s )) && (( x <= m_e )); then
-        [[ -n "$m_url" ]] && open_url "$m_url"
+  # Link rows (Monitor / Flag) carry no thread, so they are checked before the thread
+  # maps and are column-scoped -- clicking anywhere else on the row stays inert.
+  local linkmap lline l_row l_s l_e l_url
+  linkmap=$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_linkmap 2>/dev/null || true)
+  if [[ -n "$linkmap" && -n "$x" ]]; then
+    while IFS= read -r lline; do
+      [[ -z "$lline" ]] && continue
+      l_row="${lline%%:*}"; lline="${lline#*:}"
+      l_s="${lline%%:*}";   lline="${lline#*:}"
+      l_e="${lline%%:*}";   l_url="${lline#*:}"
+      if [[ "$l_row" == "$y" ]] && (( x >= l_s )) && (( x <= l_e )); then
+        open_url "$l_url"
         return 0
       fi
-      IFS=','
-    done
-    IFS="$IFS_MON"
+    done <<< "$linkmap"
   fi
 
   # PR rows first: prmap and rowmap are disjoint by construction (each row draws
@@ -2893,6 +2940,35 @@ cmd_project() {
       tolaria_set_association "$slug" "" || return 1
       tolaria_log "$slug" "Unlinked from llmux thread section '$key'."
       echo "Unlinked '$key' from '$slug' (the notes are untouched)"
+      ;;
+    flag)
+      local fkey="${1:-}" fname="${2:-}" fsvc="${3:-}" furl=""
+      if [[ -z "$fkey" ]]; then
+        local k n sv u
+        printf '%-28s %-38s %-16s %s\n' PROJECT FLAG SERVICE LINK
+        while IFS=$'\t' read -r k n sv u; do
+          [[ -n "$k" ]] && printf '%-28s %-38s %-16s %s\n' "$k" "$n" "$sv" "$u"
+        done < <(read_flags)
+        return 0
+      fi
+      fkey=$(sanitize_project "$fkey")
+      if [[ "$fname" == "--clear" || "$fname" == "none" ]]; then
+        set_flag "$fkey" "" "" ""
+        echo "Cleared flag for $fkey."
+        render_sidebar 2>/dev/null || true
+        return 0
+      fi
+      [[ -z "$fname" ]] && { echo "Usage: llmux project flag <key> <flag-name> [unleash-service] [--url U]" >&2; return 1; }
+      # Explicit --url wins; otherwise infer the Unleash project from the flag prefix.
+      if [[ "$fsvc" == "--url" ]]; then furl="${4:-}"; fsvc=""; fi
+      [[ "${4:-}" == "--url" ]] && furl="${5:-}"
+      if [[ -z "$fsvc" ]]; then unleash_service_for "$fname"; fsvc="$R_UNLEASH_SVC"; fi
+      [[ -z "$furl" ]] && furl="${UNLEASH_BASE}/projects/${fsvc}/features/${fname}"
+      set_flag "$fkey" "$fname" "$fsvc" "$furl"
+      echo "$fkey → $fname [$fsvc]"
+      echo "  $furl"
+      render_sidebar 2>/dev/null || true
+      return 0
       ;;
     monitor)
       local mkey="${1:-}" murl="${2:-}"
