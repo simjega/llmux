@@ -84,6 +84,9 @@ Usage:
                                                 when no slug is given)
   llmux project unlink <key>                    Detach the notes (they are left alone)
   llmux project open <key>                      Open the project's hub note
+  llmux project monitor [<key> <url|--clear>]   Attach a monitoring dashboard to a project.
+                                                Its heading gains a clickable "(Monitor)";
+                                                no argument lists what is attached.
   llmux pr add <number|url> [--title T]         Register a PR under a project so it lists in
              [--project P] [--stack S]          the sidebar. Project defaults to the calling
                                                 pane's section; title to the PR's own. PRs
@@ -230,6 +233,7 @@ def _load(path):
     d.setdefault("paused", [])
     d.setdefault("prs", [])
     d.setdefault("session", {})
+    d.setdefault("monitors", {})
     return d
 
 def _save(path, d):
@@ -335,6 +339,43 @@ if len(d["paused"]) == before:
     sys.exit(1)
 _save(path, d)
 ' "$PAUSED_FILE" "$name"
+}
+
+
+# Single place a sidebar click turns into a browser tab.
+open_url() {
+  [[ -n "${1:-}" ]] || return 0
+  command -v open >/dev/null 2>&1 || return 0
+  (open "$1" >/dev/null 2>&1 &) || true
+}
+
+# ── Project monitoring links ─────────────────────────────────────────────────
+#
+# A project that has monitoring gets a clickable "(Monitor)" beside its heading, so
+# the dashboard is one click from the work rather than a bookmark you have to go
+# find. Stored per project key in paused.json — the same file, no new state.
+read_monitors() {
+  [[ -f "$PAUSED_FILE" ]] || return 0
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+for k, v in (_load(sys.argv[1]).get("monitors") or {}).items():
+    if v:
+        print("%s\t%s" % (k, v))
+' "$PAUSED_FILE"
+}
+
+set_monitor() {
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+path, key, url = sys.argv[1], sys.argv[2], sys.argv[3]
+_lk = _lock(path)
+d = _load(path)
+if url:
+    d["monitors"][key] = url
+else:
+    d["monitors"].pop(key, None)
+_save(path, d)
+' "$PAUSED_FILE" "$1" "${2:-}"
 }
 
 # ── Registered PRs ───────────────────────────────────────────────────────────
@@ -1699,11 +1740,25 @@ thread_icon() {
 # for the whole sidebar (on the rule row), because a new thread now needs a
 # platform chosen and that question belongs to the thread, not the section.
 sidebar_section_header() {
-  local key="$1" with_plus="${2:-0}"
+  local key="$1" with_plus="${2:-0}" mon_url="${3:-}"
   local meta label colour rule="" i=0 rule_len
   project_meta "$key" >/dev/null; meta="$R_PROJECT_META"
   label="${meta%%|*}"
   colour="${meta##*|}"
+
+  # "(Monitor)" is the affordance; the label is context. So when the pane is too
+  # narrow for both, the LABEL gives ground — a clipped project name is still
+  # recognisable, whereas a clipped "(Monito" is both unreadable and unclickable.
+  # R_SECTION_MON is "startcol endcol" for the click map, empty when not drawn.
+  R_SECTION_MON=""
+  local mon_txt=""
+  if [[ -n "$mon_url" ]]; then
+    local avail=$(( ${R_SECTION_W:-$SIDEBAR_WIDTH} - 1 - 10 ))
+    (( avail < 4 )) && avail=4
+    (( ${#label} > avail )) && label="${label:0:avail}"
+    mon_txt=" (Monitor)"
+    R_SECTION_MON="$(( 1 + ${#label} + 1 )) $(( 1 + ${#label} + 9 ))"
+  fi
   if [[ "$with_plus" == "1" ]]; then
     # Stop the rule so the "+" lands exactly in SIDEBAR_PLUS_COL for every
     # section: 1 leading space + label + 1 space + rule + 1 space + "+".
@@ -1712,9 +1767,14 @@ sidebar_section_header() {
     # Plus-less sections keep the rule flush with the title divider.
     rule_len=$(( SIDEBAR_RULE_WIDTH - ${#label} - 1 ))
   fi
+  [[ -n "$mon_txt" ]] && rule_len=$(( rule_len - 10 ))
   (( rule_len < 0 )) && rule_len=0
   while (( i < rule_len )); do rule+="─"; ((i++)); done
-  printf -v R_SECTION_HEADER ' \033[1;38;5;%sm%s\033[0m \033[38;5;236m%s\033[0m' "$colour" "$label" "$rule"
+  # Monitor link takes the section colour but is underlined, so it reads as the one
+  # clickable thing on an otherwise inert heading row.
+  local mon_ansi=""
+  [[ -n "$mon_txt" ]] && printf -v mon_ansi ' \033[4;38;5;%sm(Monitor)\033[0m' "$colour"
+  printf -v R_SECTION_HEADER ' \033[1;38;5;%sm%s\033[0m%s \033[38;5;236m%s\033[0m' "$colour" "$label" "$mon_ansi" "$rule"
   [[ "$with_plus" == "1" ]] && printf -v R_SECTION_HEADER '%s \033[1;38;5;%sm+\033[0m' "$R_SECTION_HEADER" "$colour"
   printf '%s' "$R_SECTION_HEADER"
   return 0
@@ -2003,7 +2063,7 @@ render_sidebar() {
   #
   # Absolute rows mean spacers and headings appear in neither map, so clicking
   # them is a no-op for free.
-  local rowmap="" addmap="1:*," prmap=""
+  local rowmap="" addmap="1:*," prmap="" monmap=""
   local key meta label gcolour drawn=0 entry eidx
 
   # PR rows, precomputed per project so the draw loop below stays a straight walk.
@@ -2035,6 +2095,12 @@ render_sidebar() {
     tmux set-option -t "$SESSION" @llmux_pr_rows "$pr_raw" 2>/dev/null || true
     tmux set-option -t "$SESSION" @llmux_pr_rows_sig "$pr_sig" 2>/dev/null || true
   fi
+
+  # One read per paint; a project without monitoring simply has no entry.
+  local mon_map="" monline
+  while IFS= read -r monline; do
+    [[ -n "$monline" ]] && mon_map+="${monline}"$'\n'
+  done < <(read_monitors)
 
   local pr_rows=() prline
   while IFS= read -r prline; do
@@ -2069,8 +2135,17 @@ render_sidebar() {
       ((row++))
     fi
     drawn=1
-    sidebar_section_header "$key" 0 >/dev/null
+    local mon_url=""
+    if [[ -n "$mon_map" ]]; then
+      mon_url=$(printf '%s' "$mon_map" | awk -F'\t' -v k="$key" '$1==k {print $2; exit}')
+    fi
+    R_SECTION_W="$sb_w"
+    sidebar_section_header "$key" 0 "$mon_url" >/dev/null
     out+="${R_SECTION_HEADER}"$'\n'
+    # Published in the same call that paints the row, like rowmap/prmap: a heading
+    # row is otherwise inert, so only these exact columns become clickable.
+    [[ -n "$R_SECTION_MON" && -n "$mon_url" ]] && \
+      monmap+="${row}:${R_SECTION_MON// /:}:${mon_url},"
     ((row++))
 
     for entry in ${lines[@]+"${lines[@]}"}; do
@@ -2212,6 +2287,7 @@ render_sidebar() {
   # in the call that paints it, so a click can never resolve against an order the
   # pixels no longer show.
   tmux set-option -t "$SESSION" @llmux_sidebar_prmap "${prmap%,}" 2>/dev/null || true
+  tmux set-option -t "$SESSION" @llmux_sidebar_monmap "${monmap%,}" 2>/dev/null || true
 
   # respawn-pane would kill the loop; write straight into the pane instead.
   tmux send-keys -t "$sb" "" 2>/dev/null || true
@@ -2335,6 +2411,28 @@ sidebar_click() {
 
   (( y < SIDEBAR_HEADER_LINES )) && return 0
 
+  # Monitor links live ON a heading row, which carries no thread, so this is checked
+  # before the thread maps and is column-scoped — clicking the label or the rule stays
+  # inert, exactly as it was.
+  local monmap mpair
+  monmap=$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_monmap 2>/dev/null || true)
+  if [[ -n "$monmap" && -n "$x" ]]; then
+    local IFS_MON="$IFS"
+    IFS=','
+    for mpair in $monmap; do
+      IFS="$IFS_MON"
+      local m_row="${mpair%%:*}" m_rest="${mpair#*:}"
+      local m_s="${m_rest%%:*}"; m_rest="${m_rest#*:}"
+      local m_e="${m_rest%%:*}"; local m_url="${m_rest#*:}"
+      if [[ "$m_row" == "$y" ]] && (( x >= m_s )) && (( x <= m_e )); then
+        [[ -n "$m_url" ]] && open_url "$m_url"
+        return 0
+      fi
+      IFS=','
+    done
+    IFS="$IFS_MON"
+  fi
+
   # PR rows first: prmap and rowmap are disjoint by construction (each row draws
   # either a thread or a PR), so order is about cost, not correctness.
   local prmap ppair
@@ -2349,9 +2447,14 @@ sidebar_click() {
         local pkind="${pact%%:*}" pval="${pact#*:}"
         if [[ "$pkind" == "open" ]]; then
           # `open` rather than an OSC 8 hyperlink: TERM_PROGRAM is tmux inside
-          # Terminal.app, which does not honour them. -b so a slow browser launch
-          # never blocks the click handler.
-          [[ -n "$pval" ]] && tmux run-shell -b "open $(printf '%q' "$pval")" 2>/dev/null || true
+          # Terminal.app, which does not honour them. Backgrounded so a slow browser
+          # launch never blocks the handler.
+          #
+          # Called directly, NOT via `tmux run-shell`: run-shell executes in the tmux
+          # server's environment, which inherits whatever the server was started with
+          # rather than this process's — so it is both a second environment to reason
+          # about and impossible to exercise in a test.
+          [[ -n "$pval" ]] && open_url "$pval"
         else
           local ex
           ex=$(tmux show-option -t "$SESSION" -qv @llmux_pr_expanded 2>/dev/null || true)
@@ -2790,6 +2893,29 @@ cmd_project() {
       tolaria_set_association "$slug" "" || return 1
       tolaria_log "$slug" "Unlinked from llmux thread section '$key'."
       echo "Unlinked '$key' from '$slug' (the notes are untouched)"
+      ;;
+    monitor)
+      local mkey="${1:-}" murl="${2:-}"
+      if [[ -z "$mkey" ]]; then
+        local mk mu
+        printf '%-28s %s\n' PROJECT MONITOR
+        while IFS=$'\t' read -r mk mu; do
+          [[ -n "$mk" ]] && printf '%-28s %s\n' "$mk" "$mu"
+        done < <(read_monitors)
+        return 0
+      fi
+      mkey=$(sanitize_project "$mkey")
+      if [[ "$murl" == "--clear" || "$murl" == "none" ]]; then
+        set_monitor "$mkey" ""
+        echo "Cleared monitoring link for $mkey."
+      elif [[ -z "$murl" ]]; then
+        echo "Usage: llmux project monitor <key> <url|--clear>" >&2; return 1
+      else
+        set_monitor "$mkey" "$murl"
+        echo "$mkey → $murl"
+      fi
+      render_sidebar 2>/dev/null || true
+      return 0
       ;;
     open)
       tolaria_open_project "${1:-}"
