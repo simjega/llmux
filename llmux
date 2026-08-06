@@ -90,6 +90,10 @@ Usage:
                                                 sharing --stack group under that name; an
                                                 unlabelled base/head chain groups itself.
   llmux pr ls | rm <number|url> | refresh       List / unregister / re-poll PR state
+  llmux snapshot [show|save]                    Live session mirrored to disk (threads,
+                                                projects, tools, resumable session ids)
+  llmux restore [--force]                       Rebuild the session from that snapshot
+                                                after a crash or reboot
   llmux top <name>... | --reset                 Move threads to the top of their sidebar
                                                 section, in the order given (--reset clears it)
   llmux next / llmux prev                       Step to the next/previous thread (wraps).
@@ -225,6 +229,7 @@ def _load(path):
         return {"paused": d, "prs": []}
     d.setdefault("paused", [])
     d.setdefault("prs", [])
+    d.setdefault("session", {})
     return d
 
 def _save(path, d):
@@ -232,7 +237,22 @@ def _save(path, d):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
     with os.fdopen(fd, "w") as f:
         json.dump(d, f, indent=2)
+        f.flush()
+        # The rename is atomic, but it only orders the metadata write. Without the
+        # fsync a crash seconds later can leave the new name pointing at an empty
+        # inode -- the exact failure this file exists to survive.
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+
+def _lock(path):
+    # Mutations are read-modify-write in short-lived processes, and llmux runs one
+    # per agent pane. Two `pr add` calls landing together would otherwise both read
+    # the old file and the second would erase the entry the first wrote. Held for life
+    # of the process; the OS releases it on exit, including on a kill.
+    import fcntl
+    f = open(path + ".lock", "w")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
 '
 
 # Read paused.json, output pipe-delimited lines:
@@ -259,6 +279,7 @@ add_paused() {
   python3 -c "$PY_PAUSED_IO"'
 import sys, time
 path = sys.argv[1]
+_lk = _lock(path)
 d = _load(path)
 d["paused"].append({
     "name": sys.argv[2],
@@ -287,6 +308,7 @@ set_paused_project() {
   python3 -c "$PY_PAUSED_IO"'
 import sys
 path, name, project = sys.argv[1], sys.argv[2], sys.argv[3]
+_lk = _lock(path)
 d = _load(path)
 hit = False
 for p in d["paused"]:
@@ -305,6 +327,7 @@ remove_paused() {
 import sys
 path = sys.argv[1]
 name = sys.argv[2]
+_lk = _lock(path)
 d = _load(path)
 before = len(d["paused"])
 d["paused"] = [p for p in d["paused"] if p.get("name") != name]
@@ -353,6 +376,7 @@ add_pr() {
 import sys, time
 path, repo, num = sys.argv[1], sys.argv[2], sys.argv[3]
 url, title, project, branch, base, stack = sys.argv[4:10]
+_lk = _lock(path)
 d = _load(path)
 for p in d["prs"]:
     if p.get("repo") == repo and str(p.get("number")) == num:
@@ -373,6 +397,7 @@ remove_pr() {
   python3 -c "$PY_PAUSED_IO"'
 import sys
 path, repo, num = sys.argv[1], sys.argv[2], sys.argv[3]
+_lk = _lock(path)
 d = _load(path)
 before = len(d["prs"])
 d["prs"] = [p for p in d["prs"]
@@ -2224,6 +2249,14 @@ sidebar_loop() {
     # was seen.
     mark_thread_seen "$(get_active_thread_pane)"
     render_sidebar
+    # Snapshot when the thread set CHANGES, not on a timer: a crash moments after
+    # adding or removing a thread should still recover it, and the digest makes the
+    # common case (nothing changed) free.
+    _sig=$(tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}|#{@llmux_project}|#{@llmux_tool}' 2>/dev/null | md5 -q 2>/dev/null || true)
+    if [[ -n "$_sig" && "$_sig" != "${_snap_sig:-}" ]]; then
+      _snap_sig="$_sig"
+      snapshot_session
+    fi
     sleep 2
   done
 }
@@ -5309,6 +5342,190 @@ cmd_pr() {
   render_sidebar 2>/dev/null || true
 }
 
+
+# ── Crash resilience ─────────────────────────────────────────────────────────
+#
+# Everything about a LIVE thread -- its name, project, tool, worktree, slot and
+# claude/opencode session id -- lives in tmux pane options, which die with the tmux
+# server. Paused threads and registered PRs were already on disk; the running
+# session, the part actually holding work in flight, was not. A crash lost all of it.
+#
+# So: mirror the live session into paused.json under "session" on a slow timer and
+# after anything structural. This is a DERIVED cache, never a source of truth -- a
+# live tmux session always wins, and the snapshot is only consulted by `llmux restore`
+# when there is no session to read.
+#
+# Deliberately not sqlite. The data is tens of rows written rarely; what JSON lacked
+# was atomicity (fixed: temp file + fsync + rename) and concurrent-write safety
+# (fixed: flock). A database would add a dependency and a migration without
+# persisting one byte more than this does.
+snapshot_session() {
+  tmux has-session -t "$SESSION" 2>/dev/null || return 0
+  local rows="" line
+  while IFS='|' read -r line; do
+    [[ -n "$line" ]] && rows+="${line}"$'\n'
+  done < <(tmux list-panes -s -t "$SESSION" \
+      -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_project}|#{@llmux_worktree}|#{@llmux_slot}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_order}|#{@llmux_pinned}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}' \
+      2>/dev/null || true)
+  [[ -z "$rows" ]] && return 0
+
+  local opts=""
+  local o
+  for o in project_order sidebar_mode sidebar_width pr_expanded; do
+    opts+="${o}=$(tmux show-option -t "$SESSION" -qv "@llmux_${o}" 2>/dev/null || true)"$'\n'
+  done
+
+  printf '%s\x00%s' "$rows" "$opts" | python3 -c "$PY_PAUSED_IO"'
+import sys, time
+path = sys.argv[1]
+raw = sys.stdin.read()
+rows, _, opts = raw.partition("\x00")
+keys = ["name","dir","tool","project","worktree","slot","claude_session",
+        "opencode_session","order","pinned","terminal","sidebar","anchor"]
+threads = []
+for line in rows.splitlines():
+    if not line.strip():
+        continue
+    f = line.split("|")
+    f += [""] * (len(keys) - len(f))
+    t = dict(zip(keys, f))
+    # The sidebar and the parked-window placeholder are furniture, not work.
+    if t["sidebar"] == "1" or t["anchor"] == "1" or not t["name"]:
+        continue
+    threads.append(t)
+if not threads:
+    sys.exit(0)
+options = {}
+for line in opts.splitlines():
+    k, _, v = line.partition("=")
+    if k:
+        options[k] = v
+_lk = _lock(path)
+d = _load(path)
+
+# Identity is monotonic: a thread that HAD a session id has not stopped having one
+# just because this read came back blank. Without this, one degraded snapshot -- a
+# pane mid-relaunch, or a restore where resume rejected a stale id -- permanently
+# overwrites the only record of how to resume that conversation. Losing that is the
+# failure this whole feature exists to prevent, so a blank never beats a known value.
+prev = {t.get("name"): t for t in ((d.get("session") or {}).get("threads") or [])}
+for t in threads:
+    old_t = prev.get(t.get("name"))
+    if not old_t:
+        continue
+    for k in ("claude_session", "opencode_session", "worktree", "slot", "project", "tool"):
+        if not t.get(k) and old_t.get(k):
+            t[k] = old_t[k]
+
+d["session"] = {"saved_at": int(time.time()), "threads": threads, "options": options}
+_save(path, d)
+' "$PAUSED_FILE" 2>/dev/null || true
+}
+
+# Print what the snapshot holds, so "did it capture my work?" is answerable without
+# reading JSON by hand.
+cmd_snapshot() {
+  case "${1:-show}" in
+    save) snapshot_session; echo "Snapshot saved."; return 0 ;;
+    show) ;;
+    *) echo "Usage: llmux snapshot [show|save]" >&2; return 1 ;;
+  esac
+  [[ -f "$PAUSED_FILE" ]] || { echo "No snapshot."; return 0; }
+  python3 -c "$PY_PAUSED_IO"'
+import sys, time
+d = _load(sys.argv[1])
+s = d.get("session") or {}
+if not s:
+    print("No session snapshot yet.")
+    raise SystemExit(0)
+age = int(time.time()) - int(s.get("saved_at", 0))
+print("Snapshot %ds old — %d threads" % (age, len(s.get("threads", []))))
+for t in s.get("threads", []):
+    print("  %-24s %-9s %-22s %s" % (t.get("name",""), t.get("tool","") or "shell",
+                                     t.get("project","") or "scratch", t.get("dir","")))
+' "$PAUSED_FILE"
+}
+
+# Rebuild a session from the snapshot after a crash or a reboot. Refuses to run over
+# a live session unless forced: the live one is the source of truth and restoring on
+# top of it would duplicate every thread.
+cmd_restore() {
+  local force=0
+  [[ "${1:-}" == "--force" ]] && force=1
+  if tmux has-session -t "$SESSION" 2>/dev/null && (( ! force )); then
+    local n
+    n=$({ tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}' 2>/dev/null | grep -c . ; } || echo 0)
+    echo "Error: session '$SESSION' is already running ($n panes)." >&2
+    echo "  Nothing to restore onto. Use --force only if you know it is empty/broken." >&2
+    return 1
+  fi
+
+  local rows
+  rows=$(python3 -c "$PY_PAUSED_IO"'
+import sys
+d = _load(sys.argv[1])
+s = d.get("session") or {}
+for t in s.get("threads", []):
+    if t.get("terminal") == "1":
+        continue
+    print("|".join([t.get(k, "") for k in
+        ["name","dir","tool","project","worktree","slot","claude_session","opencode_session","order","pinned"]]))
+' "$PAUSED_FILE" 2>/dev/null || true)
+  if [[ -z "$rows" ]]; then
+    echo "No session snapshot to restore." >&2
+    return 1
+  fi
+
+  ensure_session
+  local name dir tool project worktree slot csid osid order pinned pane n=0
+  while IFS='|' read -r name dir tool project worktree slot csid osid order pinned; do
+    [[ -z "$name" ]] && continue
+    [[ -d "$dir" ]] || dir="$HOME"
+    pane=$(spawn_llm_pane "$dir") || continue
+    tmux set-option -p -t "$pane" @llmux_name "$name"
+    [[ -n "$tool" ]]      && tmux set-option -p -t "$pane" @llmux_tool "$tool"
+    [[ -n "$project" ]]   && tmux set-option -p -t "$pane" @llmux_project "$project"
+    [[ -n "$worktree" ]]  && tmux set-option -p -t "$pane" @llmux_worktree "$worktree"
+    [[ -n "$slot" ]]      && tmux set-option -p -t "$pane" @llmux_slot "$slot"
+    [[ -n "$order" ]]     && tmux set-option -p -t "$pane" @llmux_order "$order"
+    [[ "$pinned" == "1" ]] && tmux set-option -p -t "$pane" @llmux_pinned 1
+    # Resume the SAME conversation rather than starting a fresh one — the session id
+    # is the whole reason the snapshot bothers to carry it.
+    if [[ -n "$csid" ]]; then
+      tmux set-option -p -t "$pane" @llmux_claude_session "$csid"
+      resume_tool_in_pane "$pane" "${tool:-claude}" "$name" "$csid" 2>/dev/null || true
+    elif [[ -n "$osid" ]]; then
+      tmux set-option -p -t "$pane" @llmux_opencode_session "$osid"
+      resume_tool_in_pane "$pane" "${tool:-opencode}" "$name" "$osid" 2>/dev/null || true
+    elif [[ -n "$tool" ]]; then
+      launch_tool_in_pane "$pane" "$tool" "$name" 2>/dev/null || true
+    fi
+    ((n++))
+    echo "  + $name${tool:+ ($tool)}${project:+ → $project}"
+  done <<< "$rows"
+
+  local sopts
+  sopts=$(python3 -c "$PY_PAUSED_IO"'
+import sys
+d = _load(sys.argv[1])
+for k, v in ((d.get("session") or {}).get("options") or {}).items():
+    print("%s=%s" % (k, v))
+' "$PAUSED_FILE" 2>/dev/null || true)
+  local k v
+  while IFS='=' read -r k v; do
+    [[ -n "$k" && -n "$v" ]] && tmux set-option -t "$SESSION" "@llmux_${k}" "$v" 2>/dev/null || true
+  done <<< "$sopts"
+
+  apply_layout
+  # The sidebar is rebuilt rather than restored: its pane is furniture, and
+  # `sidebar on` is the one supported way to register bindings and hooks.
+  if [[ "$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_mode 2>/dev/null || true)" == "1" ]]; then
+    tmux set-option -t "$SESSION" @llmux_sidebar_mode "0" 2>/dev/null || true
+    cmd_sidebar on >/dev/null 2>&1 || true
+  fi
+  echo "Restored $n thread(s) from snapshot."
+}
+
 cmd__slot_status() {
   # Cached for 60s. This shells out to `git rev-parse` once per slot and the Owner
   # monorepo has nine of them, so a live call costs ~700ms — paid by the tmux status
@@ -5673,6 +5890,8 @@ case "$command" in
   mv)        cmd_mv "$@" ;;
   project)   cmd_project "$@" ;;
   pr)        cmd_pr "$@" ;;
+  restore)   cmd_restore "$@" ;;
+  snapshot)  cmd_snapshot "$@" ;;
   next)      cmd_next "$@" ;;
   prev)      cmd_prev "$@" ;;
   top)       cmd_top "$@" ;;
@@ -5687,6 +5906,7 @@ case "$command" in
   _status-count) cmd__status_count ;;
   _slot-status)  cmd__slot_status ;;
   _pr-refresh)   cmd__pr_refresh ;;
+  _snapshot)     snapshot_session ;;
   help)          usage ;;
   *)             echo "Unknown command: $command"; usage; exit 1 ;;
 esac
