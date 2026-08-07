@@ -86,11 +86,13 @@ Usage:
   llmux project open <key>                      Open the project's hub note
   llmux project monitor [<key> <url|--clear>]   Attach a monitoring dashboard to a project
   llmux project forge [<key> <task-id|url>      Attach a Forge task to a project — a link
-             [title]] [--remove <id>] [--clear] beside (Monitor), NOT a thread: llmux cannot
+             [name]] [--remove <id>] [--clear]  beside (Monitor), NOT a thread: llmux cannot
                                                 drive a task it has no pane for. A project may
                                                 have several. Bare tsk-… ids expand to
-                                                forge.owner.sh/tasks/<id>; the title is what
-                                                the row is labelled with (default "Forge").
+                                                forge.owner.sh/tasks/<id>. NAME IT FOR THE
+                                                WORK ("shadow parity sweep") — not the task id
+                                                and not Forge own generated task name. The ⚒
+                                                glyph and its colour already say it is Forge.
   llmux project flag [<key> <flag> [service]]   Attach an Unleash flag to a project (a
              [--remove <flag>] [--clear]        project may have several; re-adding one
                                                 updates it). --remove drops one,
@@ -454,6 +456,13 @@ _save(path, d)
 # pretence that llmux can drive it.
 FORGE_BASE="https://forge.owner.sh/tasks"
 
+# ONE colour for every Forge link, in every project — deliberately not the project
+# colour that (Monitor) and the flags take. A Forge task is a different KIND of thing
+# from the config links it sits beside, and the row has to say so before you have read
+# a word of it. 214 is unused elsewhere: clear of the project palette, of the alert
+# yellow/red (220/203) and of the three cyans the tool glyphs use.
+FORGE_COLOUR=214
+
 # Accepts a full URL or a bare task id (tsk-…), the way `pr add` takes a number or
 # a URL — the id is what you have to hand when an agent has just spawned the task.
 forge_url_for() {
@@ -464,12 +473,17 @@ forge_url_for() {
   esac
 }
 
-# What the link is LABELLED with. A task id (tsk-CJyj5XHDU6Pz) identifies nothing to
-# a human, so a title is used when given and the bare word "Forge" when not — the
-# same shape as "(Monitor)", which also says what it is rather than which one it is.
+# What the link is LABELLED with: a name the registering agent chose for the WORK.
+# Not the task id (tsk-CJyj5XHDU6Pz identifies nothing to a human) and not Forge own
+# task name either, which is generated from the prompt and arrives long and literal.
+# "shadow parity sweep" is the useful thing to see in a 30-column column.
+#
+# The ⚒ glyph and the colour are what say "this is Forge"; the label is free to spend
+# every one of its columns on which piece of work it is. An unnamed task says so,
+# rather than quietly rendering as a second link that looks like the first.
 forge_label() {
   local title="$1" width="${2:-18}"
-  [[ -z "$title" ]] && title="Forge"
+  [[ -z "$title" ]] && title="untitled task"
   R_FORGE_LABEL="${title:0:width}"
 }
 
@@ -2522,7 +2536,7 @@ render_sidebar() {
         if (( ! first_forge )); then out+=" "; lcol=$(( lcol + 1 )); fi
         forge_label "$fg_title" $(( sb_w - lcol - 2 ))
         [[ -z "$R_FORGE_LABEL" ]] && break
-        out+="\033[38;5;${gcolour}m⚒\033[0m \033[4;38;5;${gcolour}m${R_FORGE_LABEL}\033[0m"
+        out+="\033[1;38;5;${FORGE_COLOUR}m⚒\033[0m \033[4;38;5;${FORGE_COLOUR}m${R_FORGE_LABEL}\033[0m"
         # The glyph and the space after it are part of the hotspot: the glyph is one
         # column, and aiming at a one-column target is not something anyone should
         # have to do.
@@ -3369,7 +3383,11 @@ cmd_project() {
       gtitle="$*"
       forge_url_for "$gref"
       set_forge "$gkey" "$R_FORGE_URL" "$gtitle" add
-      echo "$gkey → ⚒ ${gtitle:-Forge}"
+      if [[ -z "$gtitle" ]]; then
+        echo "Warning: no name given — the row will read \"⚒ untitled task\"." >&2
+        echo "         Name it for the work: llmux project forge $gkey $gref <short name>" >&2
+      fi
+      echo "$gkey → ⚒ ${gtitle:-untitled task}"
       echo "  $R_FORGE_URL"
       render_sidebar 2>/dev/null || true
       return 0
