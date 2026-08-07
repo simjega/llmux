@@ -85,6 +85,12 @@ Usage:
   llmux project unlink <key>                    Detach the notes (they are left alone)
   llmux project open <key>                      Open the project's hub note
   llmux project monitor [<key> <url|--clear>]   Attach a monitoring dashboard to a project
+  llmux project forge [<key> <task-id|url>      Attach a Forge task to a project — a link
+             [title]] [--remove <id>] [--clear] beside (Monitor), NOT a thread: llmux cannot
+                                                drive a task it has no pane for. A project may
+                                                have several. Bare tsk-… ids expand to
+                                                forge.owner.sh/tasks/<id>; the title is what
+                                                the row is labelled with (default "Forge").
   llmux project flag [<key> <flag> [service]]   Attach an Unleash flag to a project (a
              [--remove <flag>] [--clear]        project may have several; re-adding one
                                                 updates it). --remove drops one,
@@ -436,6 +442,78 @@ _save(path, d)
 ' "$PAUSED_FILE" "$1" "${2:-}" "${3:-}" "${4:-}" "${5:-add}"
 }
 
+# ── Forge tasks ──────────────────────────────────────────────────────────────
+#
+# A Forge task is an agent working on this project somewhere else. It is very nearly
+# a thread — it just happens to be running online rather than in a pane — but it is
+# deliberately NOT modelled as one: a thread is a live tmux pane, and every piece of
+# llmux that switches, parks, cycles, resumes, snapshots or lays out threads assumes
+# a pane id it can act on. A row with no pane behind it would break all of them.
+#
+# So it is a LINK, alongside (Monitor) and the flags: one click to the task, no
+# pretence that llmux can drive it.
+FORGE_BASE="https://forge.owner.sh/tasks"
+
+# Accepts a full URL or a bare task id (tsk-…), the way `pr add` takes a number or
+# a URL — the id is what you have to hand when an agent has just spawned the task.
+forge_url_for() {
+  local ref="$1"
+  case "$ref" in
+    http*://*) R_FORGE_URL="$ref" ;;
+    *)         R_FORGE_URL="${FORGE_BASE}/${ref}" ;;
+  esac
+}
+
+# What the link is LABELLED with. A task id (tsk-CJyj5XHDU6Pz) identifies nothing to
+# a human, so a title is used when given and the bare word "Forge" when not — the
+# same shape as "(Monitor)", which also says what it is rather than which one it is.
+forge_label() {
+  local title="$1" width="${2:-18}"
+  [[ -z "$title" ]] && title="Forge"
+  R_FORGE_LABEL="${title:0:width}"
+}
+
+# Emits: project<TAB>url<TAB>title
+read_forge() {
+  [[ -f "$PAUSED_FILE" ]] || return 0
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+for k, v in (_load(sys.argv[1]).get("forge") or {}).items():
+    entries = v if isinstance(v, list) else [v]
+    for e in entries:
+        if isinstance(e, dict) and e.get("url"):
+            print("%s\t%s\t%s" % (k, e.get("url",""), e.get("title","")))
+' "$PAUSED_FILE"
+}
+
+set_forge() {
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+path, key, url, title, mode = (sys.argv[1:5] + ["add"])[:5]
+if len(sys.argv) > 5:
+    mode = sys.argv[5]
+_lk = _lock(path)
+d = _load(path)
+d.setdefault("forge", {})
+cur = d["forge"].get(key)
+entries = cur if isinstance(cur, list) else ([cur] if isinstance(cur, dict) and cur.get("url") else [])
+if mode == "remove":
+    # Match on the id as well as the whole URL: you remove a task with whatever you
+    # had to hand, which is rarely the full link you registered it with.
+    entries = [e for e in entries if e.get("url") != url and e.get("url","").rsplit("/", 1)[-1] != url.rsplit("/", 1)[-1]]
+elif url:
+    entries = [e for e in entries if e.get("url") != url]
+    entries.append({"url": url, "title": title})
+else:
+    entries = []
+if entries:
+    d["forge"][key] = entries
+else:
+    d["forge"].pop(key, None)
+_save(path, d)
+' "$PAUSED_FILE" "$1" "${2:-}" "${3:-}" "${4:-add}"
+}
+
 # ── Project monitoring links ─────────────────────────────────────────────────
 #
 # A project that has monitoring gets a clickable "(Monitor)" beside its heading, so
@@ -559,6 +637,37 @@ rows.sort(key=lambda r: (r[2] != "pending", -int(r[1] or 0)))
 for r in rows:
     print("\t".join(r))
 ' "$PAUSED_FILE" "$REVIEW_FILE" "${1:-}" "$SCRATCH_KEY" "$REVIEW_KEEP_HOURS"
+}
+
+# Monitors, Forge tasks and flags in ONE python3 start, for the paint.
+#
+# read_monitors + read_flags + read_forge are three interpreter starts against the
+# same file, and a python3 start is ~140ms under load against a paint that runs every
+# 2s -- so the render was spending most of a second re-reading one small JSON three
+# times. The individual readers stay: the CLI paths use them, where one start is fine
+# and the clearer call site is worth more.
+#
+# Emits, tagged so bash can split it back apart without re-parsing:
+#   m<TAB>project<TAB>url
+#   g<TAB>project<TAB>url<TAB>title
+#   f<TAB>project<TAB>flag<TAB>service<TAB>url
+read_project_links() {
+  [[ -f "$PAUSED_FILE" ]] || return 0
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+d = _load(sys.argv[1])
+for k, v in (d.get("monitors") or {}).items():
+    if v:
+        print("m\t%s\t%s" % (k, v))
+for k, v in (d.get("forge") or {}).items():
+    for e in (v if isinstance(v, list) else [v]):
+        if isinstance(e, dict) and e.get("url"):
+            print("g\t%s\t%s\t%s" % (k, e.get("url",""), e.get("title","")))
+for k, v in (d.get("flags") or {}).items():
+    for e in (v if isinstance(v, list) else [v]):
+        if isinstance(e, dict) and e.get("flag"):
+            print("f\t%s\t%s\t%s\t%s" % (k, e.get("flag",""), e.get("service",""), e.get("url","")))
+' "$PAUSED_FILE"
 }
 
 # ── Registered PRs ───────────────────────────────────────────────────────────
@@ -2287,16 +2396,17 @@ render_sidebar() {
     tmux set-option -t "$SESSION" @llmux_pr_rows_sig "$pr_sig" 2>/dev/null || true
   fi
 
-  # One read per paint; a project without monitoring simply has no entry.
-  local mon_map="" monline
-  while IFS= read -r monline; do
-    [[ -n "$monline" ]] && mon_map+="${monline}"$'\n'
-  done < <(read_monitors)
-
-  local flag_map="" flagline
-  while IFS= read -r flagline; do
-    [[ -n "$flagline" ]] && flag_map+="${flagline}"$'\n'
-  done < <(read_flags)
+  # One read per paint for all three kinds of project link; a project without one
+  # simply has no entry. The maps keep the field layouts the readers used, so the
+  # awk lookups below are unchanged by the merge.
+  local mon_map="" flag_map="" forge_map="" linkline
+  while IFS= read -r linkline; do
+    case "$linkline" in
+      m$'\t'*) mon_map+="${linkline#m$'\t'}"$'\n' ;;
+      g$'\t'*) forge_map+="${linkline#g$'\t'}"$'\n' ;;
+      f$'\t'*) flag_map+="${linkline#f$'\t'}"$'\n' ;;
+    esac
+  done < <(read_project_links)
 
   # The sections are collected up front rather than streamed into the draw loop:
   # build_review_rows has to know which project keys exist before the first one is
@@ -2382,14 +2492,17 @@ render_sidebar() {
     # 20-character project name plus "(Monitor) (Flag)" cannot fit 30 columns, and
     # the loser is always the thing you wanted to click. A dedicated row spills
     # once, deliberately, instead of fighting for width on every project.
-    local mon_url="" flg_url=""
+    local mon_url="" flg_url="" frg_url=""
     if [[ -n "$mon_map" ]]; then
       mon_url=$(printf '%s' "$mon_map" | awk -F'\t' -v k="$key" '$1==k {print $2; exit}')
     fi
     if [[ -n "$flag_map" ]]; then
       flg_url=$(printf '%s' "$flag_map" | awk -F'\t' -v k="$key" '$1==k {print $4; exit}')
     fi
-    if [[ -n "$mon_url" || -n "$flg_url" ]]; then
+    if [[ -n "$forge_map" ]]; then
+      frg_url=$(printf '%s' "$forge_map" | awk -F'\t' -v k="$key" '$1==k {print $2; exit}')
+    fi
+    if [[ -n "$mon_url" || -n "$flg_url" || -n "$frg_url" ]]; then
       local lrow="" lcol=2
       out+="  "
       if [[ -n "$mon_url" ]]; then
@@ -2397,6 +2510,27 @@ render_sidebar() {
         linkmap+="${row}:${lcol}:$(( lcol + 8 )):${mon_url}"$'\n'
         lcol=$(( lcol + 10 )); out+=" "
       fi
+      # Forge tasks before the flags: a task is live work, a flag is configuration,
+      # and the live thing wins the width when the row runs out. ⚒ marks them as a
+      # kind — the label is a human title, so without a glyph a task and a flag are
+      # indistinguishable at a glance. U+2692 is Neutral width, i.e. ONE column;
+      # a two-column glyph here would shift every hotspot on the row off its text.
+      local fg_url fg_title first_forge=1
+      while IFS=$'\t' read -r fg_url fg_title; do
+        [[ -z "$fg_url" ]] && continue
+        (( sb_w - lcol < 7 )) && break
+        if (( ! first_forge )); then out+=" "; lcol=$(( lcol + 1 )); fi
+        forge_label "$fg_title" $(( sb_w - lcol - 2 ))
+        [[ -z "$R_FORGE_LABEL" ]] && break
+        out+="\033[38;5;${gcolour}m⚒\033[0m \033[4;38;5;${gcolour}m${R_FORGE_LABEL}\033[0m"
+        # The glyph and the space after it are part of the hotspot: the glyph is one
+        # column, and aiming at a one-column target is not something anyone should
+        # have to do.
+        linkmap+="${row}:${lcol}:$(( lcol + 1 + ${#R_FORGE_LABEL} )):${fg_url}"$'\n'
+        lcol=$(( lcol + 2 + ${#R_FORGE_LABEL} ))
+        first_forge=0
+      done < <(printf '%s' "$forge_map" | awk -F'\t' -v k="$key" '$1==k {print $2"\t"$3}')
+      [[ -n "$frg_url" && -n "$flg_url" ]] && { out+=" "; lcol=$(( lcol + 1 )); }
       # Every flag the project carries, until the row runs out. A stub of four or
       # fewer characters identifies nothing and cannot be aimed at, so stop rather
       # than draw one.
@@ -3203,6 +3337,43 @@ cmd_project() {
       tolaria_log "$slug" "Unlinked from llmux thread section '$key'."
       echo "Unlinked '$key' from '$slug' (the notes are untouched)"
       ;;
+    forge)
+      local gkey="${1:-}" gref="${2:-}" gtitle=""
+      if [[ -z "$gkey" ]]; then
+        local k u t
+        printf '%-28s %-24s %s\n' PROJECT TITLE LINK
+        while IFS=$'\t' read -r k u t; do
+          [[ -n "$k" ]] && printf '%-28s %-24s %s\n' "$k" "${t:-—}" "$u"
+        done < <(read_forge)
+        return 0
+      fi
+      gkey=$(sanitize_project "$gkey")
+      if [[ "$gref" == "--clear" || "$gref" == "none" ]]; then
+        set_forge "$gkey" "" "" clear
+        echo "Cleared all Forge tasks for $gkey."
+        render_sidebar 2>/dev/null || true
+        return 0
+      fi
+      if [[ "$gref" == "--remove" ]]; then
+        [[ -z "${3:-}" ]] && { echo "Usage: llmux project forge <key> --remove <task-id|url>" >&2; return 1; }
+        forge_url_for "$3"
+        set_forge "$gkey" "$R_FORGE_URL" "" remove
+        echo "Removed $3 from $gkey."
+        render_sidebar 2>/dev/null || true
+        return 0
+      fi
+      [[ -z "$gref" ]] && { echo "Usage: llmux project forge <key> <task-id|url> [title]" >&2; return 1; }
+      shift 2 2>/dev/null || true
+      # Remaining words are the title, unquoted or not — "llmux project forge x tsk-1
+      # fix flaky test" is what someone actually types.
+      gtitle="$*"
+      forge_url_for "$gref"
+      set_forge "$gkey" "$R_FORGE_URL" "$gtitle" add
+      echo "$gkey → ⚒ ${gtitle:-Forge}"
+      echo "  $R_FORGE_URL"
+      render_sidebar 2>/dev/null || true
+      return 0
+      ;;
     flag)
       local fkey="${1:-}" fname="${2:-}" fsvc="${3:-}" furl=""
       if [[ -z "$fkey" ]]; then
@@ -3266,7 +3437,7 @@ cmd_project() {
       tolaria_open_project "${1:-}"
       ;;
     *)
-      echo "Usage: llmux project [ls | new <key> [slug] | link <key> [slug] | unlink <key> | open <key>]" >&2
+      echo "Usage: llmux project [ls | new <key> [slug] | link <key> [slug] | unlink <key> | open <key> | monitor <key> <url> | flag <key> <flag> | forge <key> <task-id> [title]]" >&2
       return 1
       ;;
   esac

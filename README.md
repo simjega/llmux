@@ -127,6 +127,40 @@ whatever is actually in flight rather than every PR you've ever authored.
   Fetched state — open/draft/last-activity — is a disposable tmux option refreshed by
   `llmux-watch` every ~2 min, never a file.
 
+### Forge tasks, per project
+
+A Forge task is an agent working on the project somewhere else. Attach it and it draws
+as a link on the project's links row, beside `(Monitor)` and the flags:
+
+```
+ custom-campaigns-me2 ──
+  (Monitor) ⚒ shadow parity sweep customCampaignsMe2
+  👀 Rollout sequencing
+ 1 ✳ cc-last-mile
+```
+
+```bash
+llmux project forge custom-campaigns-me2 tsk-CJyj5XHDU6Pz shadow parity sweep
+llmux project forge custom-campaigns-me2 https://forge.owner.sh/tasks/tsk-CJyj5XHDU6Pz
+llmux project forge custom-campaigns-me2 --remove tsk-CJyj5XHDU6Pz
+llmux project forge                      # list them all
+```
+
+- **A link, not a thread.** A Forge task is very nearly a thread — it just runs online
+  rather than in a pane — but a thread in llmux *is* a tmux pane, and everything that
+  switches, parks, cycles, resumes, snapshots or lays out threads acts on a pane id. A
+  row with no pane behind it would break all of them. So it is a link: one click to the
+  task, and no pretence that llmux can drive it.
+- **A bare `tsk-…` id is enough** — it expands to `forge.owner.sh/tasks/<id>`, which is
+  what you have to hand the moment an agent spawns one. A full URL works too.
+- **The trailing words are the title**, and the title is what the row is labelled with
+  (`⚒ shadow parity sweep`). Without one the row reads `⚒ Forge`, which is honest but
+  tells you nothing when a project has two. A task id never appears in the sidebar —
+  `tsk-CJyj5XHDU6Pz` identifies nothing to a human.
+- **A project can carry several.** Re-registering the same task updates its title
+  rather than duplicating; `--remove` takes the bare id or the full URL, `--clear`
+  drops them all. Nothing expires them — a finished task stays until you remove it.
+
 ### Docs waiting on you, per project
 
 A thread that produces something you need to read — a plan, a recap, a decision
