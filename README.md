@@ -153,10 +153,16 @@ llmux project forge                      # list them all
   task, and no pretence that llmux can drive it.
 - **A bare `tsk-…` id is enough** — it expands to `forge.owner.sh/tasks/<id>`, which is
   what you have to hand the moment an agent spawns one. A full URL works too.
-- **The trailing words are the title**, and the title is what the row is labelled with
-  (`⚒ shadow parity sweep`). Without one the row reads `⚒ Forge`, which is honest but
-  tells you nothing when a project has two. A task id never appears in the sidebar —
-  `tsk-CJyj5XHDU6Pz` identifies nothing to a human.
+- **Name it for the work, not for the task.** The trailing words become the row's
+  label (`⚒ shadow parity sweep`). Not the task id, and not Forge's own generated task
+  name either — that is written from the prompt and arrives long and literal. The ⚒ and
+  its colour already say "this is Forge"; the label is free to spend every column on
+  *which* piece of work it is. Register one without a name and it says `⚒ untitled
+  task`, plus a warning on the way in.
+- **Every Forge link is the same colour, in every project** — deliberately not the
+  project colour that `(Monitor)` and the flags take. A running task is a different
+  kind of thing from the config links beside it, and the row says so before you have
+  read a word of it.
 - **A project can carry several.** Re-registering the same task updates its title
   rather than duplicating; `--remove` takes the bare id or the full URL, `--clear`
   drops them all. Nothing expires them — a finished task stays until you remove it.
