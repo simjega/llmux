@@ -102,6 +102,15 @@ Usage:
                                                 sharing --stack group under that name; an
                                                 unlabelled base/head chain groups itself.
   llmux pr ls | rm <number|url> | refresh       List / unregister / re-poll PR state
+  llmux review add --title T --url U            Queue a doc for Jay to review (lookout link or
+             --context C [--kind K]             equivalent). Project defaults to the calling
+             [--project P]                      pane's section. Rides on the reviewq queue, so
+                                                `reviewq review` still drains it. Draws at the
+                                                TOP of its project, marked 👀 until resolved.
+  llmux review ls | done <id> | dismiss <id>    List / sign off / discard. Marking it done
+             | open <id> | mv <id> [project]    clears the 👀; the row fades out after
+                                                LLMUX_REVIEW_KEEP_HOURS (24). mv re-files an
+                                                entry whose project matched no section.
   llmux snapshot [show|save]                    Live session mirrored to disk (threads,
                                                 projects, tools, resumable session ids)
   llmux restore [--force]                       Rebuild the session from that snapshot
@@ -454,6 +463,102 @@ else:
     d["monitors"].pop(key, None)
 _save(path, d)
 ' "$PAUSED_FILE" "$1" "${2:-}"
+}
+
+# ── Review queue ─────────────────────────────────────────────────────────────
+#
+# Docs a thread wants Jay to read, drawn at the TOP of their project — above the
+# threads, because a doc waiting on him blocks the work under it.
+#
+# The queue itself belongs to `reviewq` (~/.config/reviewq/queue.jsonl); llmux
+# reads that file and never writes it. Enqueueing and resolving shell out to the
+# reviewq CLI, so there is exactly one queue and `reviewq review` still drains it.
+# The one thing llmux stores is routing: which llmux project an entry belongs to,
+# because reviewq's own --project defaults to the basename of the cwd and lands
+# entries under names like "jay" or "marketing-engine-2" that match no section.
+REVIEW_FILE="${REVIEWQ_DIR:-$HOME/.config/reviewq}/queue.jsonl"
+
+# How long an approved doc keeps its row after Jay signs off. The emoji goes the
+# moment it is resolved — that is the signal, and it is answered — but the row
+# lingers so "what did I just approve" is still on screen. 0 drops it immediately.
+REVIEW_KEEP_HOURS="${LLMUX_REVIEW_KEEP_HOURS:-24}"
+
+set_review_project() {
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+path, rid, project = sys.argv[1], sys.argv[2], sys.argv[3]
+_lk = _lock(path)
+d = _load(path)
+d.setdefault("reviews", {})
+if project:
+    d["reviews"][rid] = project
+else:
+    d["reviews"].pop(rid, None)
+_save(path, d)
+' "$PAUSED_FILE" "$1" "${2:-}"
+}
+
+invalidate_review_rows() {
+  tmux set-option -t "$SESSION" @llmux_review_rows_sig "" 2>/dev/null || true
+}
+
+# Emits: project<TAB>id<TAB>pending|done<TAB>title<TAB>url
+#
+# $1 = the section keys currently drawn, comma-separated. An entry whose project
+# matches none of them is not dropped — it goes to SCRATCH, which is always drawn.
+# A doc an agent queued has to be VISIBLE somewhere; silently filing it under a
+# section that does not exist is the one outcome worse than putting it in the
+# wrong place.
+build_review_rows() {
+  [[ -f "$REVIEW_FILE" ]] || return 0
+  python3 -c "$PY_PAUSED_IO"'
+import sys, json, re, time, calendar
+paused, qfile, keys_csv, scratch, keep_hours = sys.argv[1:6]
+keys = [k for k in keys_csv.split(",") if k]
+overrides = (_load(paused).get("reviews") or {})
+keep = int(keep_hours) * 3600
+
+def norm(s):
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
+
+lookup = {norm(k): k for k in keys}
+now = time.time()
+
+def resolved_age(e):
+    # reviewq stamps UTC ("...Z"), so timegm — mktime would read it as local and
+    # shift the keep-window by the UTC offset.
+    ts = (e.get("resolved_at") or "").replace("Z", "")
+    try:
+        return now - calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return 0   # unparseable stamp keeps the row rather than vanishing it
+
+rows = []
+for line in open(qfile):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        e = json.loads(line)
+    except Exception:
+        continue
+    status = e.get("status") or "pending"
+    if status == "dismissed":
+        continue
+    if status != "pending":
+        if keep <= 0 or resolved_age(e) > keep:
+            continue
+    rid = str(e.get("id") or "")
+    project = overrides.get(rid) or lookup.get(norm(e.get("project"))) or scratch
+    rows.append((project, rid, "pending" if status == "pending" else "done",
+                 " ".join((e.get("title") or "").split()), e.get("url") or ""))
+
+# Pending first, then most recently queued: the thing waiting on him outranks the
+# thing he already answered, whatever order the file happens to be in.
+rows.sort(key=lambda r: (r[2] != "pending", -int(r[1] or 0)))
+for r in rows:
+    print("\t".join(r))
+' "$PAUSED_FILE" "$REVIEW_FILE" "${1:-}" "$SCRATCH_KEY" "$REVIEW_KEEP_HOURS"
 }
 
 # ── Registered PRs ───────────────────────────────────────────────────────────
@@ -2162,10 +2267,17 @@ render_sidebar() {
   # The minute bucket is what makes staleness still work: PR_STALE_DAYS is evaluated
   # against "now", so without it a PR crossing the 14-day line would keep drawing
   # until something else invalidated the cache.
+  # now_ts and the paused.json mtime are read ONCE and shared by both cache
+  # signatures and the done-age column below. Each was its own fork, and a fork is
+  # 5-50ms in a paint that runs every 2s -- the cost the caching exists to avoid.
+  local now_ts paused_mtime
+  now_ts=$(date +%s)
+  paused_mtime=$({ stat -f %m "$PAUSED_FILE" 2>/dev/null || echo 0; })
+
   local pr_blob pr_exp pr_sig pr_sig_old pr_raw
   pr_blob=$(tmux show-option -t "$SESSION" -qv @llmux_prs_state 2>/dev/null || true)
   pr_exp=$(tmux show-option -t "$SESSION" -qv @llmux_pr_expanded 2>/dev/null || true)
-  pr_sig="$({ stat -f %m "$PAUSED_FILE" 2>/dev/null || echo 0; })|${pr_blob}|${pr_exp}|$(( $(date +%s) / 60 ))"
+  pr_sig="${paused_mtime}|${pr_blob}|${pr_exp}|$(( now_ts / 60 ))"
   pr_sig_old=$(tmux show-option -t "$SESSION" -qv @llmux_pr_rows_sig 2>/dev/null || true)
   if [[ -n "$pr_sig_old" && "$pr_sig_old" == "$pr_sig" ]]; then
     pr_raw=$(tmux show-option -t "$SESSION" -qv @llmux_pr_rows 2>/dev/null || true)
@@ -2186,6 +2298,42 @@ render_sidebar() {
     [[ -n "$flagline" ]] && flag_map+="${flagline}"$'\n'
   done < <(read_flags)
 
+  # The sections are collected up front rather than streamed into the draw loop:
+  # build_review_rows has to know which project keys exist before the first one is
+  # drawn, so it can file an entry that matches none of them under SCRATCH.
+  local sections=() skey
+  while IFS= read -r skey; do
+    [[ -n "$skey" ]] && sections+=("$skey")
+  done < <(project_sections)
+  local sect_csv=""
+  for skey in ${sections[@]+"${sections[@]}"}; do sect_csv+="${skey},"; done
+  sect_csv="${sect_csv%,}"
+
+  # Same cache shape as the PR rows, for the same reason: one python3 start (~140ms)
+  # against a paint that runs every 2s. An HOUR bucket, not a minute one — the only
+  # time-dependent decision here is dropping a doc approved more than
+  # REVIEW_KEEP_HOURS ago, which no one is watching to the minute.
+  local rev_sig rev_sig_old rev_raw
+  # mtime AND size for the queue file: `llmux review done` invalidates explicitly,
+  # but Jay drains with `reviewq review` — which llmux never sees. stat reports mtime
+  # in whole seconds, so a drain landing in the same second a paint sampled it would
+  # leave the signature identical and the 👀 would stay on screen after he cleared it.
+  # Resolving an entry always changes the file's length ("pending" → "done", plus a
+  # resolved_at stamp), so the size catches what the second-resolution mtime cannot.
+  rev_sig="$({ stat -f '%m.%z' "$REVIEW_FILE" 2>/dev/null || echo 0; })|${paused_mtime}|${sect_csv}|$(( now_ts / 3600 ))"
+  rev_sig_old=$(tmux show-option -t "$SESSION" -qv @llmux_review_rows_sig 2>/dev/null || true)
+  if [[ -n "$rev_sig_old" && "$rev_sig_old" == "$rev_sig" ]]; then
+    rev_raw=$(tmux show-option -t "$SESSION" -qv @llmux_review_rows 2>/dev/null || true)
+  else
+    rev_raw=$(build_review_rows "$sect_csv")
+    tmux set-option -t "$SESSION" @llmux_review_rows "$rev_raw" 2>/dev/null || true
+    tmux set-option -t "$SESSION" @llmux_review_rows_sig "$rev_sig" 2>/dev/null || true
+  fi
+  local rev_rows=() revline
+  while IFS= read -r revline; do
+    [[ -n "$revline" ]] && rev_rows+=("$revline")
+  done <<< "$rev_raw"
+
   local pr_rows=() prline
   while IFS= read -r prline; do
     [[ -n "$prline" ]] && pr_rows+=("$prline")
@@ -2193,10 +2341,9 @@ render_sidebar() {
 
   # Kept out of list_threads on purpose: its positional field contract has a dozen
   # read sites of varying arity, and widening it would touch every one.
-  local done_map now_ts
+  local done_map
   done_map=$({ tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_done_at}' 2>/dev/null; } || true)
-  now_ts=$(date +%s)
-  while IFS= read -r key; do
+  for key in ${sections[@]+"${sections[@]}"}; do
     [[ -z "$key" ]] && continue
     project_meta "$key" >/dev/null; meta="$R_PROJECT_META"
     label="${meta%%|*}"
@@ -2209,8 +2356,16 @@ render_sidebar() {
     for entry in ${lines[@]+"${lines[@]}"}; do
       [[ "${entry##*|}" == "$key" ]] && ((n++))
     done
+    # …unless a doc there is still waiting on Jay. The thread that queued it has
+    # usually finished and gone by the time he looks, and dropping the section
+    # would take the request with it — the queue would then be showing something
+    # nobody can see.
     if (( n == 0 )) && [[ "$key" != "$SCRATCH_KEY" ]]; then
-      continue
+      local has_rev=0 rv
+      for rv in ${rev_rows[@]+"${rev_rows[@]}"}; do
+        [[ "${rv%%$'\t'*}" == "$key" ]] && { has_rev=1; break; }
+      done
+      (( has_rev )) || continue
     fi
 
     # Spacer between sections, never above the first drawn one.
@@ -2261,6 +2416,34 @@ render_sidebar() {
       out+=$'\n'
       ((row++))
     fi
+
+    # Docs awaiting review, ABOVE the threads. A doc Jay hasn't signed off on is
+    # usually the thing holding its project up, so it reads before the work it is
+    # holding up — the inverse of PR rows, which record what already shipped.
+    #
+    # 👀 is the whole signal: it means "this wants your eyes". The moment the entry
+    # resolves the emoji goes and the row dims to a plain link, so the section
+    # answers "is anything waiting on me" from the glyphs alone.
+    local rev_entry r_proj r_id r_state r_title r_url
+    for rev_entry in ${rev_rows[@]+"${rev_rows[@]}"}; do
+      IFS=$'\t' read -r r_proj r_id r_state r_title r_url <<< "$rev_entry"
+      [[ "$r_proj" == "$key" ]] || continue
+      local r_glyph="  " r_col="38;5;250" r_ind=" "
+      if [[ "$r_state" == "pending" ]]; then
+        r_glyph="👀"; r_col="1;38;5;220"
+      fi
+      # An emoji is two columns; the resolved row pads to the same two so both
+      # kinds of row start their text in the same place and the column reads as
+      # one list rather than two ragged ones.
+      local r_w=$(( sb_w - 4 ))
+      (( r_w < 4 )) && r_w=4
+      local r_label="${r_title:0:r_w}"
+      out+=" ${r_glyph} \033[${r_col}m${r_label}\033[0m"$'\n'
+      # Column-scoped like the Monitor/flag links, and on linkmap rather than
+      # prmap: prmap is comma-separated and a doc URL is not guaranteed comma-free.
+      [[ -n "$r_url" ]] && linkmap+="${row}:4:$(( 4 + ${#r_label} - 1 )):${r_url}"$'\n'
+      ((row++))
+    done
 
     for entry in ${lines[@]+"${lines[@]}"}; do
       [[ "${entry##*|}" == "$key" ]] || continue
@@ -2389,7 +2572,7 @@ render_sidebar() {
           ;;
       esac
     done
-  done < <(project_sections)
+  done
 
   out+=$'\n\033[38;5;240m click a row, + to add\n prefix j/k  next/prev\n prefix M    move project\n prefix 1-9  jump\033[0m\n'
 
@@ -5659,6 +5842,119 @@ cmd_pr() {
   render_sidebar 2>/dev/null || true
 }
 
+# `llmux review` is a thin front for `reviewq` — it exists to get the PROJECT right.
+# reviewq defaults --project to the basename of the cwd, which for a thread in a
+# worktree is a repo name, not the work; entries land under "Owner" or "jay" and
+# match no section, so the doc never appears where Jay would look for it. Called
+# from a thread, this fills in that thread's project the way `pr add` does.
+#
+# Everything else forwards verbatim. The queue stays reviewq's, so `reviewq review`
+# and `reviewq ls` keep working on exactly the same entries.
+cmd_review() {
+  local action="${1:-ls}"; shift 2>/dev/null || true
+  command -v reviewq >/dev/null 2>&1 \
+    || { echo "Error: reviewq not installed (expected ~/.local/bin/reviewq)" >&2; return 1; }
+
+  case "$action" in
+    ls)
+      local only=""
+      [[ "${1:-}" == "--project" ]] && only="${2:-}"
+      printf '%-6s %-22s %-9s %s\n' ID PROJECT STATE TITLE
+      local r_proj r_id r_state r_title r_url
+      while IFS=$'\t' read -r r_proj r_id r_state r_title r_url; do
+        [[ -z "$r_id" ]] && continue
+        [[ -n "$only" && "$r_proj" != "$only" ]] && continue
+        printf '%-6s %-22s %-9s %s\n' "#$r_id" "$r_proj" "$r_state" "$r_title"
+      done < <(build_review_rows "$(known_projects | tr '\n' ',')")
+      return 0
+      ;;
+    done|dismiss)
+      [[ $# -gt 0 ]] || { echo "Usage: llmux review $action <id>..." >&2; return 1; }
+      reviewq "$action" "$@" || return 1
+      invalidate_review_rows
+      render_sidebar 2>/dev/null || true
+      return 0
+      ;;
+    open)
+      [[ -n "${1:-}" ]] || { echo "Usage: llmux review open <id>" >&2; return 1; }
+      reviewq open "$1"; return $?
+      ;;
+    mv)
+      # Re-file an entry whose project llmux could not match — including everything
+      # queued through reviewq directly, before this existed. Stored in paused.json,
+      # not written back into reviewq's file: that queue belongs to reviewq, and two
+      # writers on one jsonl is how you lose an entry.
+      [[ $# -ge 1 ]] || { echo "Usage: llmux review mv <id> [project]  -- no project restores the reviewq one" >&2; return 1; }
+      local rid="${1#\#}" proj="${2:-}"
+      [[ -n "$proj" ]] && proj=$(sanitize_project "$proj")
+      set_review_project "$rid" "$proj"
+      invalidate_review_rows
+      echo "Review #${rid} → ${proj:-the project reviewq recorded}"
+      render_sidebar 2>/dev/null || true
+      return 0
+      ;;
+    add) ;;
+    *) echo "Usage: llmux review [add|ls|done|dismiss|open|mv] ..." >&2; return 1 ;;
+  esac
+
+  # ── add ───────────────────────────────────────────────────────────────────
+  local title="" url="" context="" kind="" project="" requester="" args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title)     title="${2:-}"; shift 2 ;;
+      --url)       url="${2:-}"; shift 2 ;;
+      --context)   context="${2:-}"; shift 2 ;;
+      --kind)      kind="${2:-}"; shift 2 ;;
+      --project)   project="${2:-}"; shift 2 ;;
+      --requester) requester="${2:-}"; shift 2 ;;
+      --title=*)     title="${1#*=}"; shift ;;
+      --url=*)       url="${1#*=}"; shift ;;
+      --context=*)   context="${1#*=}"; shift ;;
+      --kind=*)      kind="${1#*=}"; shift ;;
+      --project=*)   project="${1#*=}"; shift ;;
+      --requester=*) requester="${1#*=}"; shift ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$title" && -n "$url" ]] \
+    || { echo "Usage: llmux review add --title T --url U [--context C] [--kind K] [--project P]" >&2; return 1; }
+
+  # -t "$TMUX_PANE", not a bare display-message. Bare, tmux answers for whichever
+  # pane is ACTIVE — so an agent enqueueing from a background shell, or while Jay is
+  # looking at another thread, files its doc under someone else's project. TMUX_PANE
+  # is set per pane by tmux itself and names the caller, whoever is on screen.
+  local ctx=()
+  [[ -n "${TMUX_PANE:-}" ]] && ctx=(-t "$TMUX_PANE")
+  if [[ -z "$project" ]]; then
+    project=$(tmux display-message -p ${ctx[@]+"${ctx[@]}"} '#{@llmux_project}' 2>/dev/null || true)
+  fi
+  [[ -z "$project" ]] && project="$SCRATCH_KEY"
+  if [[ -z "$requester" ]]; then
+    local pane_name
+    pane_name=$(tmux display-message -p ${ctx[@]+"${ctx[@]}"} '#{@llmux_name}' 2>/dev/null || true)
+    [[ -n "$pane_name" ]] && requester="llmux:${pane_name}"
+  fi
+
+  args=(add --title "$title" --url "$url" --project "$project")
+  [[ -n "$kind" ]]      && args+=(--kind "$kind")
+  [[ -n "$requester" ]] && args+=(--requester "$requester")
+  # Context on stdin, not as an argument: it is prose, routinely multi-paragraph,
+  # and reviewq reads stdin for exactly this.
+  local out_line
+  if [[ -n "$context" ]]; then
+    out_line=$(printf '%s\n' "$context" | reviewq "${args[@]}") || return 1
+  elif [[ ! -t 0 ]]; then
+    out_line=$(reviewq "${args[@]}") || return 1
+  else
+    echo "Error: --context is required (say what needs review and what feedback you want)" >&2
+    return 1
+  fi
+  invalidate_review_rows
+  echo "${out_line} → ${project}"
+  echo "  $title"
+  render_sidebar 2>/dev/null || true
+}
+
 
 # ── Crash resilience ─────────────────────────────────────────────────────────
 #
@@ -6207,6 +6503,7 @@ case "$command" in
   mv)        cmd_mv "$@" ;;
   project)   cmd_project "$@" ;;
   pr)        cmd_pr "$@" ;;
+  review)    cmd_review "$@" ;;
   restore)   cmd_restore "$@" ;;
   snapshot)  cmd_snapshot "$@" ;;
   next)      cmd_next "$@" ;;

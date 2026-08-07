@@ -127,6 +127,46 @@ whatever is actually in flight rather than every PR you've ever authored.
   Fetched state — open/draft/last-activity — is a disposable tmux option refreshed by
   `llmux-watch` every ~2 min, never a file.
 
+### Docs waiting on you, per project
+
+A thread that produces something you need to read — a plan, a recap, a decision
+write-up — queues it, and it draws at the **top** of its project, above the threads.
+A doc awaiting sign-off is usually what the work under it is waiting on, which is the
+inverse of PR rows: those record what already shipped, so they sit at the bottom.
+
+```
+ custom-campaigns-me2 ──
+  (Monitor) customCampaignsMe2
+  👀 Rollout sequencing        ← needs your eyes; click opens the doc
+  👀 SLO thresholds
+     Zeus cutover checklist    ← you signed off; emoji gone, row fades out
+  1 ✳ cc-zeus
+  ⌥ #52093 read flag
+```
+
+- **👀 is the whole signal.** It means "this wants your eyes". Approve the entry and
+  the emoji goes; the row stays a plain link for `LLMUX_REVIEW_KEEP_HOURS` (24, set 0
+  to drop it immediately) so "what did I just approve" is still on screen.
+- **It rides on [`reviewq`](~/.local/bin/reviewq), not a second queue.** llmux reads
+  `~/.config/reviewq/queue.jsonl` and never writes it, so `reviewq review` still drains
+  the same entries and clearing one there clears the 👀 here within a repaint.
+- **`llmux review add` exists to get the project right.** `reviewq` defaults its
+  `--project` to the basename of the cwd, which in a worktree is a repo name, not the
+  work — entries land under `Owner` or `jay` and match no section. Called from a
+  thread, `llmux review add` fills in *that thread's* project, the way `pr add` does.
+- **Nothing queued is ever invisible.** An entry whose project matches no section is
+  filed under SCRATCH rather than dropped, and a project with a doc still pending is
+  drawn even after its last thread ends. `llmux review mv <id> <project>` re-files one
+  (stored in `paused.json`, so reviewq's own file stays reviewq's).
+
+```bash
+llmux review add --title "Rollout sequencing" --url <lookout-url> \
+                 --kind plan --context "Which ramp order do you want?"
+llmux review ls                  # id, project, state, title
+llmux review done 7              # signed off — clears the 👀
+llmux review mv 2 custom-campaigns-me2
+```
+
 ### The fading "done, and you haven't looked" dot
 
 `idle` itself stays unmarked, but the *subset* of idle that is news does get a mark:
