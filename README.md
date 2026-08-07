@@ -129,15 +129,26 @@ whatever is actually in flight rather than every PR you've ever authored.
 
 ### Forge tasks, per project
 
-A Forge task is an agent working on the project somewhere else. Attach it and it draws
-as a link on the project's links row, beside `(Monitor)` and the flags:
+A Forge task is an agent working on the project somewhere else. Attach it and it gets
+**a row of its own**, directly above the threads:
 
 ```
  custom-campaigns-me2 ──
-  (Monitor) ⚒ shadow parity sweep customCampaignsMe2
+  (Monitor) customCampaignsMe2 customCampaignsMe2Read
   👀 Rollout sequencing
+  ⚒ shadow parity sweep      ← click opens the task in Forge
+  ⚒ flaky test hunt
  1 ✳ cc-last-mile
 ```
+
+They shared the links row at first and that row could not carry them: a project with a
+monitor, two flags and two tasks ran off the right edge, and whatever came last was
+what fell off. A task also has a human-written name that wants room, unlike a flag
+whose label is a fixed identifier.
+
+Last before the threads on purpose — a Forge task is the same axis as a thread (work
+in progress, one line each), so the two read as one list, with the tasks llmux cannot
+switch to sitting just above the ones it can.
 
 ```bash
 llmux project forge custom-campaigns-me2 tsk-CJyj5XHDU6Pz shadow parity sweep
@@ -159,10 +170,12 @@ llmux project forge                      # list them all
   its colour already say "this is Forge"; the label is free to spend every column on
   *which* piece of work it is. Register one without a name and it says `⚒ untitled
   task`, plus a warning on the way in.
-- **Every Forge link is the same colour, in every project** — deliberately not the
+- **Every Forge row is the same colour, in every project** — deliberately not the
   project colour that `(Monitor)` and the flags take. A running task is a different
-  kind of thing from the config links beside it, and the row says so before you have
-  read a word of it.
+  kind of thing from the links above it and the threads below it, and the row says so
+  before you have read a word of it.
+- **A project with a task still running keeps its section**, even after its last local
+  thread ends. A Forge task outliving every pane is the normal case, not an odd one.
 - **A project can carry several.** Re-registering the same task updates its title
   rather than duplicating; `--remove` takes the bare id or the full URL, `--clear`
   drops them all. Nothing expires them — a finished task stays until you remove it.
