@@ -296,6 +296,12 @@ Bindings live in the tmux server rather than the session, so they're lost if the
 server restarts; re-run `llmux sidebar on` to re-register (it's idempotent).
 `llmux sidebar off` restores the tmux defaults it took over.
 
+**The sidebar doesn't scroll.** It always shows current state, so there is nothing
+behind it worth scrolling to — the wheel is ignored over that column and scrolls
+every other pane as usual. It also clears its own scrollback on each repaint;
+before that, a paint every 2s buried the pane in stale copies of itself that you
+could scroll into and mistake for live rows.
+
 **Ordering.** Project first, then pinned, then alphabetical. To put specific
 threads at the top *of their section*:
 

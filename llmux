@@ -2410,7 +2410,13 @@ render_sidebar() {
   # budgets above already prevent that, so this is a belt — but it is the belt that
   # matters, because the failure it prevents (a wrapped row desyncing rowmap, so
   # clicks land on the wrong thread) is silent and confusing.
-  printf '\033[H\033[2J\033[?7l%b' "$out" > "$(tmux display-message -p -t "$sb" '#{pane_tty}')" 2>/dev/null || true
+  #
+  # \033[3J erases the scrollback. tmux treats \033[2J the way a shell's `clear`
+  # wants it treated — the erased frame is pushed into history so you can scroll
+  # back to it — so repainting every 2s buried the pane under stale copies of
+  # itself and pinned it at history-limit within the hour. There is nothing worth
+  # scrolling back to here: the pane shows current state and nothing else.
+  printf '\033[H\033[2J\033[3J\033[?7l%b' "$out" > "$(tmux display-message -p -t "$sb" '#{pane_tty}')" 2>/dev/null || true
 }
 
 # Runs inside the sidebar pane. Polls so llmux-watch's @llmux_status changes
@@ -3388,6 +3394,11 @@ sidebar_unbind_keys() {
     tmux bind-key -T prefix "$i" select-window -t ":$i" 2>/dev/null || true
   done
   tmux unbind-key -n MouseDown1Pane 2>/dev/null || true
+  # Not `unbind`: this one overrode a tmux default, so dropping it would leave
+  # the wheel dead everywhere. Put the stock binding back verbatim.
+  tmux bind-key -n WheelUpPane \
+    if-shell -F -t= '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' \
+      'send-keys -M -t=' 'copy-mode -e -t=' 2>/dev/null || true
 }
 
 # Enable/disable sidebar mode. Enabling migrates the panes that already exist:
@@ -3591,6 +3602,21 @@ sidebar_bind_mouse() {
     if-shell -F -t= '#{==:#{@llmux_sidebar},1}' \
       "run-shell -b 'llmux _click #{mouse_y} #{pane_id} #{mouse_x}'" \
       "select-pane -t= ; send-keys -M" 2>/dev/null || true
+
+  # Swallow the wheel over the sidebar. Clearing the scrollback each paint stops
+  # it showing stale frames, but tmux's default WheelUpPane still drops the pane
+  # into copy-mode, which freezes it on the frame you happened to scroll — a
+  # display that has stopped updating and looks identical to one that is live.
+  # The empty arm is a real tmux command list, so the event is consumed here and
+  # never reaches copy-mode.
+  #
+  # The else arm reproduces tmux's stock WheelUpPane so every other pane keeps
+  # scrolling normally: bindings are server-global, not session-scoped, and this
+  # one has to be a no-op outside llmux's sidebar.
+  tmux bind-key -n WheelUpPane \
+    if-shell -F -t= '#{==:#{@llmux_sidebar},1}' \
+      "" \
+      "if-shell -F -t= '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' 'send-keys -M -t=' 'copy-mode -e -t='" 2>/dev/null || true
 }
 
 attach_to_pane() {
