@@ -1377,8 +1377,17 @@ prompt_for_project() {
   done < <(known_projects)
   menu+=("$NEW_PROJECT_ITEM")
 
-  pick=$(printf '%s\n' "${menu[@]}" | gum choose \
-    --header "Project" --header.foreground "99" --cursor.foreground "212") || return 1
+  # `gum filter`, not `gum choose`, and sized to the list. choose defaults to
+  # --height 10 and shows no scroll indicator, so with a dozen projects the tail --
+  # including "＋ new project…" -- was simply invisible: the list looked complete and
+  # silently skipped entries. filter also lets you type to narrow, which is how every
+  # other long picker in llmux behaves, and the project list only grows.
+  local ph=$(( ${#menu[@]} + 2 ))
+  (( ph > 20 )) && ph=20
+  pick=$(printf '%s\n' "${menu[@]}" | gum filter --height "$ph" \
+    --placeholder "type to filter" --prompt "> " \
+    --header "Project" --header.foreground "99" \
+    --indicator.foreground "212" --match.foreground "212") || return 1
   [[ -z "$pick" ]] && return 1
   if [[ "$pick" == "$NEW_PROJECT_ITEM" ]]; then
     pick=$(gum input --placeholder "project name" --header "New project" \
@@ -2621,9 +2630,20 @@ sidebar_click() {
 #
 # $1 is "*" for the global "+" (ask for the project) or a project key to add
 # straight into.
+# Popup height follows the project list: a fixed 14 rows clipped the picker as soon
+# as there were more than a handful of projects.
+popup_height() {
+  local n
+  n=$({ known_projects | grep -c . ; } || echo 0)
+  local h=$(( n + 8 ))
+  (( h < 14 )) && h=14
+  (( h > 28 )) && h=28
+  printf '%s' "$h"
+}
+
 sidebar_add_prompt() {
   local target="${1:-*}"
-  tmux display-popup -E -w 56 -h 14 -T " new thread " \
+  tmux display-popup -E -w 56 -h "$(popup_height)" -T " new thread " \
     "$(printf 'llmux _newthread %q' "$target")" 2>/dev/null || true
 }
 
@@ -3329,7 +3349,7 @@ sidebar_bind_keys() {
   # M, not m: ensure_session already owns prefix+m as the mouse toggle (the
   # "[mouse]" flag in status-right), and stealing it would break the one binding
   # you need when the mouse is what's misbehaving.
-  tmux bind-key -T prefix M display-popup -E -w 56 -h 14 -T ' move thread ' \
+  tmux bind-key -T prefix M display-popup -E -w 56 -h 24 -T ' move thread ' \
     'llmux _movethread' 2>/dev/null || true
   local i
   for i in 1 2 3 4 5 6 7 8 9; do
