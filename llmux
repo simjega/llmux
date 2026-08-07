@@ -2453,6 +2453,11 @@ render_sidebar() {
     tmux set-option -t "$SESSION" @llmux_review_rows "$rev_raw" 2>/dev/null || true
     tmux set-option -t "$SESSION" @llmux_review_rows_sig "$rev_sig" 2>/dev/null || true
   fi
+  local forge_rows=() forgeline
+  while IFS= read -r forgeline; do
+    [[ -n "$forgeline" ]] && forge_rows+=("$forgeline")
+  done <<< "$forge_map"
+
   local rev_rows=() revline
   while IFS= read -r revline; do
     [[ -n "$revline" ]] && rev_rows+=("$revline")
@@ -2480,16 +2485,22 @@ render_sidebar() {
     for entry in ${lines[@]+"${lines[@]}"}; do
       [[ "${entry##*|}" == "$key" ]] && ((n++))
     done
-    # …unless a doc there is still waiting on Jay. The thread that queued it has
-    # usually finished and gone by the time he looks, and dropping the section
-    # would take the request with it — the queue would then be showing something
-    # nobody can see.
+    # …unless a doc is still waiting on Jay, or a Forge task is still running. The
+    # thread that queued the doc has usually finished and gone by the time he looks,
+    # and a Forge task outliving every local thread is the normal case, not an odd
+    # one — dropping the section would take both with it, leaving llmux showing
+    # something nobody can see.
     if (( n == 0 )) && [[ "$key" != "$SCRATCH_KEY" ]]; then
-      local has_rev=0 rv
+      local has_extra=0 rv
       for rv in ${rev_rows[@]+"${rev_rows[@]}"}; do
-        [[ "${rv%%$'\t'*}" == "$key" ]] && { has_rev=1; break; }
+        [[ "${rv%%$'\t'*}" == "$key" ]] && { has_extra=1; break; }
       done
-      (( has_rev )) || continue
+      if (( ! has_extra )); then
+        for rv in ${forge_rows[@]+"${forge_rows[@]}"}; do
+          [[ "${rv%%$'\t'*}" == "$key" ]] && { has_extra=1; break; }
+        done
+      fi
+      (( has_extra )) || continue
     fi
 
     # Spacer between sections, never above the first drawn one.
@@ -2506,17 +2517,14 @@ render_sidebar() {
     # 20-character project name plus "(Monitor) (Flag)" cannot fit 30 columns, and
     # the loser is always the thing you wanted to click. A dedicated row spills
     # once, deliberately, instead of fighting for width on every project.
-    local mon_url="" flg_url="" frg_url=""
+    local mon_url="" flg_url=""
     if [[ -n "$mon_map" ]]; then
       mon_url=$(printf '%s' "$mon_map" | awk -F'\t' -v k="$key" '$1==k {print $2; exit}')
     fi
     if [[ -n "$flag_map" ]]; then
       flg_url=$(printf '%s' "$flag_map" | awk -F'\t' -v k="$key" '$1==k {print $4; exit}')
     fi
-    if [[ -n "$forge_map" ]]; then
-      frg_url=$(printf '%s' "$forge_map" | awk -F'\t' -v k="$key" '$1==k {print $2; exit}')
-    fi
-    if [[ -n "$mon_url" || -n "$flg_url" || -n "$frg_url" ]]; then
+    if [[ -n "$mon_url" || -n "$flg_url" ]]; then
       local lrow="" lcol=2
       out+="  "
       if [[ -n "$mon_url" ]]; then
@@ -2524,27 +2532,6 @@ render_sidebar() {
         linkmap+="${row}:${lcol}:$(( lcol + 8 )):${mon_url}"$'\n'
         lcol=$(( lcol + 10 )); out+=" "
       fi
-      # Forge tasks before the flags: a task is live work, a flag is configuration,
-      # and the live thing wins the width when the row runs out. ⚒ marks them as a
-      # kind — the label is a human title, so without a glyph a task and a flag are
-      # indistinguishable at a glance. U+2692 is Neutral width, i.e. ONE column;
-      # a two-column glyph here would shift every hotspot on the row off its text.
-      local fg_url fg_title first_forge=1
-      while IFS=$'\t' read -r fg_url fg_title; do
-        [[ -z "$fg_url" ]] && continue
-        (( sb_w - lcol < 7 )) && break
-        if (( ! first_forge )); then out+=" "; lcol=$(( lcol + 1 )); fi
-        forge_label "$fg_title" $(( sb_w - lcol - 2 ))
-        [[ -z "$R_FORGE_LABEL" ]] && break
-        out+="\033[1;38;5;${FORGE_COLOUR}m⚒\033[0m \033[4;38;5;${FORGE_COLOUR}m${R_FORGE_LABEL}\033[0m"
-        # The glyph and the space after it are part of the hotspot: the glyph is one
-        # column, and aiming at a one-column target is not something anyone should
-        # have to do.
-        linkmap+="${row}:${lcol}:$(( lcol + 1 + ${#R_FORGE_LABEL} )):${fg_url}"$'\n'
-        lcol=$(( lcol + 2 + ${#R_FORGE_LABEL} ))
-        first_forge=0
-      done < <(printf '%s' "$forge_map" | awk -F'\t' -v k="$key" '$1==k {print $2"\t"$3}')
-      [[ -n "$frg_url" && -n "$flg_url" ]] && { out+=" "; lcol=$(( lcol + 1 )); }
       # Every flag the project carries, until the row runs out. A stub of four or
       # fewer characters identifies nothing and cannot be aimed at, so stop rather
       # than draw one.
@@ -2590,6 +2577,29 @@ render_sidebar() {
       # Column-scoped like the Monitor/flag links, and on linkmap rather than
       # prmap: prmap is comma-separated and a doc URL is not guaranteed comma-free.
       [[ -n "$r_url" ]] && linkmap+="${row}:4:$(( 4 + ${#r_label} - 1 )):${r_url}"$'\n'
+      ((row++))
+    done
+
+    # Forge tasks: ONE ROW EACH, directly above the threads. They shared the links
+    # row with (Monitor) and the flags at first, and that row cannot carry them — a
+    # project with a monitor, two flags and two tasks ran off the right edge, and
+    # what got pushed off was whatever came last. A task also has a human-written
+    # name that wants room, unlike a flag whose label is a fixed identifier.
+    #
+    # Last before the threads on purpose: this is the same axis as a thread — work
+    # in progress, one line per piece — so the two read as one list, with the tasks
+    # that llmux cannot switch to sitting just above the ones it can.
+    local fg_entry fg_proj fg_url fg_title
+    for fg_entry in ${forge_rows[@]+"${forge_rows[@]}"}; do
+      IFS=$'\t' read -r fg_proj fg_url fg_title <<< "$fg_entry"
+      [[ "$fg_proj" == "$key" ]] || continue
+      # Same geometry as a PR row (" ⌥ label"): glyph at column 1, label at 3. The
+      # kinds then line up down the section instead of each starting somewhere new.
+      forge_label "$fg_title" $(( sb_w - 3 ))
+      out+=" \033[1;38;5;${FORGE_COLOUR}m⚒\033[0m \033[4;38;5;${FORGE_COLOUR}m${R_FORGE_LABEL}\033[0m"$'\n'
+      # Hotspot spans the glyph too: one column is not a thing anyone should have to
+      # aim at, and nothing else on this row competes for the click.
+      linkmap+="${row}:1:$(( 3 + ${#R_FORGE_LABEL} - 1 )):${fg_url}"$'\n'
       ((row++))
     done
 
