@@ -7,9 +7,17 @@
 # ends when the pane produces sustained new content (3+ consecutive hash
 # changes = 15+ seconds of active output), not just a cursor blink.
 
-SESSION="llmux"
-WATCH_STATE_DIR="/tmp/llmux-watch"
-WATCH_PIDFILE="/tmp/llmux-watch.pid"
+# The session is overridable so the watcher can be exercised against the isolated
+# dev instance. It used to be hardcoded, which meant there was NO way to test a
+# watcher change except by pointing it at Jay's live session -- and starting a second
+# copy also clobbered the shared pidfile, so stopping "the" watcher then killed the
+# wrong process. Paths stay byte-identical for the default session, so a watcher that
+# is already running and an `llmux _watch-stop` from an older build both still work.
+SESSION="${LLMUX_SESSION:-llmux}"
+_watch_suffix=""
+[ "$SESSION" = "llmux" ] || _watch_suffix="-$SESSION"
+WATCH_STATE_DIR="/tmp/llmux-watch$_watch_suffix"
+WATCH_PIDFILE="/tmp/llmux-watch$_watch_suffix.pid"
 
 mkdir -p "$WATCH_STATE_DIR"
 echo $$ > "$WATCH_PIDFILE"
@@ -228,7 +236,7 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
     (llmux _snapshot >/dev/null 2>&1 || true) &
   fi
 
-  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor; do
+  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor asking; do
     [ "$is_term" = "1" ] && continue
     [ -z "$pane_id" ] && continue
     # Now that -s exposes them: the sidebar is a display that repaints every 2s
@@ -311,6 +319,11 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
         # Behind the same 3-cycle gate as the notified marker, so a cursor blink
         # can't reset an age you were reading.
         tmux set-option -p -t "$pane_id" @llmux_done_at "" 2>/dev/null || true
+        # Sustained output means the thread went back to work, so whatever it was
+        # asking is no longer outstanding. Clearing here is what stops a stale ask
+        # holding the row red forever if Jay answers somewhere this never sees --
+        # the UserPromptSubmit hook is the fast path, this is the backstop.
+        [ -n "$asking" ] && tmux set-option -p -t "$pane_id" @llmux_asking "" 2>/dev/null || true
       fi
     else
       # Content unchanged — reset active counter
@@ -362,6 +375,16 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
           ;;
       esac
 
+      # A thread that ASKED something is blocked on Jay even though the screen shows
+      # a plain idle prompt. @llmux_asking is set by the Stop/Notification hooks (and
+      # by `llmux asking` for tools with no hooks) precisely because the pane cannot
+      # be read for this: a turn ending in a question and a turn ending in an answer
+      # look identical. Below `perm`, which is a harder gate, and never overriding a
+      # menu already detected.
+      if [ -n "$asking" ] && { [ -z "$detected" ] || [ "$detected" = "idle" ]; }; then
+        detected="blocked"
+      fi
+
       if [ -n "$detected" ]; then
         tmux set-option -p -t "$pane_id" @llmux_status "$detected" 2>/dev/null || true
         # The notified marker stores the STATE, not just "1", so an escalation
@@ -383,7 +406,7 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
   # loop only ever saw the ONE visible thread — every parked thread got no status
   # updates at all. That is precisely why a thread blocked on a question showed no
   # indicator: it was parked, so nothing ever looked at it.
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}' 2>/dev/null)
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}' 2>/dev/null)
 
   sleep 5
 done

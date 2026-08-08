@@ -121,6 +121,11 @@ Usage:
              [--project P]                      pane's section. Rides on the reviewq queue, so
                                                 'reviewq review' still drains it. Draws at the
                                                 TOP of its project, marked 👀 until resolved.
+  llmux asking [on|off]                         Mark this thread as waiting on an answer from
+                                                Jay, recolouring its row until he replies.
+                                                Claude threads do this automatically (Stop /
+                                                Notification hooks); this is for the tools
+                                                without hooks.
   llmux review ls | done <id> | dismiss <id>    List / sign off / discard. Marking it done
              | open <id> | mv <id> [project]    clears the 👀; the row fades out after
                                                 LLMUX_REVIEW_KEEP_HOURS (24). mv re-files an
@@ -6055,6 +6060,38 @@ cmd_pr() {
 #
 # Everything else forwards verbatim. The queue stays reviewq's, so `reviewq review`
 # and `reviewq ls` keep working on exactly the same entries.
+# Mark this thread as waiting on a human answer, so its row recolours.
+#
+# The status option itself is NOT written here: llmux-watch owns @llmux_status and
+# recomputes it every 5s, so anything written directly would be erased within one
+# cycle. This sets @llmux_asking, which llmux-watch promotes to `blocked`.
+#
+# Claude threads get this automatically from the Stop/Notification hooks. This
+# command is for the tools with no hook system (codex, amp, opencode, a plain
+# shell), and for the case where an agent knows it is asking before it stops.
+cmd_asking() {
+  local action="${1:-on}"
+  local pane="${TMUX_PANE:-}"
+  # -t "$TMUX_PANE": a bare display-message answers for whichever pane is ACTIVE, so
+  # an agent running in the background would flag whatever thread Jay is looking at.
+  if [[ -z "$pane" ]]; then
+    echo "Error: not inside a tmux pane — run this from the thread that is asking" >&2
+    return 1
+  fi
+  case "$action" in
+    on|"")
+      tmux set-option -p -t "$pane" @llmux_asking "$(date +%s)" 2>/dev/null || true
+      echo "Marked $(tmux show-option -p -t "$pane" -qv @llmux_name 2>/dev/null || echo "$pane") as waiting on an answer."
+      ;;
+    off|clear|answered)
+      tmux set-option -p -t "$pane" @llmux_asking "" 2>/dev/null || true
+      echo "Cleared."
+      ;;
+    *) echo "Usage: llmux asking [on|off]" >&2; return 1 ;;
+  esac
+  render_sidebar 2>/dev/null || true
+}
+
 cmd_review() {
   local action="${1:-ls}"; shift 2>/dev/null || true
   command -v reviewq >/dev/null 2>&1 \
@@ -6709,6 +6746,7 @@ case "$command" in
   project)   cmd_project "$@" ;;
   pr)        cmd_pr "$@" ;;
   review)    cmd_review "$@" ;;
+  asking)    cmd_asking "$@" ;;
   restore)   cmd_restore "$@" ;;
   snapshot)  cmd_snapshot "$@" ;;
   next)      cmd_next "$@" ;;
