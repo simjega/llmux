@@ -220,6 +220,34 @@ llmux review done 7              # signed off — clears the 👀
 llmux review mv 2 custom-campaigns-me2
 ```
 
+### A thread that is asking you something turns colour
+
+When an agent asks Jay a question, its row goes to the alert colour and picks up 🙋 —
+the same treatment a permission prompt gets. It clears the moment he replies.
+
+`llmux-watch` already did this for questions it could *see*: a choice list, a
+permission gate. But it works by reading the pane, and on screen a turn that ends
+with a question is identical to a turn that ends with an answer — same prompt, same
+idle cursor. So the one thread that needed Jay rendered exactly like the ten that
+didn't. The transcript knows the difference, so that is what is read now.
+
+- **Claude threads need no cooperation.** Three hooks
+  (`~/.agents/hooks/llmux-asking.sh`) do it: `Notification` when Claude is waiting on
+  input, `Stop` when a turn ends *and its last line is a question*, `UserPromptSubmit`
+  to clear when Jay replies.
+- **Only the last line of the final message counts.** A "?" earlier in a message is
+  usually the agent quoting the question it just answered, and a colour that is always
+  on stops meaning anything. Measured over ~2,600 real assistant messages, 3% would
+  flag.
+- **Tools without hooks say so themselves**: `llmux asking` / `llmux asking off` —
+  codex, amp, opencode, a plain shell.
+- **The flag is `@llmux_asking` on the pane, never `@llmux_status`.** `llmux-watch`
+  owns the status option and recomputes it every 5s, so anything written there
+  directly is erased within one cycle; the watcher reads `@llmux_asking` and promotes
+  the thread from `idle` to `blocked`. It also clears it once the thread produces
+  sustained output again — that is the backstop if Jay answers somewhere the hook
+  never sees.
+
 ### The fading "done, and you haven't looked" dot
 
 `idle` itself stays unmarked, but the *subset* of idle that is news does get a mark:
