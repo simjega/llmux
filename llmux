@@ -37,7 +37,13 @@ unset _llmux_bin
 export PATH
 
 usage() {
-  cat <<EOF
+  # QUOTED heredoc. Unquoted, every backtick and $( ) in the help text below is a
+  # command substitution that bash RUNS before printing a word -- and one of these
+  # lines cites a `reviewq review` example, which is an interactive fzf drain. So
+  # `llmux help` hung forever, having silently launched the review queue in a pane
+  # nobody was looking at. The text needs no expansion at all, so quoting it makes
+  # the block inert and stops the next backticked example doing the same thing.
+  cat <<'EOF'
 llmux — multiplex LLM sessions in tmux
 
 Usage:
@@ -113,7 +119,7 @@ Usage:
   llmux review add --title T --url U            Queue a doc for Jay to review (lookout link or
              --context C [--kind K]             equivalent). Project defaults to the calling
              [--project P]                      pane's section. Rides on the reviewq queue, so
-                                                `reviewq review` still drains it. Draws at the
+                                                'reviewq review' still drains it. Draws at the
                                                 TOP of its project, marked 👀 until resolved.
   llmux review ls | done <id> | dismiss <id>    List / sign off / discard. Marking it done
              | open <id> | mv <id> [project]    clears the 👀; the row fades out after
