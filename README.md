@@ -220,6 +220,37 @@ llmux review done 7              # signed off — clears the 👀
 llmux review mv 2 custom-campaigns-me2
 ```
 
+### Threads can message each other
+
+```bash
+llmux who                                    # the directory: who exists, and how busy
+llmux send cc-last-mile "the reads flag is live in staging — retest?"
+```
+
+`who` lists every live thread with its name, project, tool, **status**, session id and
+cwd; `--json` for agents. `send` resolves a target by exact name, session id, or
+unique name prefix — anything ambiguous is an error rather than a guess, because
+delivering to the wrong agent is worse than not delivering.
+
+- **Delivery goes through the pane, not `claude --resume <id> -p`.** The session id is
+  the right way to *name* a thread and llmux already records it per pane, but resuming
+  a session a live TUI is holding open puts two writers on one transcript: that
+  corrupts the session instead of delivering a message. The pane is where a running
+  agent actually reads input, so that is the mailbox.
+- **It refuses to type into a prompt.** A pane sitting on a permission gate or a
+  choice menu reads keystrokes as *answers* — a message would approve a tool call
+  nobody vetted, or pick an option. Those states are refused (`--force` if you know
+  better). A thread that stopped to ask a *question* is fair game: a message is the
+  answer.
+- **Messages are attributed in the payload**, not by convention:
+  `[llmux message from thread "cc-last-mile" — another agent, not Jay]`. The recipient
+  may have no llmux context, and a peer's request must never arrive looking like an
+  instruction from Jay.
+- **One line.** A newline is Enter in all these TUIs, so a multi-line message would
+  submit itself in fragments; whitespace is collapsed on the way out.
+- Nothing is queued: a thread that is not running has no mailbox, which is correct —
+  there is nobody to read it.
+
 ### A thread that is asking you something turns colour
 
 When an agent asks Jay a question, its row goes to the alert colour and picks up 🙋 —
