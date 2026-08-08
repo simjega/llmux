@@ -1042,12 +1042,7 @@ ensure_session() {
     tmux set-option -t "$SESSION" mouse on
     tmux bind-key -T prefix m set-option mouse
     apply_status_right
-    # Active pane's Claude token usage (used_k/left_k vs the 1M window), bottom-left
-    # under Claude's ">> bypass permissions on" footer. @llmux_ctx is maintained per
-    # pane by llmux-watch; status formats resolve it against the active pane. Falls
-    # back to the session name on panes with no token count (terminal/non-claude).
-    tmux set-option -t "$SESSION" status-left "#{?#{@llmux_ctx},#[fg=colour214,bold] 🪙 #{@llmux_ctx} #[default],#[fg=colour244] [#{session_name}] #[default]}"
-    tmux set-option -t "$SESSION" status-left-length 40
+    apply_status_left
     tmux set-option -t "$SESSION" status-interval 5
     # Allow mouse wheel to scroll in non-alternate-screen panes (plain shells)
     tmux set-option -t "$SESSION" terminal-overrides 'xterm*:smcup@:rmcup@'
@@ -1102,6 +1097,40 @@ ensure_session() {
 #
 # Inside a #{?...} conditional a literal comma separates the arms, so a comma inside
 # #[...] must be escaped as #, — see the pane-border format below.
+# Bottom-left segment, resolved against the ACTIVE pane. Two per-pane options,
+# both maintained by llmux-watch:
+#   @llmux_ctx    — Claude token usage "used_k/left_k" (claude panes only)
+#   @llmux_prompt — first line of the session's first user prompt (set once)
+# Layout: "🪙 <ctx> · <prompt>". Either may be absent — a non-claude pane has no
+# ctx, and a pane whose transcript hasn't produced a first user message yet has no
+# prompt — so each segment is guarded independently and the " · " separator only
+# draws when both are present. When neither exists (e.g. the terminal pane) it
+# falls back to the session name, matching the old behaviour.
+#
+# A function, not an inline literal in ensure_session, for the same reason as
+# apply_status_right/apply_pane_border_format: ensure_session only runs when there
+# is NO session, so an inline format could never be corrected in a live session
+# without recreating it (which kills every thread). cmd_sidebar's `on` path
+# re-applies this — keep that call in step with any edit here.
+#
+# Comma escaping: inside a #{?...} conditional a literal comma separates the
+# true/false arms, so a comma inside #[...] must be written #, or tmux truncates
+# the attribute list at it.
+apply_status_left() {
+  local ctx prompt sep fallback
+  ctx='#{?#{@llmux_ctx},#[fg=colour214#,bold]🪙 #{@llmux_ctx}#[default],}'
+  # Separator only when BOTH ctx and prompt are set (nested condition).
+  sep='#{?#{@llmux_ctx},#{?#{@llmux_prompt}, #[fg=colour244]· #[default],},}'
+  prompt='#{?#{@llmux_prompt},#[fg=colour252]#{@llmux_prompt}#[default],}'
+  # Neither present → session name, as before. The condition concatenates both
+  # option values: empty ⇒ false, either non-empty ⇒ true.
+  fallback='#{?#{@llmux_ctx}#{@llmux_prompt},,#[fg=colour244][#{session_name}]#[default]}'
+  tmux set-option -t "$SESSION" status-left " ${ctx}${sep}${prompt}${fallback} "
+  # Wider than the old 40 so a first-prompt line has room; still bounded so it
+  # can't crowd out the right cluster.
+  tmux set-option -t "$SESSION" status-left-length 80
+}
+
 apply_status_right() {
   tmux set-option -t "$SESSION" status-right \
     "#(llmux _slot-status)#(llmux _status-count)#(reviewq _status-count)#{?mouse,,#[fg=colour203#,bold] MOUSE OFF (prefix+m) #[default]} %H:%M " 2>/dev/null || true
@@ -3852,6 +3881,7 @@ cmd_sidebar() {
     sidebar_hook_resize
     apply_pane_border_format
     apply_status_right
+    apply_status_left
     sidebar_apply_layout
     render_sidebar
     echo "Sidebar mode already on — bindings re-registered."
@@ -3912,6 +3942,7 @@ cmd_sidebar() {
   # reach a live session, so `llmux sidebar on` is the repair path for a session
   # whose status bar or borders predate a change to either format.
   apply_status_right
+  apply_status_left
   sidebar_apply_layout
   # The loop runs in the sidebar pane's own shell, which does not inherit our
   # environment — so an overridden session name has to be passed through

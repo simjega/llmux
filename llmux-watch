@@ -7,7 +7,11 @@
 # ends when the pane produces sustained new content (3+ consecutive hash
 # changes = 15+ seconds of active output), not just a cursor blink.
 
-SESSION="llmux"
+# Respect an overridden session name (the isolated llmux-dev instance sets
+# LLMUX_SESSION=llmux-dev), matching llmux's own `SESSION="${LLMUX_SESSION:-llmux}"`.
+# Unset — the daily-driver case — still resolves to "llmux", so this is a no-op for
+# the live watcher.
+SESSION="${LLMUX_SESSION:-llmux}"
 WATCH_STATE_DIR="/tmp/llmux-watch"
 WATCH_PIDFILE="/tmp/llmux-watch.pid"
 
@@ -207,6 +211,104 @@ if total:
 PY
 }
 
+# First line of the session's FIRST user prompt — the thing the pane was started to
+# do. Immutable once the transcript has a first human turn, so the caller computes
+# it ONCE (only when @llmux_prompt is empty) and never again.
+#
+# Resolution is deliberately cheaper than compute_claude_ctx: cached session UUID
+# first, else the single-jsonl-in-slug-dir fallback. NO lsof sweep — by the time a
+# pane has produced a first user message the ctx path has usually already cached its
+# session; if not, we simply retry next cycle. Ambiguous cwd with no cached session
+# ⇒ emit nothing (never guess a neighbour's transcript).
+#
+# Slash-command starts: Claude records `/foo bar` as a wrapper whose real text is in
+# <command-args>. We surface the args (so this session reads "and /improving-llmux
+# …" rather than "/llmux"); a bare command with no args (e.g. /clear) is skipped and
+# we look at the next user turn.
+compute_claude_prompt() {
+  local cwd="$1" cached_session="${2:-}"
+  python3 - "$cwd" "$cached_session" <<'PY' 2>/dev/null
+import json, os, sys, glob, re
+cwd = sys.argv[1]
+cached_session = sys.argv[2] if len(sys.argv) > 2 else ""
+proj_root = os.path.expanduser('~/.claude/projects')
+
+def slug_dirs():
+    s = {cwd.replace('/', '-'), cwd.replace('/', '-').replace('.', '-')}
+    return [os.path.join(proj_root, x) for x in s if os.path.isdir(os.path.join(proj_root, x))]
+
+def jsonl_for_uuid(uuid):
+    for d in slug_dirs():
+        p = os.path.join(d, f'{uuid}.jsonl')
+        if os.path.isfile(p):
+            return p
+    return None
+
+jsonl = jsonl_for_uuid(cached_session) if cached_session else None
+if not jsonl:
+    cands = []
+    for d in slug_dirs():
+        cands.extend(glob.glob(os.path.join(d, '*.jsonl')))
+    if len(cands) == 1:
+        jsonl = cands[0]
+    # else ambiguous — give up, retry next cycle once the session is cached.
+if not jsonl or not os.path.isfile(jsonl):
+    sys.exit(0)
+
+def label_from(text):
+    t = text.strip()
+    # Slash-command wrapper: prefer the args, fall back to nothing (bare command).
+    if '<command-name>' in t or '<command-args>' in t:
+        m = re.search(r'<command-args>(.*?)</command-args>', t, re.S)
+        args = (m.group(1).strip() if m else '')
+        if not args:
+            return None
+        t = args
+    # Drop system-reminder blocks and local-command caveats.
+    t = re.sub(r'<[a-z-]*system-reminder>.*?</[a-z-]*system-reminder>', '', t, flags=re.S)
+    for line in t.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith('<') and s.endswith('>'):   # a lone tag line
+            continue
+        if s.startswith('Caveat:'):
+            continue
+        s = re.sub(r'^>\s*', '', s).strip()          # quote marker
+        if s:
+            return s
+    return None
+
+with open(jsonl, 'rb') as f:
+    for raw in f:
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if d.get('type') != 'user' or d.get('isMeta'):
+            continue
+        msg = d.get('message')
+        if not isinstance(msg, dict) or msg.get('role') != 'user':
+            continue
+        c = msg.get('content')
+        if isinstance(c, list):
+            # Skip pure tool_result turns; join any text blocks.
+            txts = [b.get('text', '') for b in c
+                    if isinstance(b, dict) and b.get('type') == 'text']
+            if not txts:
+                continue
+            c = '\n'.join(txts)
+        if not isinstance(c, str) or not c.strip():
+            continue
+        label = label_from(c)
+        if label:
+            # Cap stored length; status-left-length bounds the DISPLAY, but keep the
+            # option value itself sane.
+            print(label[:160])
+            break
+PY
+}
+
 cycle=0
 while tmux has-session -t "$SESSION" 2>/dev/null; do
   cycle=$((cycle + 1))
@@ -228,7 +330,7 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
     (llmux _snapshot >/dev/null 2>&1 || true) &
   fi
 
-  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor; do
+  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor pane_prompt; do
     [ "$is_term" = "1" ] && continue
     [ -z "$pane_id" ] && continue
     # Now that -s exposes them: the sidebar is a display that repaints every 2s
@@ -252,6 +354,16 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
       if [ -n "$new_session" ] && [ "$new_session" != "$pane_session" ]; then
         tmux set-option -p -t "$pane_id" @llmux_claude_session "$new_session" 2>/dev/null || true
       fi
+    fi
+
+    # First-prompt line for the status bar — computed ONCE, only while empty. Runs
+    # outside the update_ctx cadence so it lands on the first tick the transcript
+    # has a user turn; once set, this whole block is skipped forever. Uses the
+    # freshly-resolved session when the ctx path just discovered one, else the
+    # cached value.
+    if [ "${pane_tool:-}" = "claude" ] && [ -z "$pane_prompt" ] && [ -n "$pane_cwd" ]; then
+      prompt_line=$(compute_claude_prompt "$pane_cwd" "${new_session:-$pane_session}")
+      [ -n "$prompt_line" ] && tmux set-option -p -t "$pane_id" @llmux_prompt "$prompt_line" 2>/dev/null || true
     fi
 
     content=$(tmux capture-pane -t "$pane_id" -p -S -25 2>/dev/null) || continue
@@ -383,7 +495,7 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
   # loop only ever saw the ONE visible thread — every parked thread got no status
   # updates at all. That is precisely why a thread blocked on a question showed no
   # indicator: it was parked, so nothing ever looked at it.
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}' 2>/dev/null)
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_prompt}' 2>/dev/null)
 
   sleep 5
 done
