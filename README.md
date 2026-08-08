@@ -239,6 +239,12 @@ didn't. The transcript knows the difference, so that is what is read now.
   usually the agent quoting the question it just answered, and a colour that is always
   on stops meaning anything. Measured over ~2,600 real assistant messages, 3% would
   flag.
+- **Looking at the thread clears it.** Click the row (or reach it with prefix+j/k, or
+  `llmux switch`) and the 🙋 and the colour go at once — the marker exists to tell you
+  *which* thread wants you, and once you are in it that job is done. A real permission
+  gate or an unanswered choice menu is NOT cleared by looking: those are still
+  genuinely unanswered, so `llmux-watch` records WHY a thread is blocked and only the
+  asked-in-prose kind retires on sight.
 - **Tools without hooks say so themselves**: `llmux asking` / `llmux asking off` —
   codex, amp, opencode, a plain shell.
 - **The flag is `@llmux_asking` on the pane, never `@llmux_status`.** `llmux-watch`

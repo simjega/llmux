@@ -1378,6 +1378,30 @@ mark_thread_seen() {
   local pane="$1"
   [[ -z "$pane" ]] && return 0
   tmux set-option -p -t "$pane" @llmux_done_at "0" 2>/dev/null || true
+  # Looking at the thread answers the question the 🙋 was asking, so it goes the
+  # moment the thread is on screen — clicked, switched to with prefix+j/k, or
+  # focused any other way, since every path lands here.
+  #
+  # One query, not three: this runs for the active pane on EVERY paint, and a fork
+  # in that loop is the cost the render caching exists to avoid. Nothing is written
+  # unless there is something to clear.
+  local seen_state
+  seen_state=$(tmux display-message -p -t "$pane" \
+    '#{@llmux_asking}|#{@llmux_status_src}|#{@llmux_status}' 2>/dev/null || true)
+  case "$seen_state" in
+    \|*) return 0 ;;   # not asking — the common case, and it costs one query
+  esac
+  tmux set-option -p -t "$pane" @llmux_asking "" 2>/dev/null || true
+  # Clear the derived status too, or the row keeps its colour for up to one watcher
+  # cycle (5s) after the click. ONLY when the watcher says the `blocked` came from
+  # the asking flag: a thread sitting on a real permission gate or an unanswered
+  # choice menu is still blocked whether or not Jay has looked at it, and blanking
+  # that would erase a state he has not actually dealt with.
+  local src="${seen_state#*|}"; local st="${src#*|}"; src="${src%%|*}"
+  if [[ "$st" == "blocked" && "$src" == "asking" ]]; then
+    tmux set-option -p -t "$pane" @llmux_status "" 2>/dev/null || true
+    tmux set-option -p -t "$pane" @llmux_status_src "" 2>/dev/null || true
+  fi
 }
 
 # Column the "+" affordance is drawn in — a constant, so the click hotspot does
