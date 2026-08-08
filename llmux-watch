@@ -236,7 +236,7 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
     (llmux _snapshot >/dev/null 2>&1 || true) &
   fi
 
-  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor asking; do
+  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor asking visible; do
     [ "$is_term" = "1" ] && continue
     [ -z "$pane_id" ] && continue
     # Now that -s exposes them: the sidebar is a display that repaints every 2s
@@ -381,12 +381,26 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
       # be read for this: a turn ending in a question and a turn ending in an answer
       # look identical. Below `perm`, which is a harder gate, and never overriding a
       # menu already detected.
-      if [ -n "$asking" ] && { [ -z "$detected" ] || [ "$detected" = "idle" ]; }; then
+      # Recorded, not inferred: `blocked` from an unanswered MENU and `blocked` from
+      # a question the agent asked in prose are the same value, and they clear on
+      # different events. Looking at the thread retires the second (mark_thread_seen)
+      # but must not touch the first, which is still genuinely unanswered.
+      status_src=""
+      # Never for the thread Jay is LOOKING AT. He is reading the question in the
+      # pane; a sidebar marker telling him to go and look at what is already on his
+      # screen is noise. This is also what makes the clear-on-click reliable rather
+      # than racy: mark_thread_seen clears the flag, but the snapshot this loop is
+      # working from was taken before the click, so without the guard the very next
+      # write would put the 🙋 straight back for another cycle.
+      if [ -n "$asking" ] && [ -z "$visible" ] \
+         && { [ -z "$detected" ] || [ "$detected" = "idle" ]; }; then
         detected="blocked"
+        status_src="asking"
       fi
 
       if [ -n "$detected" ]; then
         tmux set-option -p -t "$pane_id" @llmux_status "$detected" 2>/dev/null || true
+        tmux set-option -p -t "$pane_id" @llmux_status_src "$status_src" 2>/dev/null || true
         # The notified marker stores the STATE, not just "1", so an escalation
         # (idle → blocked, e.g. a turn ends and then asks a question) re-notifies.
         # Keying on a bare flag swallowed exactly the alert you most wanted.
@@ -406,7 +420,7 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
   # loop only ever saw the ONE visible thread — every parked thread got no status
   # updates at all. That is precisely why a thread blocked on a question showed no
   # indicator: it was parked, so nothing ever looked at it.
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}' 2>/dev/null)
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}|#{?#{&&:#{pane_active},#{window_active}},1,}' 2>/dev/null)
 
   sleep 5
 done
