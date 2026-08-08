@@ -121,6 +121,12 @@ Usage:
              [--project P]                      pane's section. Rides on the reviewq queue, so
                                                 'reviewq review' still drains it. Draws at the
                                                 TOP of its project, marked 👀 until resolved.
+  llmux who [--json]                            Every live thread: name, project, tool, status,
+                                                session id, cwd. The directory an agent reads
+                                                to decide who to send to.
+  llmux send <name|session-id> "<message>"      Deliver a message to another thread. Refuses a
+             [--force]                          target sitting on a permission prompt or menu,
+                                                where keystrokes would answer it instead.
   llmux asking [on|off]                         Mark this thread as waiting on an answer from
                                                 Jay, recolouring its row until he replies.
                                                 Claude threads do this automatically (Stop /
@@ -5080,6 +5086,175 @@ cmd_worktree() {
   echo "Tagged '$name' → $branch"
 }
 
+# ── Message passing between threads ──────────────────────────────────────────
+#
+# `who` is the directory an agent reads to decide who to talk to; `send` delivers.
+#
+# Delivery goes through the PANE, not through `claude --resume <id> -p`. The session
+# id is the right way to NAME a thread and it is recorded per pane already, but
+# resuming a session that a live TUI is holding open puts two writers on one
+# transcript -- that corrupts the session rather than delivering a message. The pane
+# is where a running agent actually reads input, so that is the mailbox.
+#
+# Everything here is derived from tmux pane options. No new state, and a thread that
+# dies takes its mailbox with it, which is correct: there is nobody to read it.
+
+# The thread the CALLER is running in, if any. -t "$TMUX_PANE" rather than a bare
+# display-message, which answers for whichever pane is active and would credit a
+# background agent's message to whatever thread Jay is looking at.
+sender_thread_name() {
+  R_SENDER=""
+  [[ -n "${TMUX_PANE:-}" ]] || return 0
+  R_SENDER=$(tmux display-message -p -t "$TMUX_PANE" '#{@llmux_name}' 2>/dev/null || true)
+}
+
+# Emits: pane_id|name|project|tool|status|session_id|cwd|done_at
+#
+# STATUS is llmux-watch's read of the pane, and its vocabulary is worth knowing before
+# you trust it:
+#   idle     at the prompt with nothing to do -- safe to interrupt, will read at once
+#   (empty)  producing output right now; rendered "working"
+#   busy     producing output for 2+ minutes straight
+#   blocked  stopped on a question or a menu
+#   perm     stopped on a permission gate
+# It is a LAGGING indicator: the watcher samples every 5s, and `idle` for claude needs
+# either a bare prompt line or 30s of an unchanged screen. So "not yet idle" can mean
+# "finished two seconds ago". done_at (the finish edge, 0 once Jay has looked) is what
+# turns that into a real answer: idle WITH a done_at is definitely finished.
+# Only real threads -- the terminal, sidebar and parked anchor are infrastructure and
+# have nobody to talk to.
+thread_directory() {
+  tmux list-panes -s -t "$SESSION" \
+    -F '#{pane_id}|#{@llmux_name}|#{@llmux_project}|#{@llmux_tool}|#{@llmux_status}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{pane_current_path}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_done_at}' \
+    2>/dev/null | awk -F'|' '
+      $2 != "" && $9 != "1" && $10 != "1" && $11 != "1" {
+        sid = ($6 != "") ? $6 : $7
+        printf "%s|%s|%s|%s|%s|%s|%s|%s\n", $1, $2, ($3 == "" ? "scratch" : $3), $4, $5, sid, $8, $12
+      }'
+}
+
+cmd_who() {
+  local as_json=0
+  [[ "${1:-}" == "--json" ]] && as_json=1
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "No llmux session running" >&2; return 1
+  fi
+  sender_thread_name; local me="$R_SENDER"
+  local pane_id name project tool status sid cwd done_at now_ts
+  now_ts=$(date +%s)
+  if (( as_json )); then
+    # For agents: one object per thread, so picking a recipient is a filter and not
+    # a screen-scrape of a column layout that may change.
+    local first=1
+    printf '['
+    while IFS='|' read -r pane_id name project tool status sid cwd done_at; do
+      [[ -z "$name" ]] && continue
+      (( first )) || printf ','
+      first=0
+      local idle_for=""
+      [[ -n "$done_at" && "$done_at" != "0" ]] && idle_for=$(( now_ts - done_at ))
+      python3 -c '
+import json, sys
+idle = sys.argv[8]
+print(json.dumps({"name": sys.argv[1], "project": sys.argv[2], "tool": sys.argv[3],
+                  "status": sys.argv[4] or "working", "session_id": sys.argv[5],
+                  "cwd": sys.argv[6], "self": sys.argv[7] == sys.argv[1],
+                  "idle_seconds": int(idle) if idle else None}), end="")
+' "$name" "$project" "$tool" "$status" "$sid" "$cwd" "$me" "$idle_for"
+    done < <(thread_directory)
+    printf ']\n'
+    return 0
+  fi
+  printf '%-24s  %-20s  %-8s  %-14s  %-36s  %s\n' NAME PROJECT TOOL STATUS SESSION CWD
+  while IFS='|' read -r pane_id name project tool status sid cwd done_at; do
+    [[ -z "$name" ]] && continue
+    local mark="" shown="${status:-working}"
+    [[ -n "$me" && "$name" == "$me" ]] && mark=" (you)"
+    # "idle 12m" beats "idle": it answers "has this really finished, or did it just
+    # go quiet a moment ago" without a second command.
+    if [[ "$shown" == "idle" && -n "$done_at" && "$done_at" != "0" ]]; then
+      fmt_age_short $(( now_ts - done_at )) >/dev/null
+      shown="idle ${R_AGE}"
+    fi
+    printf '%-24s  %-20s  %-8s  %-14s  %-36s  %s\n' \
+      "${name}${mark}" "$project" "${tool:-shell}" "$shown" "${sid:-—}" "${cwd/#$HOME/~}"
+  done < <(thread_directory)
+}
+
+cmd_send() {
+  local target="" msg="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *) if [[ -z "$target" ]]; then target="$1"; else msg="${msg:+$msg }$1"; fi; shift ;;
+    esac
+  done
+  [[ -n "$target" && -n "$msg" ]] \
+    || { echo "Usage: llmux send <name|session-id> \"<message>\" [--force]" >&2; return 1; }
+
+  local pane_id name project tool status sid cwd
+  local hit_pane="" hit_name="" hit_status="" hit_tool="" matches=0
+  while IFS='|' read -r pane_id name project tool status sid cwd; do
+    [[ -z "$name" ]] && continue
+    # Exact name, then session id, then unique name prefix. Anything ambiguous is an
+    # error rather than a guess: delivering a message to the wrong agent is worse
+    # than not delivering it.
+    if [[ "$name" == "$target" || ( -n "$sid" && "$sid" == "$target" ) ]]; then
+      hit_pane="$pane_id"; hit_name="$name"; hit_status="$status"; hit_tool="$tool"; matches=1; break
+    fi
+    if [[ "$name" == "$target"* ]]; then
+      hit_pane="$pane_id"; hit_name="$name"; hit_status="$status"; hit_tool="$tool"
+      matches=$(( matches + 1 ))
+    fi
+  done < <(thread_directory)
+
+  if (( matches == 0 )); then
+    echo "Error: no thread matches '$target' — try: llmux who" >&2; return 1
+  fi
+  if (( matches > 1 )); then
+    echo "Error: '$target' matches $matches threads — name one exactly (llmux who)" >&2; return 1
+  fi
+
+  sender_thread_name
+  local from="$R_SENDER"
+  [[ -n "$from" && "$from" == "$hit_name" ]] && { echo "Error: that is this thread" >&2; return 1; }
+
+  # A pane sitting on a permission prompt or a choice menu is READING KEYSTROKES AS
+  # ANSWERS. Typing a message into it would pick an option -- approving a tool call
+  # nobody vetted, or answering a question with prose. Refuse; --force is the escape
+  # hatch for when you know the prompt is gone.
+  if [[ "$hit_status" == "perm" ]] && (( ! force )); then
+    echo "Error: $hit_name is at a permission prompt — a message would answer it. Deal with the prompt, or --force." >&2
+    return 1
+  fi
+  local hit_src
+  hit_src=$(tmux display-message -p -t "$hit_pane" '#{@llmux_status_src}' 2>/dev/null || true)
+  if [[ "$hit_status" == "blocked" && "$hit_src" != "asking" ]] && (( ! force )); then
+    echo "Error: $hit_name is showing a menu — a message would select an option. Answer it, or --force." >&2
+    return 1
+  fi
+
+  # Attribution is part of the payload, not a convention the recipient has to know:
+  # it will be read by an agent that may have no llmux context, and a peer's request
+  # must not arrive looking like an instruction from Jay.
+  local label
+  if [[ -n "$from" ]]; then
+    label="[llmux message from thread \"$from\" — another agent, not Jay]"
+  else
+    label="[llmux message from Jay]"
+  fi
+  # Collapsed to one line: a newline is ENTER in every one of these TUIs, so a
+  # multi-line message submits itself in pieces, the first fragment landing as a
+  # whole turn. Keep messages short; that is what the skill says too.
+  local flat
+  flat=$(printf '%s' "$msg" | tr '\n\r\t' '   ' | tr -s ' ')
+
+  tmux send-keys -t "$hit_pane" -l "$label $flat" 2>/dev/null \
+    || { echo "Error: could not write to $hit_name" >&2; return 1; }
+  tmux send-keys -t "$hit_pane" Enter 2>/dev/null || true
+  echo "→ $hit_name${hit_tool:+ ($hit_tool)}: $flat"
+}
+
 cmd_ls() {
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "No llmux session running"
@@ -6771,6 +6946,8 @@ case "$command" in
   pr)        cmd_pr "$@" ;;
   review)    cmd_review "$@" ;;
   asking)    cmd_asking "$@" ;;
+  who)       cmd_who "$@" ;;
+  send)      cmd_send "$@" ;;
   restore)   cmd_restore "$@" ;;
   snapshot)  cmd_snapshot "$@" ;;
   next)      cmd_next "$@" ;;
