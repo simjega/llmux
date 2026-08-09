@@ -121,6 +121,11 @@ Usage:
              [--project P]                      pane's section. Rides on the reviewq queue, so
                                                 'reviewq review' still drains it. Draws at the
                                                 TOP of its project, marked 👀 until resolved.
+  llmux context [<project>]                     Everything llmux knows about this thread's
+                                                project: its vault notes (with paths, in
+                                                reading order), monitor/flag/Forge links, PRs
+                                                registered, docs awaiting review, and the
+                                                sibling threads. What a new agent reads first.
   llmux who [--json]                            Every live thread: name, project, tool, status,
                                                 session id, cwd. The directory an agent reads
                                                 to decide who to send to.
@@ -5086,6 +5091,129 @@ cmd_worktree() {
   echo "Tagged '$name' → $branch"
 }
 
+# ── Startup context ──────────────────────────────────────────────────────────
+#
+# What a new agent should read before it does anything. Everything here is already
+# in llmux -- the project, its notes, its flags and dashboards, the PRs in flight,
+# the docs waiting on Jay, the sibling threads -- and until now a fresh session knew
+# only its own name. It would ask about, or worse re-do, work another thread had
+# already finished.
+#
+# It POINTS more than it prints. A wall of file contents in every session is a tax
+# on every trivial one; a list of exact paths costs a few lines and the agent reads
+# what its task actually needs.
+cmd_context() {
+  local pane="${TMUX_PANE:-}" name="" project="" tool="" cwd="" sid=""
+  if [[ -n "$pane" ]]; then
+    IFS='|' read -r name project tool cwd sid < <(tmux display-message -p -t "$pane" \
+      '#{@llmux_name}|#{@llmux_project}|#{@llmux_tool}|#{pane_current_path}|#{@llmux_claude_session}' 2>/dev/null || true)
+  fi
+  [[ -n "${1:-}" ]] && project="$1"
+  [[ -z "$project" ]] && project="$SCRATCH_KEY"
+
+  echo "# Thread"
+  echo "name:     ${name:-（not in an llmux pane）}"
+  echo "project:  $project"
+  [[ -n "$tool" ]] && echo "tool:     $tool"
+  [[ -n "$cwd" ]]  && echo "cwd:      $cwd"
+  [[ -n "$sid" ]]  && echo "session:  $sid"
+
+  # ── the project's notes ────────────────────────────────────────────────────
+  local slug=""
+  slug=$(tolaria_slug_for_key "$project")
+  echo
+  echo "# Project notes"
+  if [[ -n "$slug" ]]; then
+    local st; st=$(tolaria_status "$slug")
+    echo "vault project: $slug${st:+  (status: $st)}"
+    echo "READ FIRST, in this order:"
+    echo "  $(tolaria_hub "$slug")"
+    local n label i=0
+    for n in "${TOLARIA_NOTES[@]}"; do
+      label="${TOLARIA_NOTE_LABELS[$i]}"; i=$(( i + 1 ))
+      case "$n" in
+        intent|open-questions|decisions|todo)
+          echo "  $TOLARIA_PROJECTS_DIR/$slug/$slug-$n.md   # $label" ;;
+      esac
+    done
+    echo "  (then $slug-log.md for what happened most recently -- read its TAIL)"
+  else
+    if [[ "$project" == "$SCRATCH_KEY" ]]; then
+      # SCRATCH is where unassigned threads land; it is not a project and never gets
+      # notes. Telling an agent to create them for it would make a junk vault entry.
+      echo "none — this thread is unassigned (SCRATCH). If the work belongs to a"
+      echo "project, 'llmux mv $name <project>' files it and this command gets useful."
+    else
+      echo "none linked. If this project earns notes, 'llmux project new $project' creates them."
+    fi
+  fi
+
+  # ── what the project points at ─────────────────────────────────────────────
+  local kind k v1 v2 v3 mon="" flags="" forge=""
+  while IFS='|' read -r kind k v1 v2 v3; do
+    [[ "$k" == "$project" ]] || continue
+    case "$kind" in
+      m) mon="$v1" ;;
+      f) flags="${flags:+$flags, }$v1" ;;
+      g) forge="${forge:+$forge, }${v2:-untitled task}" ;;
+    esac
+  done < <(read_project_links | awk -F'\t' '{print $1"|"$2"|"$3"|"$4"|"$5}')
+  if [[ -n "$mon$flags$forge" ]]; then
+    echo
+    echo "# This project is wired to"
+    [[ -n "$mon" ]]   && echo "monitor:     $mon"
+    [[ -n "$flags" ]] && echo "flags:       $flags"
+    [[ -n "$forge" ]] && echo "forge tasks: $forge"
+  fi
+
+  # ── work already in flight ─────────────────────────────────────────────────
+  local repo number url title pproj branch base stack had_pr=0
+  while IFS='|' read -r repo number url title pproj branch base stack; do
+    [[ "$pproj" == "$project" && -n "$number" ]] || continue
+    (( had_pr )) || { echo; echo "# PRs registered under this project"; had_pr=1; }
+    echo "  #${number} ${title}${stack:+  [stack: $stack]}"
+  done < <(read_prs)
+
+  local r_proj r_id r_state r_title r_url had_rev=0
+  while IFS=$'\t' read -r r_proj r_id r_state r_title r_url; do
+    [[ "$r_proj" == "$project" && "$r_state" == "pending" ]] || continue
+    (( had_rev )) || { echo; echo "# Docs waiting on Jay (do not re-decide what these settle)"; had_rev=1; }
+    echo "  #${r_id} ${r_title}"
+    echo "        ${r_url}"
+  done < <(build_review_rows "$(known_projects | tr '\n' ',')" 2>/dev/null || true)
+
+  # ── who else is here ───────────────────────────────────────────────────────
+  local p_id p_name p_proj p_tool p_status p_sid p_cwd p_done had_sib=0
+  while IFS='|' read -r p_id p_name p_proj p_tool p_status p_sid p_cwd p_done; do
+    [[ "$p_proj" == "$project" && "$p_name" != "$name" ]] || continue
+    (( had_sib )) || { echo; echo "# Other threads on this project -- ASK THEM before redoing their work"; echo "# (llmux send <name> \"...\")"; had_sib=1; }
+    echo "  ${p_name}  [${p_status:-working}]  ${p_cwd/#$HOME/~}"
+  done < <(thread_directory)
+
+  # ── the repo you are standing in ───────────────────────────────────────────
+  if [[ -n "$cwd" && -d "$cwd" ]]; then
+    local f found=""
+    for f in CLAUDE.md AGENTS.md CLAUDE.local.md .context; do
+      [[ -e "$cwd/$f" ]] && found="${found:+$found, }$f"
+    done
+    local branch=""
+    branch=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    if [[ -n "$found$branch" ]]; then
+      echo
+      echo "# Repo at $cwd"
+      [[ -n "$branch" ]] && echo "branch: $branch"
+      [[ -n "$found" ]]  && echo "read:   $found"
+    fi
+  fi
+
+  echo
+  echo "# Before taking instructions"
+  echo "Read the notes listed above -- at minimum the hub, intent, decisions and"
+  echo "open-questions -- plus any CLAUDE.md/AGENTS.md in the repo. Then say in one or"
+  echo "two lines what this project is and where it stands. If a sibling thread already"
+  echo "owns the piece you are being asked for, message it rather than duplicating it."
+}
+
 # ── Message passing between threads ──────────────────────────────────────────
 #
 # `who` is the directory an agent reads to decide who to talk to; `send` delivers.
@@ -6946,6 +7074,7 @@ case "$command" in
   pr)        cmd_pr "$@" ;;
   review)    cmd_review "$@" ;;
   asking)    cmd_asking "$@" ;;
+  context)   cmd_context "$@" ;;
   who)       cmd_who "$@" ;;
   send)      cmd_send "$@" ;;
   restore)   cmd_restore "$@" ;;

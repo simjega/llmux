@@ -220,6 +220,28 @@ llmux review done 7              # signed off — clears the 👀
 llmux review mv 2 custom-campaigns-me2
 ```
 
+### A new thread reads itself in before it starts
+
+```bash
+llmux context
+```
+
+Prints what llmux already knows about the thread's project — the vault notes with
+exact paths in reading order, the monitor/flag/Forge links, the PRs registered under
+it, the docs still waiting on Jay, the sibling threads working the same project, and
+the repo's CLAUDE.md/branch. The SessionStart hook tells every new agent to run it
+**and read what it points at before accepting any instruction**, then say back where
+the project stands.
+
+It points rather than dumps. A wall of file contents in every session is a tax on
+every trivial one; a list of exact paths costs a few lines and the agent reads what
+its task actually needs.
+
+The failure it exists to stop: an agent dropped into ongoing work, acting before it
+knows that another thread already owns the piece, that the decision was settled a
+week ago in the decision log, or that a doc answering the question is sitting in the
+review queue.
+
 ### Threads can message each other
 
 ```bash
