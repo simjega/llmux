@@ -6557,9 +6557,16 @@ snapshot_session() {
     opts+="${o}=$(tmux show-option -t "$SESSION" -qv "@llmux_${o}" 2>/dev/null || true)"$'\n'
   done
 
+  # When the tmux server was (re)started is the signal that separates a genuine
+  # wind-down from the bare session that comes up after a crash/reboot. Passed to
+  # the writer so it can refuse to clobber a rich snapshot with the empty one.
+  local screated
+  screated=$(tmux display-message -p -t "$SESSION" '#{session_created}' 2>/dev/null || echo 0)
+
   printf '%s\x00%s' "$rows" "$opts" | python3 -c "$PY_PAUSED_IO"'
 import sys, time
 path = sys.argv[1]
+session_created = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 0
 raw = sys.stdin.read()
 rows, _, opts = raw.partition("\x00")
 keys = ["name","dir","tool","project","worktree","slot","claude_session",
@@ -6584,6 +6591,24 @@ for line in opts.splitlines():
         options[k] = v
 _lk = _lock(path)
 d = _load(path)
+
+# Crash-recovery guard. After a reboot the tmux server comes up with a bare
+# session (a terminal, maybe one auto-launched pane) and the snapshotter would
+# overwrite the rich pre-crash record that `llmux restore` needs -- which is
+# exactly how a live session was lost once. Refuse to shrink a multi-thread
+# snapshot down to at most one real thread WHEN the server has restarted since
+# that snapshot was taken (session_created > saved_at). A genuine wind-down on
+# the SAME server is not blocked: there session_created predates saved_at. And
+# the moment the session grows back past one thread the guard stops firing, so
+# it never freezes a snapshot that is legitimately changing.
+old_sess = d.get("session") or {}
+old_threads = old_sess.get("threads") or []
+old_saved = old_sess.get("saved_at", 0)
+new_content = [t for t in threads if t.get("terminal") != "1"]
+old_content = [t for t in old_threads if t.get("terminal") != "1"]
+if (len(new_content) <= 1 and len(old_content) >= 2
+        and old_saved > 0 and session_created > old_saved):
+    sys.exit(0)
 
 # Identity is monotonic: a thread that HAD a session id has not stopped having one
 # just because this read came back blank. Without this, one degraded snapshot -- a
