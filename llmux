@@ -1300,8 +1300,8 @@ NEW_PROJECT_ITEM="＋ new project…"
 #
 # ⏳ is gone entirely. It reads as "time passing" — static, and easy to mistake for
 # "stalled" — which is wrong for both "answer me" and "still going". `busy` uses 🌀
-# instead: a spiral reads as motion, which is exactly what it means. It also stays
-# rare, since most threads never sit in one changing state for two minutes.
+# instead: a spiral reads as motion, which is exactly what it means. It appears after
+# roughly 15 seconds of real output and clears after roughly 10 seconds settled.
 #
 # `idle` HAS NO GLYPH ON PURPOSE. It is the resting state of every thread that
 # isn't currently doing something, so at any moment most of the list is idle —
@@ -1389,30 +1389,6 @@ mark_thread_seen() {
   local pane="$1"
   [[ -z "$pane" ]] && return 0
   tmux set-option -p -t "$pane" @llmux_done_at "0" 2>/dev/null || true
-  # Looking at the thread answers the question the 🙋 was asking, so it goes the
-  # moment the thread is on screen — clicked, switched to with prefix+j/k, or
-  # focused any other way, since every path lands here.
-  #
-  # One query, not three: this runs for the active pane on EVERY paint, and a fork
-  # in that loop is the cost the render caching exists to avoid. Nothing is written
-  # unless there is something to clear.
-  local seen_state
-  seen_state=$(tmux display-message -p -t "$pane" \
-    '#{@llmux_asking}|#{@llmux_status_src}|#{@llmux_status}' 2>/dev/null || true)
-  case "$seen_state" in
-    \|*) return 0 ;;   # not asking — the common case, and it costs one query
-  esac
-  tmux set-option -p -t "$pane" @llmux_asking "" 2>/dev/null || true
-  # Clear the derived status too, or the row keeps its colour for up to one watcher
-  # cycle (5s) after the click. ONLY when the watcher says the `blocked` came from
-  # the asking flag: a thread sitting on a real permission gate or an unanswered
-  # choice menu is still blocked whether or not Jay has looked at it, and blanking
-  # that would erase a state he has not actually dealt with.
-  local src="${seen_state#*|}"; local st="${src#*|}"; src="${src%%|*}"
-  if [[ "$st" == "blocked" && "$src" == "asking" ]]; then
-    tmux set-option -p -t "$pane" @llmux_status "" 2>/dev/null || true
-    tmux set-option -p -t "$pane" @llmux_status_src "" 2>/dev/null || true
-  fi
 }
 
 # Column the "+" affordance is drawn in — a constant, so the click hotspot does
@@ -5212,6 +5188,8 @@ cmd_context() {
   echo "open-questions -- plus any CLAUDE.md/AGENTS.md in the repo. Then say in one or"
   echo "two lines what this project is and where it stands. If a sibling thread already"
   echo "owns the piece you are being asked for, message it rather than duplicating it."
+  echo "Before ending a turn with a question for Jay, run 'llmux asking'; resumed output"
+  echo "clears the marker. Claude hooks do this automatically, so Claude can skip it."
 }
 
 # ── Message passing between threads ──────────────────────────────────────────
@@ -5242,11 +5220,11 @@ sender_thread_name() {
 # you trust it:
 #   idle     at the prompt with nothing to do -- safe to interrupt, will read at once
 #   (empty)  producing output right now; rendered "working"
-#   busy     producing output for 2+ minutes straight
+#   busy     producing output across ~15 seconds of watcher samples
 #   blocked  stopped on a question or a menu
 #   perm     stopped on a permission gate
-# It is a LAGGING indicator: the watcher samples every 5s, and `idle` for claude needs
-# either a bare prompt line or 30s of an unchanged screen. So "not yet idle" can mean
+# It is a LAGGING indicator: the watcher samples every 5s, and `idle` needs either a
+# recognized prompt line or 10s of an unchanged screen. So "not yet idle" can mean
 # "finished two seconds ago". done_at (the finish edge, 0 once Jay has looked) is what
 # turns that into a real answer: idle WITH a done_at is definitely finished.
 # Only real threads -- the terminal, sidebar and parked anchor are infrastructure and
