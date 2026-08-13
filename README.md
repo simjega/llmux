@@ -80,7 +80,7 @@ to tell you about it.
 |---|---|---|
 | 🙋 | `blocked` | a question or choice is waiting on **you** |
 | 🔐 | `perm` | a permission / approval gate |
-| 🌀 | `busy` | working 2+ minutes, needs nothing |
+| 🌀 | `busy` | actively producing output for ~15 seconds, needs nothing |
 | *(none)* | `idle` | turn finished, sitting at the prompt |
 
 **`idle` is deliberately unmarked.** It's the resting state of every thread that isn't
@@ -270,8 +270,17 @@ delivering to the wrong agent is worse than not delivering.
   instruction from Jay.
 - **One line.** A newline is Enter in all these TUIs, so a multi-line message would
   submit itself in fragments; whitespace is collapsed on the way out.
-- Nothing is queued: a thread that is not running has no mailbox, which is correct —
-  there is nobody to read it.
+- **The watcher submits at a confirmed input point.** Claude, Codex, and OpenCode accept text
+  into the composer while working but ignore Enter, so `send` keeps the payload in
+  the pane's `@llmux_inbox` instead. `llmux-watch` submits one message at the next
+  confirmed input point; additional messages remain ordered for later turns. An idle
+  thread receives it within the next watcher tick rather than trusting a potentially
+  stale status; the same confirmation protects a prose-question state from races.
+- Claude, Amp, Codex, and OpenCode expose a reliable ready signal. Other interactive
+  tools are refused instead of claiming an undeliverable queue; use `--force` only
+  while visibly sitting at their prompt.
+- Nothing is persisted for a thread that is not running: it has no pane and therefore
+  no mailbox, which is correct — there is nobody to read it.
 
 ### A thread that is asking you something turns colour
 
@@ -286,26 +295,22 @@ didn't. The transcript knows the difference, so that is what is read now.
 
 - **Claude threads need no cooperation.** Three hooks
   (`~/.agents/hooks/llmux-asking.sh`) do it: `Notification` when Claude is waiting on
-  input, `Stop` when a turn ends *and its last line is a question*, `UserPromptSubmit`
-  to clear when Jay replies.
+  input, `Stop` when a turn ends *and its last line is a question*, and
+  `UserPromptSubmit` to record Jay's reply; resumed output retires the marker.
 - **Only the last line of the final message counts.** A "?" earlier in a message is
   usually the agent quoting the question it just answered, and a colour that is always
   on stops meaning anything. Measured over ~2,600 real assistant messages, 3% would
   flag.
-- **Looking at the thread clears it.** Click the row (or reach it with prefix+j/k, or
-  `llmux switch`) and the 🙋 and the colour go at once — the marker exists to tell you
-  *which* thread wants you, and once you are in it that job is done. A real permission
-  gate or an unanswered choice menu is NOT cleared by looking: those are still
-  genuinely unanswered, so `llmux-watch` records WHY a thread is blocked and only the
-  asked-in-prose kind retires on sight.
+- **Looking is not answering.** The 🙋 stays until the thread resumes after your reply,
+  including while the pane is visible. A permission gate or unanswered choice menu
+  likewise remains marked until it is actually resolved.
 - **Tools without hooks say so themselves**: `llmux asking` / `llmux asking off` —
   codex, amp, opencode, a plain shell.
 - **The flag is `@llmux_asking` on the pane, never `@llmux_status`.** `llmux-watch`
   owns the status option and recomputes it every 5s, so anything written there
   directly is erased within one cycle; the watcher reads `@llmux_asking` and promotes
-  the thread from `idle` to `blocked`. It also clears it once the thread produces
-  sustained output again — that is the backstop if Jay answers somewhere the hook
-  never sees.
+  the thread from `idle` to `blocked`. The first real output after Jay answers clears
+  it — that is the backstop if a prompt-submit hook never fires.
 
 ### The fading "done, and you haven't looked" dot
 
@@ -352,8 +357,9 @@ Mechanics, all derived, no new state file:
 A blocked or permission-gated thread also takes over its row's colour and gets a `·` marker,
 the count rides on the title row (`llmux threads  🙋1`), and the pane border spells it out —
 `🙋 ANSWER ME` / `🔐 APPROVE?`. There's no hourglass anywhere: it reads as static — easy to
-mistake for "stalled" — so `busy` uses 🌀, a spiral, which reads as motion. It's rare anyway,
-since most turns finish well inside two minutes.
+mistake for "stalled" — so `busy` uses 🌀, a spiral, which reads as motion. It appears after
+roughly 15 seconds of real output, tolerates a brief quiet sample, and clears for every
+agent within roughly 10 seconds of settling.
 
 **If clicking ever stops working, check `tmux show-option -g mouse` first.** `prefix`+`m`
 toggles tmux's mouse mode and sits one shift key away from `prefix`+`M` (move thread to
