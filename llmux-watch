@@ -73,6 +73,90 @@ notify() {
     2>/dev/null &
 }
 
+# Drain one base64-encoded @llmux_inbox entry. Messages are queued by `llmux send`
+# while a TUI is working because those apps accept text but ignore Enter mid-turn.
+# Pop only after both send-keys calls succeed; a watcher restart otherwise loses a
+# message that was never submitted.
+deliver_inbox_one() {
+  local pane_id="$1" safe_id lock inbox encoded rest payload tries=0 owner=""
+  safe_id="${pane_id//%/}"
+  lock="/tmp/llmux-send-${SESSION//[^a-zA-Z0-9_.-]/_}-${safe_id}.lock"
+  until mkdir "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 50 ]; then
+      owner=$(cat "$lock/owner" 2>/dev/null || true)
+      if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+        return 1
+      fi
+      rm -f "$lock/owner" 2>/dev/null || true
+      rmdir "$lock" 2>/dev/null || true
+      tries=0
+      continue
+    fi
+    sleep 0.02
+  done
+  printf '%s' "$$" > "$lock/owner"
+
+  if [ "$(tmux show-option -t "$SESSION" -qv @llmux_rebuilding 2>/dev/null || true)" = "1" ]; then
+    rm -f "$lock/owner" 2>/dev/null || true
+    rmdir "$lock" 2>/dev/null || true
+    return 1
+  fi
+
+  # Re-read under the same lock senders use. The list-panes value is only a hint:
+  # an append between that snapshot and a stale pop must not be overwritten.
+  inbox=$(tmux show-option -p -t "$pane_id" -qv @llmux_inbox 2>/dev/null || true)
+  if [ -z "$inbox" ]; then rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true; return 1; fi
+  encoded="${inbox%%,*}"
+  if [ "$inbox" = "$encoded" ]; then rest=""; else rest="${inbox#*,}"; fi
+  payload=$(printf '%s' "$encoded" | base64 --decode 2>/dev/null \
+    || printf '%s' "$encoded" | base64 -D 2>/dev/null) \
+    || { rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true; return 1; }
+  [ -n "$payload" ] \
+    || { rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true; return 1; }
+  tmux send-keys -t "$pane_id" -l "$payload" 2>/dev/null \
+    || { rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true; return 1; }
+  sleep "${LLMUX_SEND_SETTLE_SECONDS:-0.15}"
+  tmux send-keys -t "$pane_id" Enter 2>/dev/null \
+    || { rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true; return 1; }
+  tmux set-option -p -t "$pane_id" @llmux_inbox "$rest" 2>/dev/null \
+    || { rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true; return 1; }
+  rm -f "$lock/owner" 2>/dev/null || true
+  rmdir "$lock" 2>/dev/null || true
+}
+
+# Positive evidence that the TUI can accept a submitted turn. Quiet-time fallback is
+# intentionally NOT enough: a silent tool call can leave the screen unchanged while
+# Enter is still ignored, recreating the stranded-composer bug this queue fixes.
+pane_input_ready() {
+  local tool="$1" content="$2"
+  case "$tool" in
+    claude|amp)
+      printf '%s\n' "$content" | grep -qE '^❯[[:space:]]*$'
+      ;;
+    codex)
+      # Codex keeps its › composer visible while working. Its live activity row is
+      # the discriminator; a prompt with no later Working/Waiting row is actionable,
+      # including a brand-new thread before it has a "Worked for" divider.
+      printf '%s\n' "$content" | awk '
+        /^[[:space:]]*›/ { prompt=NR }
+        /^[[:space:]]*•[[:space:]]+(Working|Waiting|Running)([[:space:](]|$)/ { active=NR }
+        /^[[:space:]]*─[[:space:]]*Worked for/ { done=NR }
+        END { exit !(prompt > 0 && (active == 0 || done > active)) }
+      '
+      ;;
+    opencode)
+      # OpenCode retains the composer while working too, but its footer exposes a
+      # stable interrupt affordance for the whole active turn. The command hint is
+      # present at the real composer; requiring it while rejecting "esc interrupt"
+      # avoids treating a partial or alternate screen as ready.
+      printf '%s\n' "$content" | grep -qF 'ctrl+p commands' \
+        && ! printf '%s\n' "$content" | grep -qF 'esc interrupt'
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 # Compute Claude context-window % consumed for a given pane.
 # Echoes "<pct>%[\t<session-uuid>]" — the optional second tab-separated field
 # is a newly-resolved session UUID the caller should cache as @llmux_claude_session
@@ -225,6 +309,13 @@ PY
 cycle=0
 seen_panes="|"
 while tmux has-session -t "$SESSION" 2>/dev/null; do
+  # Refresh/restore builds a replacement session behind a commit gate. Even if a
+  # stale/manual watcher starts during that window, it must not drain queues or
+  # snapshot partial state before the lifecycle command clears the gate.
+  if [ "$(tmux show-option -t "$SESSION" -qv @llmux_rebuilding 2>/dev/null || true)" = "1" ]; then
+    sleep "$WATCH_INTERVAL"
+    continue
+  fi
   cycle=$((cycle + 1))
   # Update context % every other cycle (~10s, since base cadence is 5s).
   update_ctx=0
@@ -244,7 +335,7 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
     (llmux _snapshot >/dev/null 2>&1 || true) &
   fi
 
-  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor asking asking_armed current_status current_status_src; do
+  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor asking asking_armed current_status current_status_src inbox; do
     [ "$is_term" = "1" ] && continue
     [ -z "$pane_id" ] && continue
     # Now that -s exposes them: the sidebar is a display that repaints every 2s
@@ -436,9 +527,28 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
         detected="blocked"
         status_src="asking"
         tmux set-option -p -t "$pane_id" @llmux_asking_armed "$asking" 2>/dev/null || true
+        asking_armed="$asking"
       elif [ -z "$asking" ] && [ "$current_status" = "blocked" ] \
            && [ "$current_status_src" = "asking" ]; then
         tmux set-option -p -t "$pane_id" @llmux_asking_armed "" 2>/dev/null || true
+      fi
+
+      # Drain only with POSITIVE input evidence. A timeout-derived `idle` remains
+      # useful display state but is unsafe for delivery during a silent tool call.
+      input_ready=0
+      pane_input_ready "${pane_tool:-}" "$content" && input_ready=1
+      if [ "$detected" = "blocked" ] && [ "$status_src" = "asking" ] \
+         && [ -n "$asking" ] && [ "$asking_armed" = "$asking" ]; then
+        input_ready=1
+      fi
+      if [ -n "$inbox" ] && [ "$input_ready" = "1" ]; then
+        if deliver_inbox_one "$pane_id"; then
+          tmux set-option -p -t "$pane_id" @llmux_status "" 2>/dev/null || true
+          tmux set-option -p -t "$pane_id" @llmux_status_src "" 2>/dev/null || true
+          tmux set-option -p -t "$pane_id" @llmux_done_at "" 2>/dev/null || true
+          rm -f "$notified_file"
+          continue
+        fi
       fi
 
       if [ -n "$detected" ]; then
@@ -463,7 +573,7 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
   # loop only ever saw the ONE visible thread — every parked thread got no status
   # updates at all. That is precisely why a thread blocked on a question showed no
   # indicator: it was parked, so nothing ever looked at it.
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}|#{@llmux_asking_armed}|#{@llmux_status}|#{@llmux_status_src}' 2>/dev/null)
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}|#{@llmux_asking_armed}|#{@llmux_status}|#{@llmux_status_src}|#{@llmux_inbox}' 2>/dev/null)
 
   sleep "$WATCH_INTERVAL"
 done

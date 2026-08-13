@@ -309,7 +309,7 @@ def _lock(path):
 '
 
 # Read paused.json, output pipe-delimited lines:
-#   name|dir|tool|worktree|paused_at|session_id|slot|project
+#   name|dir|tool|worktree|paused_at|session_id|slot|project|inbox
 # Sorted most-recent-first by paused_at. `slot` is the owner-wt slot the pane was
 # adopting (empty if the pane wasn't using a slot); `project` is its sidebar
 # section (empty = scratch).
@@ -319,16 +319,16 @@ read_paused() {
 import json, sys
 data = _load(sys.argv[1])["paused"]
 data.sort(key=lambda p: int(p.get("paused_at", 0) or 0), reverse=True)
-# Keep keys in sync with add_paused. The slot and project keys were added later
+# Keep keys in sync with add_paused. The trailing keys were added later
 # so they default to "" for backward-compat with older entries.
 for p in data:
-    print("|".join(str(p.get(k, "")) for k in ["name","dir","tool","worktree","paused_at","session_id","slot","project"]))
+    print("|".join(str(p.get(k, "")) for k in ["name","dir","tool","worktree","paused_at","session_id","slot","project","inbox"]))
 ' "$PAUSED_FILE"
 }
 
-# Append a paused pane entry. Args: name dir tool worktree session_id [slot] [project]
+# Append a paused pane entry. Args: name dir tool worktree session_id [slot] [project] [inbox]
 add_paused() {
-  local name="$1" dir="$2" tool="${3:-}" worktree="${4:-}" session_id="${5:-}" slot="${6:-}" project="${7:-}"
+  local name="$1" dir="$2" tool="${3:-}" worktree="${4:-}" session_id="${5:-}" slot="${6:-}" project="${7:-}" inbox="${8:-}"
   python3 -c "$PY_PAUSED_IO"'
 import sys, time
 path = sys.argv[1]
@@ -342,10 +342,38 @@ d["paused"].append({
     "session_id": sys.argv[6],
     "slot": sys.argv[7],
     "project": sys.argv[8],
+    "inbox": sys.argv[9],
     "paused_at": int(time.time())
 })
 _save(path, d)
-' "$PAUSED_FILE" "$name" "$dir" "$tool" "$worktree" "$session_id" "$slot" "$project"
+' "$PAUSED_FILE" "$name" "$dir" "$tool" "$worktree" "$session_id" "$slot" "$project" "$inbox"
+}
+
+# Persist a captured batch after a destructive refresh fails. Each argument is
+# name|dir|tool|worktree|session_id|slot|project|inbox. The partial replacement
+# session is torn down by the caller first, so these entries become the sole source
+# of truth rather than duplicates of half-restored panes.
+persist_refresh_recovery() {
+  local entry name dir tool worktree session_id slot project inbox
+  for entry in "$@"; do
+    IFS='|' read -r name dir tool worktree session_id slot project inbox <<< "$entry"
+    [[ -n "$name" ]] || continue
+    remove_paused "$name" >/dev/null 2>&1 || true
+    add_paused "$name" "$dir" "$tool" "$worktree" "$session_id" "$slot" "$project" "$inbox"
+  done
+}
+
+abort_refresh_to_paused() {
+  watch_stop
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+}
+
+clear_refresh_recovery() {
+  local entry name
+  for entry in "$@"; do
+    name="${entry%%|*}"
+    [[ -n "$name" ]] && remove_paused "$name" >/dev/null 2>&1 || true
+  done
 }
 
 # Remove a paused entry by name. Returns 0 if found, 1 if not.
@@ -1047,6 +1075,7 @@ is_default_title() {
 ensure_session() {
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux new-session -d -s "$SESSION" -x 200 -y 50
+    [[ "${LLMUX_REBUILDING:-0}" == "1" ]] && tmux set-option -t "$SESSION" @llmux_rebuilding 1
     # Enable pane titles in the border (with waiting indicator)
     tmux set-option -t "$SESSION" pane-border-status top
     # Status prefix, most-urgent first. `blocked`/`perm` get a WORD, not just a
@@ -1095,7 +1124,7 @@ ensure_session() {
     # Auto re-layout when a pane exits
     tmux set-hook -t "$SESSION" pane-exited "run-shell 'llmux _relayout 2>/dev/null || true'"
     # Start the background watcher for waiting-state detection
-    watch_start
+    [[ "${LLMUX_SKIP_WATCH_START:-0}" == "1" ]] || watch_start
     INITIAL_PANE=1
   fi
 }
@@ -4458,8 +4487,8 @@ pause_one() {
     return 1
   fi
 
-  local target_pane="" pane_dir="" pane_tool="" pane_wt="" pane_sid="" pane_slot="" pane_project=""
-  while IFS='|' read -r pid pname pdir ptool pwt pterm psid pslot pproj; do
+  local target_pane="" pane_dir="" pane_tool="" pane_wt="" pane_sid="" pane_slot="" pane_project="" pane_inbox=""
+  while IFS='|' read -r pid pname pdir ptool pwt pterm psid pslot pproj pinbox; do
     if [[ "$pname" == "$name" ]]; then
       target_pane="$pid"
       pane_dir="$pdir"
@@ -4468,9 +4497,10 @@ pause_one() {
       pane_sid="$psid"
       pane_slot="$pslot"
       pane_project="$pproj"
+      pane_inbox="$pinbox"
       break
     fi
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_claude_session}|#{@llmux_slot}|#{@llmux_project}')
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_claude_session}|#{@llmux_slot}|#{@llmux_project}|#{@llmux_inbox}')
 
   if [[ -z "$target_pane" ]]; then
     echo "Skipping '$name': no pane with that name"
@@ -4494,8 +4524,22 @@ pause_one() {
     remove_paused "$name" >/dev/null 2>&1 || true
   fi
 
-  add_paused "$name" "$pane_dir" "$pane_tool" "$pane_wt" "$pane_sid" "$pane_slot" "$pane_project"
-  tmux kill-pane -t "$target_pane"
+  # Freeze the consumable inbox across capture + retirement. A sender that already
+  # resolved this pane either finishes before this read or waits and then gets a
+  # clear failure against the retired pane; no accepted append can vanish.
+  local inbox_lock
+  acquire_message_lock "$target_pane" || { echo "Skipping '$name': message queue is busy" >&2; return 1; }
+  inbox_lock="$MESSAGE_LOCK"
+  pane_inbox=$(tmux show-option -p -t "$target_pane" -qv @llmux_inbox 2>/dev/null || true)
+  if ! add_paused "$name" "$pane_dir" "$pane_tool" "$pane_wt" "$pane_sid" "$pane_slot" "$pane_project" "$pane_inbox"; then
+    release_message_lock "$inbox_lock"
+    return 1
+  fi
+  if ! tmux kill-pane -t "$target_pane"; then
+    release_message_lock "$inbox_lock"
+    return 1
+  fi
+  release_message_lock "$inbox_lock"
   if [[ -n "$pane_slot" ]]; then
     release_slot "$pane_slot"
     echo "Paused '$name' (released $pane_slot back to idle)"
@@ -4730,14 +4774,14 @@ cmd_cycle() {
   # Capture pane metadata before killing — including the captured claude session
   # UUID so we resume the exact same session (--resume <id>) rather than
   # --continue, which only grabs the most-recent session in the cwd.
-  local target_pane="" pane_dir="" pane_tool="" pane_wt="" pane_pinned="" pane_sid="" pane_ocsid="" pane_project=""
-  while IFS='|' read -r pid pname pdir ptool pwt _pterm ppin psid pocsid pproj; do
+  local target_pane="" pane_dir="" pane_tool="" pane_wt="" pane_pinned="" pane_sid="" pane_ocsid="" pane_project="" pane_inbox=""
+  while IFS='|' read -r pid pname pdir ptool pwt _pterm ppin psid pocsid pproj pinbox; do
     if [[ "$pname" == "$name" ]]; then
       target_pane="$pid"; pane_dir="$pdir"; pane_tool="$ptool"; pane_wt="$pwt"; pane_pinned="$ppin"
-      pane_sid="$psid"; pane_ocsid="$pocsid"; pane_project="$pproj"
+      pane_sid="$psid"; pane_ocsid="$pocsid"; pane_project="$pproj"; pane_inbox="$pinbox"
       break
     fi
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_project}')
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_project}|#{@llmux_inbox}')
 
   if [[ -z "$target_pane" ]]; then
     echo "Error: no pane named '$name'"
@@ -4845,13 +4889,35 @@ cmd_cycle() {
     fi
   fi
 
-  # Kill old pane, recreate at same name with same metadata, restart the tool.
-  # This is pause+resume in one step — skips the paused.json roundtrip.
-  tmux kill-pane -t "$target_pane"
+  # Kill old pane while holding its inbox lock. A sender that resolved the old pane
+  # cannot append successfully between our capture and retirement.
+  local inbox_lock
+  acquire_message_lock "$target_pane" || { echo "Error: '$name' message queue is busy; cycle aborted" >&2; return 1; }
+  inbox_lock="$MESSAGE_LOCK"
+  pane_inbox=$(tmux show-option -p -t "$target_pane" -qv @llmux_inbox 2>/dev/null || true)
+  remove_paused "$name" >/dev/null 2>&1 || true
+  if ! add_paused "$name" "$pane_dir" "$pane_tool" "$pane_wt" "$pane_sid" "" "$pane_project" "$pane_inbox"; then
+    release_message_lock "$inbox_lock"
+    return 1
+  fi
+  if ! tmux kill-pane -t "$target_pane"; then
+    release_message_lock "$inbox_lock"
+    remove_paused "$name" >/dev/null 2>&1 || true
+    return 1
+  fi
+  release_message_lock "$inbox_lock"
 
   local new_pane
-  new_pane=$(spawn_llm_pane "$pane_dir")
+  if ! new_pane=$(spawn_llm_pane "$pane_dir"); then
+    echo "Error: cycle could not recreate '$name'; thread remains paused" >&2
+    return 1
+  fi
   tmux select-pane -t "$new_pane" -T "$name"
+  if ! restore_message_inbox "$new_pane" "$pane_inbox"; then
+    tmux kill-pane -t "$new_pane" 2>/dev/null || true
+    echo "Error: cycle could not restore '$name' inbox; thread was saved as paused" >&2
+    return 1
+  fi
   tmux set-option -p -t "$new_pane" @llmux_name "$name"
   [[ -n "$pane_wt" ]] && tmux set-option -p -t "$new_pane" @llmux_worktree "$pane_wt"
   # Preserve pinned state so apply_layout repositions the pane back into the
@@ -4870,6 +4936,7 @@ cmd_cycle() {
   else
     echo "Warning: '$name' had no @llmux_tool and no default tool configured — pane is bare shell" >&2
   fi
+  remove_paused "$name" >/dev/null 2>&1 || true
 
   echo "Cycled '$name'"
   # `cycle all` sets CYCLE_NO_ATTACH so focus doesn't bounce across every pane
@@ -5287,6 +5354,122 @@ print(json.dumps({"name": sys.argv[1], "project": sys.argv[2], "tool": sys.argv[
   done < <(thread_directory)
 }
 
+# One lock namespace protects every read/modify/write of @llmux_inbox, including
+# lifecycle operations that retire and recreate panes.
+MESSAGE_LOCK=""
+acquire_message_lock() {
+  local pane="$1" wait_for_owner="${2:-0}" safe_id lock tries=0 owner=""
+  safe_id="${pane//%/}"
+  lock="/tmp/llmux-send-${SESSION//[^a-zA-Z0-9_.-]/_}-${safe_id}.lock"
+  until mkdir "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    if (( tries >= 50 )); then
+      owner=$(cat "$lock/owner" 2>/dev/null || true)
+      if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+        # Lifecycle restore waits longer than an interactive sender, but remains
+        # bounded: a wedged/PID-reused owner must reach durable rollback.
+        if [[ "$wait_for_owner" == "1" && "$tries" -lt 500 ]]; then
+          sleep 0.02
+          continue
+        fi
+        echo "Error: message queue for $pane is busy" >&2
+        return 1
+      fi
+      rm -f "$lock/owner" 2>/dev/null || true
+      rmdir "$lock" 2>/dev/null || true
+      tries=0
+      continue
+    fi
+    sleep 0.02
+  done
+  if ! printf '%s' "$$" > "$lock/owner"; then
+    rmdir "$lock" 2>/dev/null || true
+    return 1
+  fi
+  MESSAGE_LOCK="$lock"
+}
+
+release_message_lock() {
+  local lock="$1" owner=""
+  owner=$(cat "$lock/owner" 2>/dev/null || true)
+  if [[ "$owner" == "$$" ]]; then
+    rm -f "$lock/owner" 2>/dev/null || true
+    rmdir "$lock" 2>/dev/null || true
+  fi
+}
+
+# Merge preserved entries before anything that reached a newly-created pane. The
+# new pane has a different lock identity, so lifecycle restore must serialize there
+# too rather than overwriting a sender that found the replacement immediately.
+restore_message_inbox() {
+  local pane="$1" preserved="$2" lock current
+  [[ -n "$preserved" ]] || return 0
+  # Lifecycle recovery is not an interactive sender: waiting is safer than losing
+  # the only copy because a snapshot briefly owns the replacement pane's lock.
+  acquire_message_lock "$pane" 1 || return 1
+  lock="$MESSAGE_LOCK"
+  current=$(tmux show-option -p -t "$pane" -qv @llmux_inbox 2>/dev/null || true)
+  local set_tries=0
+  while ! tmux set-option -p -t "$pane" @llmux_inbox "${preserved}${current:+,$current}" 2>/dev/null; do
+    if ! tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
+      release_message_lock "$lock"
+      return 1
+    fi
+    set_tries=$((set_tries + 1))
+    if (( set_tries >= 100 )); then
+      release_message_lock "$lock"
+      return 1
+    fi
+    sleep 0.02
+  done
+  release_message_lock "$lock"
+}
+
+# Messages to a working TUI cannot be submitted yet: Claude/Codex accept the text
+# into their composer but ignore Enter while a turn is running. Keep the complete,
+# attributed payload in a pane option; llmux-watch drains one message when it next
+# observes a real idle/asking state. Base64 makes comma a safe queue delimiter.
+queue_thread_message() {
+  local pane="$1" payload="$2" encoded inbox
+  encoded=$(printf '%s' "$payload" | base64 | tr -d '\n')
+  [[ -n "$encoded" ]] || return 1
+
+  local lock
+  acquire_message_lock "$pane" || return 1
+  lock="$MESSAGE_LOCK"
+  if [[ "$(tmux show-option -t "$SESSION" -qv @llmux_rebuilding 2>/dev/null || true)" == "1" ]]; then
+    release_message_lock "$lock"
+    echo "Error: llmux session is rebuilding; retry when refresh/restore completes" >&2
+    return 1
+  fi
+  inbox=$(tmux show-option -p -t "$pane" -qv @llmux_inbox 2>/dev/null || true)
+  tmux set-option -p -t "$pane" @llmux_inbox "${inbox:+$inbox,}$encoded" 2>/dev/null
+  local rc=$?
+  release_message_lock "$lock"
+  return "$rc"
+}
+
+submit_thread_message() {
+  local pane="$1" payload="$2"
+  local lock rc=0
+  acquire_message_lock "$pane" || return 1
+  lock="$MESSAGE_LOCK"
+  if [[ "$(tmux show-option -t "$SESSION" -qv @llmux_rebuilding 2>/dev/null || true)" == "1" ]]; then
+    release_message_lock "$lock"
+    echo "Error: llmux session is rebuilding; retry when refresh/restore completes" >&2
+    return 1
+  fi
+  tmux send-keys -t "$pane" -l "$payload" 2>/dev/null || rc=$?
+  if (( rc != 0 )); then release_message_lock "$lock"; return "$rc"; fi
+  # TUIs coalesce a fast character burst as paste input. Give their input loop one
+  # beat to finish reconciling the composer before Enter; without this, even an idle
+  # pane can occasionally retain the text without submitting it.
+  sleep "${LLMUX_SEND_SETTLE_SECONDS:-0.15}"
+  tmux send-keys -t "$pane" Enter 2>/dev/null || rc=$?
+  release_message_lock "$lock"
+  return "$rc"
+}
+
 cmd_send() {
   local target="" msg="" force=0
   while [[ $# -gt 0 ]]; do
@@ -5297,6 +5480,11 @@ cmd_send() {
   done
   [[ -n "$target" && -n "$msg" ]] \
     || { echo "Usage: llmux send <name|session-id> \"<message>\" [--force]" >&2; return 1; }
+
+  if [[ "$(tmux show-option -t "$SESSION" -qv @llmux_rebuilding 2>/dev/null || true)" == "1" ]]; then
+    echo "Error: llmux session is rebuilding; retry when refresh/restore completes" >&2
+    return 1
+  fi
 
   local pane_id name project tool status sid cwd
   local hit_pane="" hit_name="" hit_status="" hit_tool="" matches=0
@@ -5339,6 +5527,15 @@ cmd_send() {
     echo "Error: $hit_name is showing a menu — a message would select an option. Answer it, or --force." >&2
     return 1
   fi
+  if (( ! force )); then
+    case "$hit_tool" in
+      claude|amp|codex|opencode) ;;
+      *)
+        echo "Error: ${hit_tool:-shell} has no reliable input-ready signal; refusing a queue that cannot drain. Retry with --force only when its prompt is visibly ready." >&2
+        return 1
+        ;;
+    esac
+  fi
 
   # Attribution is part of the payload, not a convention the recipient has to know:
   # it will be read by an agent that may have no llmux context, and a peer's request
@@ -5355,10 +5552,22 @@ cmd_send() {
   local flat
   flat=$(printf '%s' "$msg" | tr '\n\r\t' '   ' | tr -s ' ')
 
-  tmux send-keys -t "$hit_pane" -l "$label $flat" 2>/dev/null \
-    || { echo "Error: could not write to $hit_name" >&2; return 1; }
-  tmux send-keys -t "$hit_pane" Enter 2>/dev/null || true
-  echo "→ $hit_name${hit_tool:+ ($hit_tool)}: $flat"
+  local payload="$label $flat"
+  # A working/busy TUI ignores Enter but keeps inserted text in its input box, and
+  # an `idle` status can be one watcher tick stale just as a new turn starts. Queue
+  # every ordinary message outside the composer; the watcher has the authoritative
+  # stable-screen observation and submits it within its next tick. Even a prose-ask
+  # status can go stale between reads; only --force bypasses confirmation as the
+  # explicit expert-recovery path.
+  if (( force )); then
+    submit_thread_message "$hit_pane" "$payload" \
+      || { echo "Error: could not submit to $hit_name" >&2; return 1; }
+    echo "→ $hit_name${hit_tool:+ ($hit_tool)}: $flat"
+  else
+    queue_thread_message "$hit_pane" "$payload" \
+      || { echo "Error: could not queue for $hit_name" >&2; return 1; }
+    echo "⇢ queued for $hit_name${hit_tool:+ ($hit_tool)}: $flat"
+  fi
 }
 
 cmd_ls() {
@@ -5427,7 +5636,7 @@ cmd_ls() {
 
   # Show paused panes
   local has_paused=false
-  while IFS='|' read -r pname pdir ptool pwt paused_at psid pslot pproj; do
+  while IFS='|' read -r pname pdir ptool pwt paused_at psid pslot pproj _pinbox; do
     [[ -z "$pname" ]] && continue
     if ! $has_paused; then
       echo ""
@@ -5855,7 +6064,7 @@ cmd_resume() {
   # --- Collect paused panes ---
   local paused_raw=()
   local paused_display=()
-  while IFS='|' read -r pname pdir ptool pwt paused_at psid pslot pproj; do
+  while IFS='|' read -r pname pdir ptool pwt paused_at psid pslot pproj pinbox; do
     [[ -z "$pname" ]] && continue
     # Hide paused panes older than the cutoff (they remain in paused.json and in
     # `llmux ls`). Entries with an unparseable/missing paused_at are kept.
@@ -5868,7 +6077,7 @@ cmd_resume() {
     # Append the slot and project as extra fields after the trailing summary
     # placeholder. Older callsites that ignore the trailing tokens stay
     # backward-compatible.
-    paused_raw+=("paused|$pname|$pdir|$ptool|$pwt|$psid||$pslot|$pproj")
+    paused_raw+=("paused|$pname|$pdir|$ptool|$pwt|$psid||$pslot|$pproj|$pinbox")
     local short_dir="${pdir/#$HOME/\~}"
     local ts=""
     if [[ -n "$paused_at" ]]; then
@@ -6003,16 +6212,14 @@ else: print(f'{delta // 86400}d ago')
 
   [[ "$match_idx" -lt 0 ]] && { echo "Error: could not match selection"; exit 1; }
 
-  local entry_type entry_id entry_dir entry_tool entry_wt entry_sid entry_summary entry_slot entry_project
-  IFS='|' read -r entry_type entry_id entry_dir entry_tool entry_wt entry_sid entry_summary entry_slot entry_project <<< "${all_raw[$match_idx]}"
+  local entry_type entry_id entry_dir entry_tool entry_wt entry_sid entry_summary entry_slot entry_project entry_inbox
+  IFS='|' read -r entry_type entry_id entry_dir entry_tool entry_wt entry_sid entry_summary entry_slot entry_project entry_inbox <<< "${all_raw[$match_idx]}"
 
   if [[ "$entry_type" == "paused" ]]; then
     # --- Unpause flow ---
     local pane_name="$entry_id"
     local pane_dir="$entry_dir"
     local pane_tool="$entry_tool"
-
-    remove_paused "$pane_name" || echo "Warning: could not remove '$pane_name' from paused list"
 
     # If the paused pane was riding an owner-wt slot, re-grab the same branch
     # into a fresh idle slot. The original slot may have been claimed by another
@@ -6050,6 +6257,12 @@ else: print(f'{delta // 86400}d ago')
     local new_pane
     new_pane=$(spawn_llm_pane "$pane_dir")
     tmux select-pane -t "$new_pane" -T "$pane_name"
+    if ! restore_message_inbox "$new_pane" "$entry_inbox"; then
+      tmux kill-pane -t "$new_pane" 2>/dev/null || true
+      [[ -n "$adopted_slot" ]] && release_slot "$adopted_slot"
+      echo "Error: could not restore '$pane_name' inbox; it remains paused" >&2
+      return 1
+    fi
     tmux set-option -p -t "$new_pane" @llmux_name "$pane_name"
     [[ -n "$entry_wt" ]] && tmux set-option -p -t "$new_pane" @llmux_worktree "$entry_wt"
     [[ -n "$adopted_slot" ]] && tmux set-option -p -t "$new_pane" @llmux_slot "$adopted_slot"
@@ -6060,6 +6273,7 @@ else: print(f'{delta // 86400}d ago')
       tmux set-option -p -t "$new_pane" @llmux_project "$entry_project"
       register_project "$entry_project"
     fi
+    remove_paused "$pane_name" || echo "Warning: could not remove '$pane_name' from paused list"
     tag_pane_worktree "$new_pane" "$pane_dir"
     apply_layout
 
@@ -6521,13 +6735,34 @@ cmd_review() {
 # persisting one byte more than this does.
 snapshot_session() {
   tmux has-session -t "$SESSION" 2>/dev/null || return 0
+  # Inbox entries are consumable. Capture them under the same locks as enqueue and
+  # dequeue so a snapshot cannot record an entry that the watcher submits before
+  # the JSON write completes, then resurrect it after a crash.
+  local snapshot_locks=() snapshot_pane snapshot_lock
+  while IFS= read -r snapshot_pane; do
+    [[ -n "$snapshot_pane" ]] || continue
+    if ! acquire_message_lock "$snapshot_pane"; then
+      for snapshot_lock in "${snapshot_locks[@]}"; do release_message_lock "$snapshot_lock"; done
+      return 0
+    fi
+    snapshot_locks+=("$MESSAGE_LOCK")
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}' 2>/dev/null)
+
+  if [[ "$(tmux show-option -t "$SESSION" -qv @llmux_rebuilding 2>/dev/null || true)" == "1" ]]; then
+    for snapshot_lock in "${snapshot_locks[@]}"; do release_message_lock "$snapshot_lock"; done
+    return 0
+  fi
+
   local rows="" line
   while IFS='|' read -r line; do
     [[ -n "$line" ]] && rows+="${line}"$'\n'
   done < <(tmux list-panes -s -t "$SESSION" \
-      -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_project}|#{@llmux_worktree}|#{@llmux_slot}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_order}|#{@llmux_pinned}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}' \
+      -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_project}|#{@llmux_worktree}|#{@llmux_slot}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_order}|#{@llmux_pinned}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_inbox}' \
       2>/dev/null || true)
-  [[ -z "$rows" ]] && return 0
+  if [[ -z "$rows" ]]; then
+    for snapshot_lock in "${snapshot_locks[@]}"; do release_message_lock "$snapshot_lock"; done
+    return 0
+  fi
 
   local opts=""
   local o
@@ -6548,7 +6783,7 @@ session_created = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit(
 raw = sys.stdin.read()
 rows, _, opts = raw.partition("\x00")
 keys = ["name","dir","tool","project","worktree","slot","claude_session",
-        "opencode_session","order","pinned","terminal","sidebar","anchor"]
+        "opencode_session","order","pinned","terminal","sidebar","anchor","inbox"]
 threads = []
 for line in rows.splitlines():
     if not line.strip():
@@ -6605,6 +6840,7 @@ for t in threads:
 d["session"] = {"saved_at": int(time.time()), "threads": threads, "options": options}
 _save(path, d)
 ' "$PAUSED_FILE" 2>/dev/null || true
+  for snapshot_lock in "${snapshot_locks[@]}"; do release_message_lock "$snapshot_lock"; done
 }
 
 # Print what the snapshot holds, so "did it capture my work?" is answerable without
@@ -6654,19 +6890,38 @@ for t in s.get("threads", []):
     if t.get("terminal") == "1":
         continue
     print("|".join([t.get(k, "") for k in
-        ["name","dir","tool","project","worktree","slot","claude_session","opencode_session","order","pinned"]]))
+        ["name","dir","tool","project","worktree","slot","claude_session","opencode_session","order","pinned","inbox"]]))
 ' "$PAUSED_FILE" 2>/dev/null || true)
   if [[ -z "$rows" ]]; then
     echo "No session snapshot to restore." >&2
     return 1
   fi
 
-  ensure_session
-  local name dir tool project worktree slot csid osid order pinned pane n=0
-  while IFS='|' read -r name dir tool project worktree slot csid osid order pinned; do
+  if tmux has-session -t "$SESSION" 2>/dev/null; then
+    tmux set-option -t "$SESSION" @llmux_rebuilding 1
+    watch_stop
+  fi
+
+  if ! LLMUX_REBUILDING=1 LLMUX_SKIP_WATCH_START=1 ensure_session; then
+    echo "Error: could not create restore session; original crash snapshot retained" >&2
+    return 1
+  fi
+  local name dir tool project worktree slot csid osid order pinned inbox pane n=0
+  while IFS='|' read -r name dir tool project worktree slot csid osid order pinned inbox; do
     [[ -z "$name" ]] && continue
     [[ -d "$dir" ]] || dir="$HOME"
-    pane=$(spawn_llm_pane "$dir") || continue
+    if ! pane=$(spawn_llm_pane "$dir"); then
+      watch_stop
+      tmux kill-session -t "$SESSION" 2>/dev/null || true
+      echo "Error: could not recreate '$name'; original crash snapshot retained" >&2
+      return 1
+    fi
+    if ! restore_message_inbox "$pane" "$inbox"; then
+      watch_stop
+      tmux kill-session -t "$SESSION" 2>/dev/null || true
+      echo "Error: inbox restore failed; original crash snapshot retained" >&2
+      return 1
+    fi
     tmux set-option -p -t "$pane" @llmux_name "$name"
     [[ -n "$tool" ]]      && tmux set-option -p -t "$pane" @llmux_tool "$tool"
     [[ -n "$project" ]]   && tmux set-option -p -t "$pane" @llmux_project "$project"
@@ -6708,6 +6963,8 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
     tmux set-option -t "$SESSION" @llmux_sidebar_mode "0" 2>/dev/null || true
     cmd_sidebar on >/dev/null 2>&1 || true
   fi
+  tmux set-option -t "$SESSION" @llmux_rebuilding 0
+  watch_start
   echo "Restored $n thread(s) from snapshot."
 }
 
@@ -6796,23 +7053,40 @@ cmd_refresh() {
   # The project goes in the snapshot too: refresh kills the session, and with it
   # every @llmux_project and the project registry — so without carrying it, a
   # refresh would silently dump every thread back into SCRATCH.
-  local pane_data=()
-  while IFS='|' read -r name dir tool is_term is_pin sid project; do
-    pane_data+=("$name|$dir|$tool|$is_term|$is_pin|$sid|$project")
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_project}')
-
-  # Stop watcher and kill the old session
+  # Stop dequeue first, then lock every pane inbox through capture + session
+  # retirement. Senders either land before their pane is captured or fail cleanly
+  # after the old pane disappears; none can be acknowledged and then discarded.
   watch_stop
-  rm -rf "$WATCH_STATE_DIR"
-  tmux kill-session -t "$SESSION"
+  local held_inbox_locks=() lock_pane refresh_lock
+  while IFS= read -r lock_pane; do
+    [[ -n "$lock_pane" ]] || continue
+    if ! acquire_message_lock "$lock_pane"; then
+      for refresh_lock in "${held_inbox_locks[@]}"; do release_message_lock "$refresh_lock"; done
+      echo "Error: refresh aborted because a message queue is busy" >&2
+      return 1
+    fi
+    held_inbox_locks+=("$MESSAGE_LOCK")
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}' 2>/dev/null)
+
+  local pane_data=()
+  while IFS='|' read -r name dir tool is_term is_pin sid project inbox worktree slot; do
+    pane_data+=("$name|$dir|$tool|$is_term|$is_pin|$sid|$project|$inbox|$worktree|$slot")
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_project}|#{@llmux_inbox}|#{@llmux_worktree}|#{@llmux_slot}')
 
   # Filter to named non-terminal, non-pinned panes only
   local active=()
+  local recovery_entries=()
   local skipped=()
   local had_pinned_tool=""
+  local had_pinned_name=""
   local had_pinned_session=""
+  local had_pinned_inbox=""
+  local had_pinned_dir=""
+  local had_pinned_project=""
+  local had_pinned_worktree=""
+  local had_pinned_slot=""
   for entry in "${pane_data[@]}"; do
-    local name dir tool is_term is_pin sid project
+    local name dir tool is_term is_pin sid project inbox worktree slot
     name=$(echo "$entry" | cut -d'|' -f1)
     dir=$(echo "$entry" | cut -d'|' -f2)
     tool=$(echo "$entry" | cut -d'|' -f3)
@@ -6820,13 +7094,23 @@ cmd_refresh() {
     is_pin=$(echo "$entry" | cut -d'|' -f5)
     sid=$(echo "$entry" | cut -d'|' -f6)
     project=$(echo "$entry" | cut -d'|' -f7)
+    inbox=$(echo "$entry" | cut -d'|' -f8)
+    worktree=$(echo "$entry" | cut -d'|' -f9)
+    slot=$(echo "$entry" | cut -d'|' -f10)
 
     # Skip terminal — recreated by ensure_session
     [[ "$is_term" == "1" ]] && continue
+    [[ -n "$name" ]] && recovery_entries+=("$name|$dir|$tool|$worktree|$sid|$slot|$project|$inbox")
     # Skip pinned — recreated by ensure_session, resume tool after
     if [[ "$is_pin" == "1" ]]; then
+      had_pinned_name="$name"
       had_pinned_tool="$tool"
       had_pinned_session="$sid"
+      had_pinned_inbox="$inbox"
+      had_pinned_dir="$dir"
+      had_pinned_project="$project"
+      had_pinned_worktree="$worktree"
+      had_pinned_slot="$slot"
       continue
     fi
 
@@ -6835,39 +7119,89 @@ cmd_refresh() {
       continue
     fi
 
-    active+=("$name|$dir|$tool|$sid|$project")
+    active+=("$name|$dir|$tool|$sid|$project|$inbox|$worktree|$slot")
   done
 
+  # Make the whole batch durable BEFORE the destructive edge. Successful rebuilds
+  # remove entries one by one; any unexpected shell/tmux failure leaves the not-yet-
+  # restored threads recoverable rather than trapped in local arrays.
+  persist_refresh_recovery "${recovery_entries[@]}"
+
+  # Kill the old session before releasing its pane locks.
+  rm -rf "$WATCH_STATE_DIR"
+  if ! tmux kill-session -t "$SESSION"; then
+    for refresh_lock in "${held_inbox_locks[@]}"; do release_message_lock "$refresh_lock"; done
+    local recovery_entry recovery_name
+    for recovery_entry in "${recovery_entries[@]}"; do
+      recovery_name="${recovery_entry%%|*}"
+      remove_paused "$recovery_name" >/dev/null 2>&1 || true
+    done
+    return 1
+  fi
+  for refresh_lock in "${held_inbox_locks[@]}"; do release_message_lock "$refresh_lock"; done
+
   # Recreate session (creates terminal + pinned, skipping pinned tool launch)
-  LLMUX_SKIP_PINNED_LAUNCH=1 ensure_session
+  if ! LLMUX_REBUILDING=1 LLMUX_SKIP_WATCH_START=1 LLMUX_SKIP_PINNED_LAUNCH=1 ensure_session; then
+    abort_refresh_to_paused "${recovery_entries[@]}"
+    echo "Error: refresh could not create the replacement session; every captured thread remains paused" >&2
+    return 1
+  fi
 
   # Resume tool in pinned pane if it was running one
-  if [[ -n "$had_pinned_tool" ]]; then
+  if [[ -n "$had_pinned_name" ]]; then
     local pinned_pane
     pinned_pane=$(get_pinned_pane)
-    if [[ -n "$pinned_pane" ]]; then
-      resume_tool_in_pane "$pinned_pane" "$had_pinned_tool" "${LLMUX_PINNED_NAME:-}" "$had_pinned_session"
+    if [[ -z "$pinned_pane" ]]; then
+      abort_refresh_to_paused "${recovery_entries[@]}"
+      echo "Error: pinned pane was not recreated; every captured thread was saved as paused" >&2
+      return 1
+    else
+      if ! restore_message_inbox "$pinned_pane" "$had_pinned_inbox"; then
+        abort_refresh_to_paused "${recovery_entries[@]}"
+        echo "Error: pinned inbox restore failed; every captured thread was saved as paused" >&2
+        return 1
+      fi
+      [[ -n "$had_pinned_worktree" ]] && tmux set-option -p -t "$pinned_pane" @llmux_worktree "$had_pinned_worktree"
+      [[ -n "$had_pinned_slot" ]] && tmux set-option -p -t "$pinned_pane" @llmux_slot "$had_pinned_slot"
+      [[ -n "$had_pinned_tool" ]] && resume_tool_in_pane "$pinned_pane" "$had_pinned_tool" "${LLMUX_PINNED_NAME:-}" "$had_pinned_session"
     fi
   fi
 
   if [[ ${#active[@]} -eq 0 ]]; then
+    tmux set-option -t "$SESSION" @llmux_rebuilding 0
+    watch_start
+    clear_refresh_recovery "${recovery_entries[@]}"
     echo "No named panes to restore."
     return
   fi
 
   # Recreate each LLM pane below the top row
   for entry in "${active[@]}"; do
-    local name dir tool sid project
+    local name dir tool sid project inbox worktree slot
     name=$(echo "$entry" | cut -d'|' -f1)
     dir=$(echo "$entry" | cut -d'|' -f2)
     tool=$(echo "$entry" | cut -d'|' -f3)
     sid=$(echo "$entry" | cut -d'|' -f4)
     project=$(echo "$entry" | cut -d'|' -f5)
+    inbox=$(echo "$entry" | cut -d'|' -f6)
+    worktree=$(echo "$entry" | cut -d'|' -f7)
+    slot=$(echo "$entry" | cut -d'|' -f8)
 
     local new_pane
-    new_pane=$(spawn_llm_pane "$dir")
+    if ! new_pane=$(spawn_llm_pane "$dir"); then
+      abort_refresh_to_paused "${recovery_entries[@]}"
+      echo "Error: refresh could not recreate '$name'; every captured thread was saved as paused" >&2
+      return 1
+    fi
     tmux select-pane -t "$new_pane" -T "$name"
+    if ! restore_message_inbox "$new_pane" "$inbox"; then
+      abort_refresh_to_paused "${recovery_entries[@]}"
+      echo "Error: refresh failed at '$name'; every captured thread was saved as paused" >&2
+      return 1
+    fi
     tmux set-option -p -t "$new_pane" @llmux_name "$name"
+    [[ -n "$worktree" ]] && tmux set-option -p -t "$new_pane" @llmux_worktree "$worktree"
+    [[ -n "$slot" ]] && tmux set-option -p -t "$new_pane" @llmux_slot "$slot"
     if [[ -n "$project" ]]; then
       tmux set-option -p -t "$new_pane" @llmux_project "$project"
       register_project "$project"
@@ -6883,6 +7217,11 @@ cmd_refresh() {
   done
 
   apply_layout
+  # Commit point: only now is every captured thread live again. Until this line the
+  # full paused batch remains durable, so a process crash cannot strand early panes.
+  tmux set-option -t "$SESSION" @llmux_rebuilding 0
+  watch_start
+  clear_refresh_recovery "${recovery_entries[@]}"
 
   echo ""
   echo "✓ Restored ${#active[@]} pane(s) + pinned"
@@ -6924,7 +7263,7 @@ cmd_dash() {
     # Collect paused panes
     local paused_entries=()
     local paused_display=()
-    while IFS='|' read -r pname pdir ptool pwt paused_at psid; do
+    while IFS='|' read -r pname pdir ptool pwt paused_at psid _pslot _pproj _pinbox; do
       [[ -z "$pname" ]] && continue
       paused_entries+=("$pname|$pdir|$ptool")
       paused_display+=("💤  $pname (${ptool:-?})")

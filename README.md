@@ -270,8 +270,17 @@ delivering to the wrong agent is worse than not delivering.
   instruction from Jay.
 - **One line.** A newline is Enter in all these TUIs, so a multi-line message would
   submit itself in fragments; whitespace is collapsed on the way out.
-- Nothing is queued: a thread that is not running has no mailbox, which is correct —
-  there is nobody to read it.
+- **The watcher submits at a confirmed input point.** Claude, Codex, and OpenCode accept text
+  into the composer while working but ignore Enter, so `send` keeps the payload in
+  the pane's `@llmux_inbox` instead. `llmux-watch` submits one message at the next
+  confirmed input point; additional messages remain ordered for later turns. An idle
+  thread receives it within the next watcher tick rather than trusting a potentially
+  stale status; the same confirmation protects a prose-question state from races.
+- Claude, Amp, Codex, and OpenCode expose a reliable ready signal. Other interactive
+  tools are refused instead of claiming an undeliverable queue; use `--force` only
+  while visibly sitting at their prompt.
+- Nothing is persisted for a thread that is not running: it has no pane and therefore
+  no mailbox, which is correct — there is nobody to read it.
 
 ### A thread that is asking you something turns colour
 
