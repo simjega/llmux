@@ -13,19 +13,19 @@ A macOS desktop command center for existing llmux threads, built with Electron, 
 
 ## What works
 
-The preview reads the same tmux metadata as the CLI and turns it into a project-first thread list. Selecting a thread opens its live terminal; typing in the terminal sends keystrokes back to that exact pane. Activity and diagnostics are separate views so operational signals do not compete with the working surface.
+The preview reads the same tmux metadata as the CLI and turns it into a project-first thread list. Selecting a thread watches tmux's event-driven control stream and immediately refreshes an authoritative screen frame when that pane changes; typing in the terminal sends batched keystrokes back to that exact pane. Activity and diagnostics are separate views so operational signals do not compete with the working surface.
 
-![llmux Desktop overview](https://i.imgur.com/HstUJYh.png)
+![llmux Desktop overview](https://i.imgur.com/6pkb042.png)
 
 | Surface | Current behavior |
 |---|---|
 | Threads | Groups live panes by llmux project and filters them by name or path |
-| Terminal | Renders the selected pane with ANSI color and sends keyboard input back to tmux |
+| Terminal | Refreshes the selected pane on tmux output/layout events and sends batched keyboard input back to tmux |
 | Activity | Collects threads that are running, waiting for input, or recently finished |
-| Diagnostics | Shows tmux health, polling latency, failures, versions, and recent structured events |
+| Diagnostics | Shows tmux health, frame latency, stream volume, failures, versions, and recent structured events |
 | Safety | Uses context isolation, renderer sandboxing, a narrow preload API, validated IPC input, and no remote content |
 
-![llmux Desktop activity queue](https://i.imgur.com/TtBtdcu.png)
+![llmux Desktop activity queue](https://i.imgur.com/JdS7C1D.png)
 
 ## Architecture
 
@@ -38,10 +38,10 @@ React + xterm.js renderer
  sandboxed preload bridge
           │ validated IPC
           ▼
- Electron main process ───────► local JSONL telemetry
-          │ execFile only
+Electron main process ───────► local JSONL telemetry
+          │ control invalidation + bounded frame/input calls
           ▼
- tmux list-panes / capture-pane / send-keys
+tmux %output / list-panes / capture-pane / send-keys
 ```
 
 The interface borrows a few durable patterns from modern coding apps: a project/thread hierarchy, a separate activity queue, a focused terminal surface, and diagnostics kept out of the primary workspace. Those patterns are documented in OpenAI's guides to [projects](https://learn.chatgpt.com/docs/projects), [notifications](https://learn.chatgpt.com/docs/notifications), [integrated terminals](https://learn.chatgpt.com/docs/integrated-terminal), and [code review](https://learn.chatgpt.com/docs/code-review), and in Anthropic's [Claude project model](https://support.anthropic.com/en/articles/9519177-how-can-i-create-and-manage-projects).
@@ -76,11 +76,11 @@ The Diagnostics view exposes:
 
 - tmux connectivity and version
 - snapshot and terminal-frame p50/p95 latency
-- poll and failure counts
+- stream event/byte, frame, metadata-poll, and failure counts
 - the last failure and recent structured events
 - a button to reveal the local log file
 
-![Diagnostics view](https://i.imgur.com/qfzKDSw.png)
+![Diagnostics view](https://i.imgur.com/TV9rwjp.png)
 
 ## Validation
 
@@ -90,7 +90,7 @@ npm run package    # packaged macOS arm64 app
 npm run test:e2e   # packaged-app tests against an isolated tmux session
 ```
 
-The end-to-end suite creates `llmux-desktop-e2e`, launches the packaged application through Electron, verifies thread grouping and all three views, types into a real tmux pane, confirms the shell received the input, and captures the screenshots in this directory.
+The end-to-end suite creates `llmux-desktop-e2e`, launches the packaged application through Electron, verifies thread grouping and all three views, types into a real tmux pane, exercises application-mode keys, external resize and forced stream reconnect, measures rendered output latency, and captures the screenshots in this directory.
 
 ## Deliberate gaps
 
@@ -99,7 +99,7 @@ This is a direction-setting preview, not an exact port.
 - It is validated only on macOS arm64 and is unsigned and unnotarized.
 - Thread creation, pause/resume/remove, PR state, reviews, and Tolaria actions remain in the CLI.
 - Selecting a row changes only the desktop view; it does not mutate the pane currently visible to an attached tmux client.
-- The terminal currently polls `capture-pane` every 350 ms instead of maintaining a tmux control-mode stream. Mouse-heavy and unusual full-screen terminal programs may need more work.
-- Clipboard paste is deliberately blocked because a captured screen cannot safely reconstruct the pane's bracketed-paste mode. Paste through the attached tmux client until the desktop terminal uses a stateful stream.
+- The terminal mirrors the existing pane's exact rows and columns instead of resizing Jay's attached tmux client. Very large panes may be clipped in a smaller desktop window.
+- Clipboard paste is deliberately blocked because a captured screen cannot safely reconstruct the pane's bracketed-paste mode. Paste through the attached tmux client until the desktop terminal has a state-preserving PTY bridge.
 - The packaged preview retains Electron's inspector switch so Playwright can automate it. A distribution build should use a separate test fuse profile and disable that switch.
 - Electron Forge's current packaging dependency reports a development-only `extract-zip` advisory. `npm audit --omit=dev` is clean; distribution work should update the packager when its patched release is available.

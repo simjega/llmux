@@ -20,6 +20,9 @@ export class Telemetry {
   private terminalDurations: number[] = [];
   private snapshotPolls = 0;
   private terminalPolls = 0;
+  private terminalStreamEvents = 0;
+  private terminalStreamBytes = 0;
+  private terminalStreamConnected = false;
   private commandFailures = 0;
   private lastError: string | null = null;
 
@@ -58,6 +61,16 @@ export class Telemetry {
     this.terminalDurations = [...this.terminalDurations.slice(-199), durationMs];
   }
 
+  recordTerminalOutput(bytes: number) {
+    this.terminalStreamEvents += 1;
+    this.terminalStreamBytes += bytes;
+  }
+
+  recordTerminalStreamState(connected: boolean) {
+    this.terminalStreamConnected = connected;
+    this.record(connected ? 'info' : 'warn', connected ? 'tmux.stream.connected' : 'tmux.stream.disconnected');
+  }
+
   recordFailure(event: string, error: unknown, details?: Record<string, unknown>) {
     this.commandFailures += 1;
     this.lastError = error instanceof Error ? error.message : String(error);
@@ -73,6 +86,9 @@ export class Telemetry {
       uptimeMs: Date.now() - this.startedAt,
       snapshotPolls: this.snapshotPolls,
       terminalPolls: this.terminalPolls,
+      terminalStreamEvents: this.terminalStreamEvents,
+      terminalStreamBytes: this.terminalStreamBytes,
+      terminalStreamConnected: this.terminalStreamConnected,
       commandFailures: this.commandFailures,
       snapshotP50Ms: percentile(this.snapshotDurations, 0.5),
       snapshotP95Ms: percentile(this.snapshotDurations, 0.95),

@@ -39,9 +39,10 @@ function Diagnostics({ diagnostics }: { diagnostics: DiagnosticsSnapshot | null 
   if (!diagnostics) return <div className="empty-state"><Gauge size={28} /><h2>Loading diagnostics</h2></div>;
   const metrics = [
     ['Snapshot p50 / p95', `${diagnostics.snapshotP50Ms} / ${diagnostics.snapshotP95Ms} ms`],
-    ['Terminal p50 / p95', `${diagnostics.terminalP50Ms} / ${diagnostics.terminalP95Ms} ms`],
+    ['Terminal frame p50 / p95', `${diagnostics.terminalP50Ms} / ${diagnostics.terminalP95Ms} ms`],
     ['Snapshot polls', diagnostics.snapshotPolls.toLocaleString()],
-    ['Terminal polls', diagnostics.terminalPolls.toLocaleString()],
+    ['Terminal frames', diagnostics.terminalPolls.toLocaleString()],
+    ['Stream events / bytes', `${diagnostics.terminalStreamEvents.toLocaleString()} / ${diagnostics.terminalStreamBytes.toLocaleString()}`],
     ['Command failures', diagnostics.commandFailures.toLocaleString()],
     ['Runtime', `${Math.round(diagnostics.uptimeMs / 1000)} sec`],
   ];
@@ -49,7 +50,7 @@ function Diagnostics({ diagnostics }: { diagnostics: DiagnosticsSnapshot | null 
     <div className="inspector" data-testid="diagnostics-view">
       <div className="inspector-heading"><div><p className="eyebrow">OBSERVABILITY</p><h2>Runtime diagnostics</h2><p>Local, structured signals from the Electron main process and tmux adapter.</p></div><button className="secondary-button" onClick={() => void window.llmux.revealLogs()}>Reveal logs</button></div>
       <div className="metric-grid">{metrics.map(([label, value]) => <div className="metric-card" key={label}><span>{label}</span><strong>{value}</strong></div>)}</div>
-      <div className="runtime-strip"><span><i className={`health-light ${diagnostics.commandFailures ? 'warning' : ''}`} />{diagnostics.commandFailures ? 'Degraded' : 'Healthy'}</span><span>{diagnostics.tmuxVersion}</span><span>Electron {diagnostics.electronVersion}</span><span>App {diagnostics.appVersion}</span></div>
+      <div className="runtime-strip"><span><i className={`health-light ${diagnostics.commandFailures || !diagnostics.terminalStreamConnected ? 'warning' : ''}`} />{diagnostics.commandFailures || !diagnostics.terminalStreamConnected ? 'Degraded' : 'Healthy'}</span><span>{diagnostics.tmuxVersion}</span><span>{diagnostics.terminalStreamConnected ? 'Stream connected' : 'Stream reconnecting'}</span><span>Electron {diagnostics.electronVersion}</span><span>App {diagnostics.appVersion}</span></div>
       {diagnostics.lastError && <div className="last-error"><strong>Last error</strong><code>{diagnostics.lastError}</code></div>}
       <div className="event-list"><div className="section-title">Recent events</div>{diagnostics.recentEvents.map((event, index) => <div className="event-row" key={`${event.at}-${index}`}><time>{new Date(event.at).toLocaleTimeString()}</time><span className={`event-level ${event.level}`}>{event.level}</span><code>{event.event}</code>{event.durationMs !== undefined && <span>{event.durationMs} ms</span>}</div>)}</div>
       <p className="log-path">{diagnostics.logPath}</p>

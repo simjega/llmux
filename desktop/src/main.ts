@@ -56,10 +56,13 @@ app.whenReady().then(async () => {
   telemetry = new Telemetry();
   tmux = new TmuxClient(telemetry);
   await tmux.initialize();
+  tmux.onTerminalOutput((output) => mainWindow?.webContents.send('llmux:terminal-output', output));
+  tmux.onTerminalStreamState((state) => mainWindow?.webContents.send('llmux:terminal-stream-state', state));
 
   ipcMain.handle('llmux:snapshot', (event) => { assertTrustedSender(event); return tmux.snapshot(); });
   ipcMain.handle('llmux:terminal-frame', (event, paneId: string) => { assertTrustedSender(event); return tmux.terminalFrame(paneId); });
   ipcMain.handle('llmux:terminal-input', (event, paneId: string, data: string) => { assertTrustedSender(event); return tmux.sendInput(paneId, data); });
+  ipcMain.handle('llmux:terminal-key', (event, paneId: string, key: string) => { assertTrustedSender(event); return tmux.sendKey(paneId, key); });
   ipcMain.handle('llmux:diagnostics', (event) => { assertTrustedSender(event); return telemetry.diagnostics(tmux.getVersion()); });
   ipcMain.handle('llmux:reveal-logs', (event) => { assertTrustedSender(event); return shell.showItemInFolder(telemetry.logPath); });
   ipcMain.on('llmux:renderer-event', (ipcEvent, event: string, details?: Record<string, unknown>) => {
@@ -82,6 +85,8 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
+
+app.on('before-quit', () => tmux?.dispose());
 
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();

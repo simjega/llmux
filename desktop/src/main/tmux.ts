@@ -1,13 +1,20 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { access } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { promisify } from 'node:util';
-import type { AppSnapshot, ProjectSnapshot, TerminalFrame, ThreadSnapshot, ThreadStatus } from '../shared/types';
+import type { AppSnapshot, ProjectSnapshot, TerminalFrame, TerminalOutputEvent, TerminalStreamState, ThreadSnapshot, ThreadStatus } from '../shared/types';
+import { isControlLayoutChange, parseControlOutput } from './control-protocol';
 import type { Telemetry } from './telemetry';
 
 const execFileAsync = promisify(execFile);
 const FIELD_SEPARATOR = '\t';
 const PANE_ID_PATTERN = /^%\d+$/;
+const TERMINAL_KEYS = new Set([
+  'Up', 'Down', 'Left', 'Right', 'Home', 'End', 'PageUp', 'PageDown',
+  'IC', 'DC', 'Enter', 'Tab', 'BTab', 'BSpace', 'Escape',
+  'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12',
+]);
+const FRAME_MARKER = '__LLMUX_DESKTOP_FRAME_METADATA__';
 const SNAPSHOT_FORMAT = [
   '#{pane_id}', '#{@llmux_name}', '#{@llmux_tool}', '#{@llmux_project}',
   '#{pane_current_path}', '#{@llmux_status}', '#{@llmux_status_src}',
@@ -77,6 +84,13 @@ export class TmuxClient {
   private tmuxExecutable = 'tmux';
   private inputQueues = new Map<string, Promise<void>>();
   private knownPaneIds = new Set<string>();
+  private controlProcess: ChildProcessWithoutNullStreams | null = null;
+  private controlBuffer = '';
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private disposed = false;
+  private streamConnected = false;
+  private outputListeners = new Set<(event: TerminalOutputEvent) => void>();
+  private streamStateListeners = new Set<(state: TerminalStreamState) => void>();
 
   constructor(private readonly telemetry: Telemetry) {
     this.session = process.env.LLMUX_DESKTOP_SESSION || process.env.LLMUX_SESSION || 'llmux';
@@ -105,6 +119,7 @@ export class TmuxClient {
       }
       this.tmuxVersion = (await this.tmux(['-V'])).trim();
       this.telemetry.record('info', 'tmux.connected', { session: this.session, version: this.tmuxVersion });
+      this.startControlStream();
     } catch (error) {
       this.telemetry.recordFailure('tmux.initialize.failed', error, { session: this.session });
     }
@@ -112,6 +127,79 @@ export class TmuxClient {
 
   getVersion() {
     return this.tmuxVersion;
+  }
+
+  onTerminalOutput(listener: (event: TerminalOutputEvent) => void) {
+    this.outputListeners.add(listener);
+    return () => this.outputListeners.delete(listener);
+  }
+
+  onTerminalStreamState(listener: (state: TerminalStreamState) => void) {
+    this.streamStateListeners.add(listener);
+    listener({ connected: this.streamConnected });
+    return () => this.streamStateListeners.delete(listener);
+  }
+
+  private setStreamConnected(connected: boolean) {
+    if (this.streamConnected === connected) return;
+    this.streamConnected = connected;
+    this.telemetry.recordTerminalStreamState(connected);
+    for (const listener of this.streamStateListeners) listener({ connected });
+  }
+
+  private startControlStream() {
+    if (this.disposed || this.controlProcess) return;
+    this.controlBuffer = '';
+    const controlProcess = spawn(
+      this.tmuxExecutable,
+      ['-C', 'attach-session', '-E', '-r', '-f', 'ignore-size', '-t', this.session],
+      { env: process.env, stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    this.controlProcess = controlProcess;
+    controlProcess.stderr.resume();
+    controlProcess.stdout.setEncoding('utf8');
+    controlProcess.stdout.on('data', (chunk: string) => {
+      this.controlBuffer += chunk;
+      const lines = this.controlBuffer.split('\n');
+      this.controlBuffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (line.startsWith('%session-changed ')) this.setStreamConnected(true);
+        if (isControlLayoutChange(line)) {
+          const receivedAt = Date.now();
+          for (const paneId of this.knownPaneIds) {
+            this.telemetry.recordTerminalOutput(0);
+            for (const listener of this.outputListeners) listener({ paneId, receivedAt });
+          }
+          continue;
+        }
+        const output = parseControlOutput(line);
+        if (!output || !this.knownPaneIds.has(output.paneId)) continue;
+        const event = { paneId: output.paneId, receivedAt: Date.now() };
+        this.telemetry.recordTerminalOutput(Buffer.byteLength(output.data, 'utf8'));
+        for (const listener of this.outputListeners) listener(event);
+      }
+    });
+    controlProcess.on('error', () => {
+      this.telemetry.recordFailure('tmux.stream.failed', new Error('Unable to start tmux control stream'));
+    });
+    controlProcess.on('close', () => {
+      if (this.controlProcess === controlProcess) this.controlProcess = null;
+      this.setStreamConnected(false);
+      if (!this.disposed && !this.reconnectTimer) {
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null;
+          this.startControlStream();
+        }, 1_000);
+      }
+    });
+  }
+
+  dispose() {
+    this.disposed = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.controlProcess?.kill();
+    this.controlProcess = null;
   }
 
   private assertKnownPane(paneId: unknown): asserts paneId is string {
@@ -162,11 +250,17 @@ export class TmuxClient {
     this.assertKnownPane(paneId);
     const startedAt = performance.now();
     try {
-      const [content, metadata] = await Promise.all([
-        this.tmux(['capture-pane', '-p', '-e', '-t', paneId]),
-        this.tmux(['display-message', '-p', '-t', paneId, '#{cursor_x}\t#{cursor_y}\t#{pane_width}\t#{pane_height}']),
+      const output = await this.tmux([
+        'capture-pane', '-p', '-e', '-t', paneId,
+        ';', 'display-message', '-p', '-t', paneId,
+        `${FRAME_MARKER}\t#{cursor_x}\t#{cursor_y}\t#{pane_width}\t#{pane_height}`,
       ]);
-      const [cursorX, cursorY, width, height] = metadata.trim().split(FIELD_SEPARATOR).map((value) => parseInteger(value, 0));
+      const markerIndex = output.lastIndexOf(`\n${FRAME_MARKER}\t`);
+      if (markerIndex < 0) throw new Error('tmux frame metadata missing');
+      const content = output.slice(0, markerIndex);
+      const metadata = output.slice(markerIndex + 1).trim();
+      const [, cursorXRaw, cursorYRaw, widthRaw, heightRaw] = metadata.split(FIELD_SEPARATOR);
+      const [cursorX, cursorY, width, height] = [cursorXRaw, cursorYRaw, widthRaw, heightRaw].map((value) => parseInteger(value, 0));
       const latencyMs = performance.now() - startedAt;
       this.telemetry.recordTerminal(latencyMs);
       return {
@@ -197,6 +291,26 @@ export class TmuxClient {
       } catch {
         this.telemetry.recordFailure('tmux.input.failed', new Error('tmux send-keys failed'), { paneId });
         throw new Error('Unable to send terminal input');
+      }
+    });
+    this.inputQueues.set(paneId, next);
+    try {
+      await next;
+    } finally {
+      if (this.inputQueues.get(paneId) === next) this.inputQueues.delete(paneId);
+    }
+  }
+
+  async sendKey(paneId: string, key: string): Promise<void> {
+    this.assertKnownPane(paneId);
+    if (typeof key !== 'string' || !TERMINAL_KEYS.has(key)) throw new Error('Invalid terminal key');
+    const previous = this.inputQueues.get(paneId) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(async () => {
+      try {
+        await this.tmux(['send-keys', '-t', paneId, key]);
+      } catch {
+        this.telemetry.recordFailure('tmux.key.failed', new Error('tmux send-keys failed'), { paneId, key });
+        throw new Error('Unable to send terminal key');
       }
     });
     this.inputQueues.set(paneId, next);

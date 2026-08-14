@@ -48,6 +48,15 @@ export interface TerminalFrame {
   observedAt: string;
 }
 
+export interface TerminalOutputEvent {
+  paneId: string;
+  receivedAt: number;
+}
+
+export interface TerminalStreamState {
+  connected: boolean;
+}
+
 export interface TelemetryEvent {
   at: string;
   level: 'debug' | 'info' | 'warn' | 'error';
@@ -64,6 +73,9 @@ export interface DiagnosticsSnapshot {
   uptimeMs: number;
   snapshotPolls: number;
   terminalPolls: number;
+  terminalStreamEvents: number;
+  terminalStreamBytes: number;
+  terminalStreamConnected: boolean;
   commandFailures: number;
   snapshotP50Ms: number;
   snapshotP95Ms: number;
@@ -77,6 +89,9 @@ export interface LlmuxDesktopApi {
   getSnapshot(): Promise<AppSnapshot>;
   getTerminalFrame(paneId: string): Promise<TerminalFrame>;
   sendTerminalInput(paneId: string, data: string): Promise<void>;
+  sendTerminalKey(paneId: string, key: string): Promise<void>;
+  onTerminalOutput(listener: (event: TerminalOutputEvent) => void): () => void;
+  onTerminalStreamState(listener: (state: TerminalStreamState) => void): () => void;
   getDiagnostics(): Promise<DiagnosticsSnapshot>;
   revealLogs(): Promise<void>;
   reportRendererEvent(event: string, details?: Record<string, unknown>): void;
