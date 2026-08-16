@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Activity, AlertCircle, Bell, CheckCircle2, ChevronDown, CircleDot, Gauge, LockKeyhole, Search, TerminalSquare } from 'lucide-react';
 import { TerminalView } from './TerminalView';
 import type { AppSnapshot, DiagnosticsSnapshot, ThreadSnapshot, ThreadStatus } from './shared/types';
@@ -64,6 +64,8 @@ export function App() {
   const [view, setView] = useState<View>('workspace');
   const [query, setQuery] = useState('');
   const [diagnostics, setDiagnostics] = useState<DiagnosticsSnapshot | null>(null);
+  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
+  const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let disposed = false;
@@ -90,6 +92,30 @@ export function App() {
     return () => { disposed = true; window.clearInterval(timer); };
   }, [view]);
 
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      if (event.metaKey && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        searchRef.current?.focus({ preventScroll: true });
+        searchRef.current?.select();
+        return;
+      }
+      if (event.metaKey && event.key.toLowerCase() === 'd') {
+        event.preventDefault();
+        setView((current) => current === 'diagnostics' ? 'workspace' : 'diagnostics');
+        return;
+      }
+      if (event.key === 'Escape' && document.activeElement === searchRef.current) {
+        event.preventDefault();
+        setQuery('');
+        searchRef.current?.blur();
+        document.querySelector<HTMLTextAreaElement>('.xterm-helper-textarea')?.focus({ preventScroll: true });
+      }
+    };
+    window.addEventListener('keydown', handleShortcut, true);
+    return () => window.removeEventListener('keydown', handleShortcut, true);
+  }, []);
+
   const allThreads = flattenThreads(snapshot);
   const selectedThread = allThreads.find((thread) => thread.paneId === selectedPaneId) ?? null;
   const filteredProjects = useMemo(() => snapshot?.projects.map((project) => ({ ...project, threads: project.threads.filter((thread) => `${thread.name} ${thread.project} ${thread.cwd}`.toLowerCase().includes(query.toLowerCase())) })).filter((project) => project.threads.length) ?? [], [snapshot, query]);
@@ -100,18 +126,28 @@ export function App() {
     setView('workspace');
     window.llmux.reportRendererEvent('thread.selected', { paneId: thread.paneId, tool: thread.tool, project: thread.project });
   };
+  const toggleProject = (project: string) => {
+    setCollapsedProjects((current) => {
+      const next = new Set(current);
+      if (next.has(project)) next.delete(project); else next.add(project);
+      return next;
+    });
+  };
 
   return (
     <main className="app-shell">
       <aside className="sidebar">
         <div className="drag-region" />
         <div className="brand-row"><div className="brand-mark">ll</div><div><strong>llmux</strong><span>desktop preview</span></div><span className={`connection-dot ${snapshot?.connected ? 'online' : ''}`} title={snapshot?.connected ? 'Connected' : 'Disconnected'} /></div>
-        <button className={`activity-button ${view === 'activity' ? 'active' : ''}`} onClick={() => setView('activity')} data-testid="activity-button"><Bell size={15} /><span>Activity</span><span className="activity-count">{(snapshot?.attentionCount ?? 0) + (snapshot?.unreadCount ?? 0)}</span></button>
-        <label className="search-box"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Find a thread" aria-label="Find a thread" /></label>
+        <button className={`activity-button ${view === 'activity' ? 'active' : ''}`} onClick={() => setView('activity')} data-testid="activity-button"><Bell size={15} /><span>Activity</span><span className="activity-count">{activityThreads.length}</span></button>
+        <label className="search-box"><Search size={14} /><input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Find a thread" aria-label="Find a thread" /><span className="shortcut">⌘K</span></label>
         <div className="project-list">
-          {filteredProjects.map((project) => <section className="project-group" key={project.name} data-testid={`project-${project.name}`}><header><ChevronDown size={12} /><span>{project.name}</span><small>{project.threads.length}</small></header>{project.threads.map((thread) => <ThreadRow key={thread.paneId} thread={thread} selected={selectedPaneId === thread.paneId} onSelect={() => selectThread(thread)} />)}</section>)}
+          {filteredProjects.map((project) => {
+            const collapsed = !query && collapsedProjects.has(project.name);
+            return <section className={`project-group ${collapsed ? 'collapsed' : ''}`} key={project.name} data-testid={`project-${project.name}`}><button className="project-header" type="button" aria-expanded={!collapsed} data-testid={`project-toggle-${project.name}`} onClick={() => toggleProject(project.name)}><ChevronDown size={12} /><span>{project.name}</span><small>{project.threads.length}</small></button>{!collapsed && project.threads.map((thread) => <ThreadRow key={thread.paneId} thread={thread} selected={selectedPaneId === thread.paneId} onSelect={() => selectThread(thread)} />)}</section>;
+          })}
         </div>
-        <button className={`diagnostics-button ${view === 'diagnostics' ? 'active' : ''}`} onClick={() => setView('diagnostics')}><Gauge size={15} /><span>Diagnostics</span><span className="shortcut">⌘D</span></button>
+        <button className={`diagnostics-button ${view === 'diagnostics' ? 'active' : ''}`} onClick={() => setView((current) => current === 'diagnostics' ? 'workspace' : 'diagnostics')}><Gauge size={15} /><span>Diagnostics</span><span className="shortcut">⌘D</span></button>
       </aside>
 
       <section className="workspace">

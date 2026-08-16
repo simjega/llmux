@@ -90,6 +90,7 @@ export interface LlmuxDesktopApi {
   getTerminalFrame(paneId: string): Promise<TerminalFrame>;
   sendTerminalInput(paneId: string, data: string): Promise<void>;
   sendTerminalKey(paneId: string, key: string): Promise<void>;
+  sendTerminalPaste(paneId: string, data: string): Promise<void>;
   onTerminalOutput(listener: (event: TerminalOutputEvent) => void): () => void;
   onTerminalStreamState(listener: (state: TerminalStreamState) => void): () => void;
   getDiagnostics(): Promise<DiagnosticsSnapshot>;

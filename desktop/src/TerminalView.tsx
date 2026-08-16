@@ -3,6 +3,10 @@ import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import type { ThreadSnapshot } from './shared/types';
 
+const BASE_FONT_SIZE = 13;
+const MIN_FONT_SIZE = 10;
+const MAX_FONT_SIZE = 26;
+
 interface TerminalViewProps {
   thread: ThreadSnapshot;
 }
@@ -28,11 +32,7 @@ export function TerminalView({ thread }: TerminalViewProps) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const blockPaste = (event: React.ClipboardEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    event.stopPropagation();
-    setNotice('Paste is disabled in this preview; use the attached tmux client for safe bracketed paste.');
-  };
+  const focusTerminal = () => terminalRef.current?.textarea?.focus({ preventScroll: true });
 
   useEffect(() => {
     if (!hostRef.current) return undefined;
@@ -44,6 +44,9 @@ export function TerminalView({ thread }: TerminalViewProps) {
     let inputBuffer = '';
     let inputTimer: number | null = null;
     let inputQueue = Promise.resolve();
+    let fitAnimation: number | null = null;
+    let noticeTimer: number | null = null;
+    let grid = { cols: 80, rows: 24 };
     const terminal = new Terminal({
       allowProposedApi: false,
       convertEol: false,
@@ -51,7 +54,7 @@ export function TerminalView({ thread }: TerminalViewProps) {
       cursorStyle: 'bar',
       disableStdin: false,
       fontFamily: '"SFMono-Regular", "Cascadia Code", Menlo, monospace',
-      fontSize: 13,
+      fontSize: BASE_FONT_SIZE,
       lineHeight: 1.26,
       scrollback: 0,
       theme: {
@@ -67,8 +70,33 @@ export function TerminalView({ thread }: TerminalViewProps) {
       },
     });
     terminal.open(hostRef.current);
-    terminal.focus();
     terminalRef.current = terminal;
+    terminal.textarea?.focus({ preventScroll: true });
+
+    const fitGrid = () => {
+      if (disposed || !hostRef.current) return;
+      terminal.options.fontSize = BASE_FONT_SIZE;
+      terminal.resize(grid.cols, grid.rows);
+      const screen = hostRef.current.querySelector<HTMLElement>('.xterm-screen');
+      if (!screen) return;
+      const availableWidth = Math.max(1, hostRef.current.clientWidth - 20);
+      const availableHeight = Math.max(1, hostRef.current.clientHeight - 20);
+      const bounds = screen.getBoundingClientRect();
+      const scale = Math.min(availableWidth / Math.max(1, bounds.width), availableHeight / Math.max(1, bounds.height));
+      const fontSize = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, Math.floor(BASE_FONT_SIZE * scale)));
+      terminal.options.fontSize = fontSize;
+      terminal.resize(grid.cols, grid.rows);
+      hostRef.current.dataset.fontSize = String(fontSize);
+    };
+    const scheduleFit = () => {
+      if (fitAnimation !== null) window.cancelAnimationFrame(fitAnimation);
+      fitAnimation = window.requestAnimationFrame(() => {
+        fitAnimation = null;
+        fitGrid();
+      });
+    };
+    const resizeObserver = new ResizeObserver(scheduleFit);
+    resizeObserver.observe(hostRef.current);
 
     const flushInput = () => {
       if (inputTimer !== null) window.clearTimeout(inputTimer);
@@ -84,6 +112,23 @@ export function TerminalView({ thread }: TerminalViewProps) {
       inputBuffer += data;
       if (inputTimer === null) inputTimer = window.setTimeout(flushInput, 8);
     });
+    const pasteHandler = (event: ClipboardEvent) => {
+      const data = event.clipboardData?.getData('text/plain') ?? '';
+      if (!data) return;
+      event.preventDefault();
+      event.stopPropagation();
+      flushInput();
+      inputQueue = inputQueue.then(() => window.llmux.sendTerminalPaste(thread.paneId, data)).then(() => {
+        if (!disposed) {
+          setNotice('Paste sent');
+          if (noticeTimer !== null) window.clearTimeout(noticeTimer);
+          noticeTimer = window.setTimeout(() => setNotice(null), 2_500);
+        }
+      }).catch((inputError: unknown) => {
+        if (!disposed) setError(inputError instanceof Error ? inputError.message : String(inputError));
+      });
+    };
+    hostRef.current.addEventListener('paste', pasteHandler, true);
 
     const loadFrame = async () => {
       if (disposed || frameInFlight) return;
@@ -94,7 +139,8 @@ export function TerminalView({ thread }: TerminalViewProps) {
       try {
         const frame = await window.llmux.getTerminalFrame(thread.paneId);
         if (disposed) return;
-        if (terminal.cols !== frame.width || terminal.rows !== frame.height) terminal.resize(frame.width, frame.height);
+        grid = { cols: frame.width, rows: frame.height };
+        fitGrid();
         if (hostRef.current) {
           hostRef.current.dataset.cols = String(frame.width);
           hostRef.current.dataset.rows = String(frame.height);
@@ -153,7 +199,11 @@ export function TerminalView({ thread }: TerminalViewProps) {
       disposed = true;
       flushInput();
       if (frameTimer !== null) window.clearTimeout(frameTimer);
+      if (fitAnimation !== null) window.cancelAnimationFrame(fitAnimation);
+      if (noticeTimer !== null) window.clearTimeout(noticeTimer);
+      resizeObserver.disconnect();
       hostRef.current?.removeEventListener('keydown', keydownHandler, true);
+      hostRef.current?.removeEventListener('paste', pasteHandler, true);
       inputSubscription.dispose();
       outputSubscription();
       streamStateSubscription();
@@ -170,8 +220,8 @@ export function TerminalView({ thread }: TerminalViewProps) {
         <span className="terminal-latency">{error ? 'stream unavailable' : `live · ${lastLatency} ms`}</span>
       </div>
       {error && <div className="terminal-error">{error}</div>}
-      {!error && notice && <div className="terminal-error">{notice}</div>}
-      <div className="terminal-host" ref={hostRef} onPasteCapture={blockPaste} onClick={() => terminalRef.current?.focus()} />
+      {!error && notice && <div className="terminal-notice">{notice}</div>}
+      <div className="terminal-host" ref={hostRef} onClick={focusTerminal} />
     </section>
   );
 }

@@ -13,12 +13,13 @@
 }
 
 * { box-sizing: border-box; }
-html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+#root { position: fixed; inset: 0; overflow: clip; }
 button, input { font: inherit; }
 button { color: inherit; }
 
 .app-shell { display: grid; grid-template-columns: 292px minmax(0, 1fr); width: 100%; height: 100%; background: #11120f; }
-.sidebar { position: relative; display: flex; flex-direction: column; min-width: 0; padding: 42px 10px 10px; background: var(--sidebar); border-right: 1px solid var(--border); }
+.sidebar { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; padding: 42px 10px 10px; background: var(--sidebar); border-right: 1px solid var(--border); }
 .drag-region, .workspace-drag-region { position: absolute; inset: 0 0 auto; height: 38px; -webkit-app-region: drag; }
 .brand-row { display: grid; grid-template-columns: 32px 1fr 10px; align-items: center; gap: 10px; padding: 2px 8px 15px; }
 .brand-mark { display: grid; place-items: center; width: 32px; height: 32px; border: 1px solid #4d5939; border-radius: 9px; background: linear-gradient(145deg, #2d3522, #1b2016); color: var(--lime); font-family: "SFMono-Regular", Menlo, monospace; font-size: 13px; font-weight: 700; }
@@ -37,9 +38,12 @@ button { color: inherit; }
 .search-box input { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: #e5e5df; font-size: 12px; }
 .project-list { flex: 1; min-height: 0; overflow: auto; scrollbar-width: thin; scrollbar-color: #34372e transparent; }
 .project-group { margin-bottom: 13px; }
-.project-group header { display: grid; grid-template-columns: 14px 1fr auto; align-items: center; gap: 4px; padding: 5px 8px; color: #7f8279; font-size: 10px; font-weight: 700; letter-spacing: .085em; text-transform: uppercase; }
-.project-group header span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.project-group header small { font-size: 9px; font-weight: 600; }
+.project-header { display: grid; grid-template-columns: 14px 1fr auto; align-items: center; gap: 4px; width: 100%; padding: 5px 8px; border: 0; border-radius: 5px; background: transparent; color: #7f8279; font-size: 10px; font-weight: 700; letter-spacing: .085em; text-align: left; text-transform: uppercase; cursor: pointer; }
+.project-header:hover { background: #1c1e18; color: #a2a69a; }
+.project-header svg { transition: transform 120ms ease; }
+.project-group.collapsed .project-header svg { transform: rotate(-90deg); }
+.project-header span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-header small { font-size: 9px; font-weight: 600; }
 .thread-row { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; align-items: center; gap: 4px; width: 100%; min-height: 42px; padding: 5px 8px; border-radius: 7px; text-align: left; }
 .thread-row:hover { background: #1c1e18; }
 .thread-row.selected { background: #282c20; box-shadow: inset 2px 0 var(--lime); }
@@ -81,9 +85,10 @@ button { color: inherit; }
 .terminal-dot { width: 8px; height: 8px; margin-right: 6px; border-radius: 50%; background: #555; }.terminal-dot.red { background: #d8655e; }.terminal-dot.amber { background: #d0a44d; }.terminal-dot.green { background: #78aa5a; }
 .terminal-label { margin-left: 6px; color: #8c8f84; font-family: "SFMono-Regular", Menlo, monospace; font-size: 10px; }
 .terminal-latency { margin-left: auto; color: #595c54; font-family: "SFMono-Regular", Menlo, monospace; font-size: 9px; }
-.terminal-host { width: 100%; height: calc(100% - 36px); padding: 12px 10px 8px; }
+.terminal-host { width: 100%; height: calc(100% - 36px); padding: 12px 10px 8px; overflow: auto; scrollbar-width: thin; scrollbar-color: #34372e transparent; }
 .terminal-host .xterm { height: 100%; }
 .terminal-error { position: absolute; z-index: 3; top: 46px; right: 10px; max-width: 420px; padding: 7px 10px; border: 1px solid #663b38; border-radius: 6px; background: #321f1dcc; color: #ff9b92; font-size: 10px; }
+.terminal-notice { position: absolute; z-index: 3; top: 46px; right: 10px; max-width: 420px; padding: 7px 10px; border: 1px solid #50623a; border-radius: 6px; background: #22301dcc; color: #ccec9b; font-size: 10px; }
 
 .empty-state, .empty-activity { display: grid; place-items: center; align-content: center; height: 100%; color: #777b70; text-align: center; }.empty-state h2 { margin: 12px 0 4px; color: #d6d7d0; font-size: 17px; }.empty-state p { max-width: 520px; font-size: 12px; }
 .activity-view, .inspector { height: 100%; overflow: auto; padding: 78px 48px 48px; }

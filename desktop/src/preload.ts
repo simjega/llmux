@@ -6,6 +6,7 @@ const api: LlmuxDesktopApi = {
   getTerminalFrame: (paneId) => ipcRenderer.invoke('llmux:terminal-frame', paneId),
   sendTerminalInput: (paneId, data) => ipcRenderer.invoke('llmux:terminal-input', paneId, data),
   sendTerminalKey: (paneId, key) => ipcRenderer.invoke('llmux:terminal-key', paneId, key),
+  sendTerminalPaste: (paneId, data) => ipcRenderer.invoke('llmux:terminal-paste', paneId, data),
   onTerminalOutput: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, output: TerminalOutputEvent) => listener(output);
     ipcRenderer.on('llmux:terminal-output', handler);

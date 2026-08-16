@@ -63,6 +63,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('llmux:terminal-frame', (event, paneId: string) => { assertTrustedSender(event); return tmux.terminalFrame(paneId); });
   ipcMain.handle('llmux:terminal-input', (event, paneId: string, data: string) => { assertTrustedSender(event); return tmux.sendInput(paneId, data); });
   ipcMain.handle('llmux:terminal-key', (event, paneId: string, key: string) => { assertTrustedSender(event); return tmux.sendKey(paneId, key); });
+  ipcMain.handle('llmux:terminal-paste', (event, paneId: string, data: string) => { assertTrustedSender(event); return tmux.sendPaste(paneId, data); });
   ipcMain.handle('llmux:diagnostics', (event) => { assertTrustedSender(event); return telemetry.diagnostics(tmux.getVersion()); });
   ipcMain.handle('llmux:reveal-logs', (event) => { assertTrustedSender(event); return shell.showItemInFolder(telemetry.logPath); });
   ipcMain.on('llmux:renderer-event', (ipcEvent, event: string, details?: Record<string, unknown>) => {

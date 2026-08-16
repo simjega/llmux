@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseThreads } from '../src/main/tmux';
+import { parseThreads, runCommandWithInput } from '../src/main/tmux';
 
 const row = (fields: Partial<Record<number, string>> = {}) => {
   const values = ['%1', 'build-desktop', 'codex', 'llmux', '/tmp/project', 'busy', 'watch', 'feature/desktop', '', '0', '0', '0', '20', '1', '1', '0', '0'];
@@ -37,5 +37,15 @@ describe('parseThreads', () => {
   it('orders explicit ranks before names', () => {
     const threads = parseThreads([row({ 0: '%2', 1: 'z-last', 12: '50' }), row({ 0: '%3', 1: 'first', 12: '10' })].join('\n'));
     expect(threads.map((thread) => thread.name)).toEqual(['first', 'z-last']);
+  });
+});
+
+describe('runCommandWithInput', () => {
+  it('rejects cleanly when the child closes stdin before a large write completes', async () => {
+    await expect(runCommandWithInput(
+      process.execPath,
+      ['-e', 'process.stdin.destroy(); setTimeout(() => process.exit(0), 100)'],
+      'x'.repeat(8 * 1024 * 1024),
+    )).rejects.toThrow();
   });
 });

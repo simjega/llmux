@@ -23,6 +23,43 @@ const SNAPSHOT_FORMAT = [
   '#{pane_active}', '#{window_active}', '#{@llmux_sidebar}', '#{@llmux_parked_anchor}',
 ].join(FIELD_SEPARATOR);
 
+export const runCommandWithInput = (executable: string, args: string[], input: string): Promise<void> => new Promise((resolve, reject) => {
+  const child = spawn(executable, args, { env: process.env, stdio: ['pipe', 'ignore', 'ignore'] });
+  let processError: Error | null = null;
+  let stdinError: Error | null = null;
+  let timedOut = false;
+  let forceKillTimer: NodeJS.Timeout | null = null;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill('SIGTERM');
+    forceKillTimer = setTimeout(() => {
+      if (child.exitCode === null) child.kill('SIGKILL');
+    }, 250);
+  }, 3_000);
+  child.on('error', (error) => {
+    processError = error;
+  });
+  child.stdin.on('error', (error) => {
+    stdinError = error;
+    child.kill('SIGTERM');
+  });
+  child.on('close', (code) => {
+    clearTimeout(timer);
+    if (forceKillTimer) clearTimeout(forceKillTimer);
+    if (timedOut) reject(new Error('tmux input command timed out'));
+    else if (processError) reject(processError);
+    else if (stdinError) reject(stdinError);
+    else if (code === 0) resolve();
+    else reject(new Error('tmux input command failed'));
+  });
+  try {
+    child.stdin.end(input);
+  } catch (error) {
+    stdinError = error instanceof Error ? error : new Error('tmux stdin failed');
+    child.kill('SIGTERM');
+  }
+});
+
 const normalizeStatus = (status: string): ThreadStatus => {
   if (status === 'waiting') return 'idle';
   if (['blocked', 'perm', 'busy', 'idle', 'working'].includes(status)) return status as ThreadStatus;
@@ -83,6 +120,7 @@ export class TmuxClient {
   private tmuxVersion = 'unavailable';
   private tmuxExecutable = 'tmux';
   private inputQueues = new Map<string, Promise<void>>();
+  private pasteSequence = 0;
   private knownPaneIds = new Set<string>();
   private controlProcess: ChildProcessWithoutNullStreams | null = null;
   private controlBuffer = '';
@@ -104,6 +142,10 @@ export class TmuxClient {
       env: process.env,
     });
     return stdout;
+  }
+
+  private tmuxWithInput(args: string[], input: string): Promise<void> {
+    return runCommandWithInput(this.tmuxExecutable, args, input);
   }
 
   async initialize() {
@@ -311,6 +353,33 @@ export class TmuxClient {
       } catch {
         this.telemetry.recordFailure('tmux.key.failed', new Error('tmux send-keys failed'), { paneId, key });
         throw new Error('Unable to send terminal key');
+      }
+    });
+    this.inputQueues.set(paneId, next);
+    try {
+      await next;
+    } finally {
+      if (this.inputQueues.get(paneId) === next) this.inputQueues.delete(paneId);
+    }
+  }
+
+
+  async sendPaste(paneId: string, data: string): Promise<void> {
+    this.assertKnownPane(paneId);
+    if (typeof data !== 'string' || !data || Buffer.byteLength(data, 'utf8') > 1024 * 1024) {
+      throw new Error('Invalid terminal paste');
+    }
+    const terminalData = data.replace(/\r?\n/g, '\r');
+    const bufferName = `llmux-desktop-${process.pid}-${++this.pasteSequence}`;
+    const previous = this.inputQueues.get(paneId) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(async () => {
+      try {
+        await this.tmuxWithInput(['load-buffer', '-b', bufferName, '-'], terminalData);
+        await this.tmux(['paste-buffer', '-p', '-r', '-d', '-b', bufferName, '-t', paneId]);
+      } catch {
+        await this.tmux(['delete-buffer', '-b', bufferName]).catch(() => undefined);
+        this.telemetry.recordFailure('tmux.paste.failed', new Error('tmux paste-buffer failed'), { paneId });
+        throw new Error('Unable to paste terminal input');
       }
     });
     this.inputQueues.set(paneId, next);
