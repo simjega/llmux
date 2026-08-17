@@ -57,8 +57,11 @@ Usage:
                                                 is offered a Tolaria project to keep its
                                                 notes in; --tolaria <slug|new|none> answers
                                                 that up front.
-  llmux prompt "<prompt>" [--tool <tool>] [--worktree] [--name <slug>]
-                                                Auto-name + start a session with the given prompt
+  llmux prompt "<prompt>" [--tool <tool>] [--worktree] [--name <slug>] [--background]
+                                                Auto-name + start a session with the given prompt.
+                                                --background leaves the current thread visible.
+  llmux slot-cleanup [status|now]               Show the daily Owner slot cleanup schedule or
+                                                kick it off now in a reusable background thread.
   llmux resume [--tool <tool>] [--all]          Pick a past session to resume (hides entries >14d old; --all shows all)
   llmux grab <name> [pane]                      Move an existing tmux pane into llmux
   llmux rm [name] [--force]                     Remove pane (releases owned slot; refuses on dirty slot unless --force)
@@ -1179,9 +1182,22 @@ get_pinned_pane() {
 # Echoes the new pane id; callers run apply_layout afterwards.
 spawn_llm_pane() {
   local dir="$1"
-  local anchor
+  local detached="${2:-false}" anchor
+  if $detached && sidebar_enabled; then
+    local pane
+    pane=$(tmux new-window -d -t "$SESSION:" -n "_spawn-$$-$RANDOM" \
+      -c "$dir" -P -F '#{pane_id}') || return 1
+    if ! park_pane "$pane"; then
+      tmux kill-pane -t "$pane" 2>/dev/null || true
+      return 1
+    fi
+    printf '%s\n' "$pane"
+    return 0
+  fi
   anchor=$(get_terminal_pane)
-  tmux split-window -t "${anchor:-$SESSION}" -v -c "$dir" -P -F '#{pane_id}'
+  local args=()
+  $detached && args+=(-d)
+  tmux split-window ${args[@]+"${args[@]}"} -t "${anchor:-$SESSION}" -v -c "$dir" -P -F '#{pane_id}'
 }
 
 # Re-layout: top row = terminal (left) + pinned (right), LLM panes tiled below.
@@ -4307,13 +4323,14 @@ cmd_add() {
 }
 
 cmd_prompt() {
-  local prompt="" tool_override="" use_worktree=false name_override=""
+  local prompt="" tool_override="" use_worktree=false name_override="" background=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --tool) tool_override="${2:?--tool requires a value}"; shift 2 ;;
       --worktree|--wt) use_worktree=true; shift ;;
       --name) name_override="${2:?--name requires a value}"; shift 2 ;;
+      --background) background=true; shift ;;
       *)
         if [[ -z "$prompt" ]]; then prompt="$1"
         else prompt+=" $1"
@@ -4326,7 +4343,7 @@ cmd_prompt() {
   if [[ -z "$prompt" ]] && ! [ -t 0 ]; then
     prompt=$(cat)
   fi
-  [[ -z "$prompt" ]] && { echo "Usage: llmux prompt \"<prompt>\" [--tool <tool>] [--worktree] [--name <slug>]"; exit 1; }
+  [[ -z "$prompt" ]] && { echo "Usage: llmux prompt \"<prompt>\" [--tool <tool>] [--worktree] [--name <slug>] [--background]"; exit 1; }
 
   # --- Generate session slug ---
   local name="$name_override"
@@ -4363,6 +4380,15 @@ cmd_prompt() {
 
   ensure_session
 
+  local previous_pane=""
+  if $background; then
+    if sidebar_enabled; then
+      previous_pane=$(get_active_thread_pane)
+    else
+      previous_pane=$(tmux display-message -p -t "$SESSION" '#{pane_id}' 2>/dev/null || true)
+    fi
+  fi
+
   if tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}' 2>/dev/null | grep -qxF "$name"; then
     echo "Error: pane '$name' already exists" >&2
     exit 1
@@ -4373,11 +4399,13 @@ cmd_prompt() {
   fi
 
   local new_pane
-  new_pane=$(spawn_llm_pane "$dir")
+  new_pane=$(spawn_llm_pane "$dir" "$background")
   tmux select-pane -t "$new_pane" -T "$name"
   tmux set-option -p -t "$new_pane" @llmux_name "$name"
   tag_pane_worktree "$new_pane" "$dir"
-  apply_layout
+  if ! $background || ! sidebar_enabled; then
+    apply_layout
+  fi
   launch_tool_in_pane "$new_pane" "$tool_override" "$name"
 
   # After tool is ready (and /rename has fired at t≈3s), paste the prompt + Enter
@@ -4392,7 +4420,143 @@ cmd_prompt() {
   disown
 
   echo "Created pane '$name' in $dir with prompt"
-  attach_to_pane "$name"
+  if $background; then
+    [[ -n "$previous_pane" ]] && tmux select-pane -t "$previous_pane" 2>/dev/null || true
+    render_sidebar 2>/dev/null || true
+  elif sidebar_enabled; then
+    cmd_switch "$name"
+  else
+    attach_to_pane "$name"
+  fi
+}
+
+slot_cleanup_last() {
+  [[ -f "$PAUSED_FILE" ]] || return 0
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+d = _load(sys.argv[1])
+print((d.get("maintenance") or {}).get("slot_cleanup_at", ""))
+' "$PAUSED_FILE"
+}
+
+set_slot_cleanup_last() {
+  local timestamp="$1"
+  mkdir -p "$CONFIG_DIR"
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+path, timestamp = sys.argv[1], int(sys.argv[2])
+_lk = _lock(path)
+d = _load(path)
+d.setdefault("maintenance", {})["slot_cleanup_at"] = timestamp
+_save(path, d)
+' "$PAUSED_FILE" "$timestamp"
+}
+
+cmd_slot_cleanup() {
+  local action="${1:-status}"
+  local interval_hours="${LLMUX_SLOT_CLEANUP_HOURS:-24}"
+  [[ "$interval_hours" =~ ^[0-9]+$ ]] \
+    || { echo "Error: LLMUX_SLOT_CLEANUP_HOURS must be a non-negative integer" >&2; return 1; }
+
+  local last now interval
+  last=$(slot_cleanup_last)
+  now=$(date +%s)
+  interval=$(( interval_hours * 3600 ))
+
+  if [[ "$action" == "status" ]]; then
+    if (( interval == 0 )); then
+      echo "Daily slot cleanup: disabled (LLMUX_SLOT_CLEANUP_HOURS=0)"
+    elif [[ "$last" =~ ^[0-9]+$ ]]; then
+      echo "Slot cleanup: every ${interval_hours}h; last kicked off $(( now - last ))s ago"
+    else
+      echo "Slot cleanup: every ${interval_hours}h; not run in this session yet"
+    fi
+    return 0
+  fi
+  [[ "$action" == "now" || "$action" == "_tick" ]] \
+    || { echo "Usage: llmux slot-cleanup [status|now]" >&2; return 1; }
+
+  local lock="${TMPDIR:-/tmp}/llmux-slot-cleanup-${SESSION}.lock" waited=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    local lock_age
+    lock_age=$(python3 -c "
+import os,time
+try: print(int(time.time() - os.path.getmtime('$lock')))
+except Exception: print(999)" 2>/dev/null || echo 999)
+    if (( lock_age > 30 )); then
+      rmdir "$lock" 2>/dev/null || true
+      continue
+    fi
+    (( waited++ ))
+    (( waited > 20 )) && return 0
+    python3 -c 'import time; time.sleep(0.05)' 2>/dev/null || true
+  done
+  trap 'rmdir "${lock:-}" 2>/dev/null || true; trap - RETURN' RETURN
+
+  # Re-read under the lock: a manual `now` and the watcher tick may have raced
+  # before either acquired it.
+  last=$(slot_cleanup_last)
+  if [[ "$action" == "_tick" ]]; then
+    (( interval > 0 )) || return 0
+    if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < interval )); then
+      return 0
+    fi
+  fi
+
+  local owner_root="${LLMUX_OWNER_ROOT:-$HOME/owner/Owner}"
+  [[ -d "$owner_root/.workspaces" ]] \
+    || { echo "Slot cleanup deferred: Owner slot pool not found at $owner_root" >&2; return 0; }
+  owner_root=$(cd "$owner_root" && pwd -P)
+
+  local cleanup_name="slot-cleanup" cleanup_pane="" cleanup_done="" cleanup_status=""
+  local cleanup_tool="" cleanup_cwd="" cleanup_owner=""
+  local pane_id pane_name done_at pane_status pane_tool pane_cwd pane_owner
+  while IFS='|' read -r pane_id pane_name done_at pane_status pane_tool pane_cwd pane_owner; do
+    if [[ "$pane_name" == "$cleanup_name" ]]; then
+      cleanup_pane="$pane_id"
+      cleanup_done="$done_at"
+      cleanup_status="$pane_status"
+      cleanup_tool="$pane_tool"
+      cleanup_cwd="$pane_cwd"
+      cleanup_owner="$pane_owner"
+      break
+    fi
+  done < <(tmux list-panes -s -t "$SESSION" \
+    -F '#{pane_id}|#{@llmux_name}|#{@llmux_done_at}|#{@llmux_status}|#{@llmux_tool}|#{pane_current_path}|#{@llmux_maintenance}' 2>/dev/null)
+
+  local prompt="Use the slot-cleanup skill. From $owner_root, inspect the existing owner-wt slot pool and reuse it: release only safe finished unclaimed slots; never create or remove slots; never touch active, recent, dirty, open-PR, or no-PR work; report every release and every held slot with the reason."
+  if [[ -n "$cleanup_pane" ]]; then
+    if [[ "$cleanup_tool" != "claude" || "$cleanup_cwd" != "$owner_root" \
+          || ( -n "$cleanup_owner" && "$cleanup_owner" != "slot-cleanup" ) ]]; then
+      echo "Slot cleanup deferred: '$cleanup_name' exists but is not the scheduler-owned thread" >&2
+      return 0
+    fi
+    if [[ -z "$cleanup_owner" ]]; then
+      tmux set-option -p -t "$cleanup_pane" @llmux_maintenance slot-cleanup 2>/dev/null \
+        || return 1
+    fi
+    if [[ -z "$cleanup_done" || "$cleanup_status" != "idle" ]]; then
+      echo "Slot cleanup deferred: '$cleanup_name' is still active" >&2
+      return 0
+    fi
+    TMUX_PANE="" cmd_send "$cleanup_name" "$prompt" >/dev/null || return 1
+  else
+    if read_paused | grep -q "^${cleanup_name}|"; then
+      echo "Slot cleanup deferred: '$cleanup_name' is paused; resume or remove it first" >&2
+      return 0
+    fi
+    (cd "$owner_root" && cmd_prompt "$prompt" --tool claude --name "$cleanup_name" --background) \
+      >/dev/null || return 1
+    cleanup_pane=$(tmux list-panes -s -t "$SESSION" \
+      -F '#{pane_id}|#{@llmux_name}' 2>/dev/null \
+      | awk -F'|' -v name="$cleanup_name" '$2 == name { print $1; exit }')
+    [[ -n "$cleanup_pane" ]] || return 1
+    tmux set-option -p -t "$cleanup_pane" @llmux_maintenance slot-cleanup 2>/dev/null || return 1
+  fi
+
+  set_slot_cleanup_last "$now" || return 1
+  tmux set-option -t "$SESSION" @llmux_slot_cleanup_at "$now" 2>/dev/null || true
+  echo "Slot cleanup kicked off in background thread '$cleanup_name'"
 }
 
 cmd_rm() {
@@ -5429,7 +5593,8 @@ cmd_send() {
 
   tmux send-keys -t "$hit_pane" -l "$label $flat" 2>/dev/null \
     || { echo "Error: could not write to $hit_name" >&2; return 1; }
-  tmux send-keys -t "$hit_pane" Enter 2>/dev/null || true
+  tmux send-keys -t "$hit_pane" Enter 2>/dev/null \
+    || { echo "Error: could not submit message to $hit_name" >&2; return 1; }
   echo "→ $hit_name${hit_tool:+ ($hit_tool)}: $flat"
 }
 
@@ -7130,6 +7295,7 @@ esac
 case "$command" in
   add)       cmd_add "$@" ;;
   prompt)    cmd_prompt "$@" ;;
+  slot-cleanup) cmd_slot_cleanup "$@" ;;
   dash)      cmd_dash "$@" ;;
   resume)    cmd_resume "$@" ;;
   grab)      cmd_grab "$@" ;;

@@ -82,6 +82,14 @@ nickname when it fits. These rows are live status, not threads: they appear with
 watcher tick (about five seconds), disappear after completion or interruption, and are
 intentionally inert when clicked because no tmux pane exists behind them.
 
+llmux also schedules an Owner slot-cleanup thread every 24 hours. It runs from the
+base Owner checkout without claiming a slot, reuses the existing `slot-cleanup`
+thread after it finishes, and follows the guarded `slot-cleanup` skill: only clean,
+unclaimed work with a finished PR is eligible. Active, recent, dirty, open-PR, and
+no-PR slots are held for review. Use `llmux slot-cleanup status` to inspect the
+schedule or `llmux slot-cleanup now` to kick it off immediately. Set
+`LLMUX_SLOT_CLEANUP_HOURS=0` in the watcher environment to disable it.
+
 **Status flags. A flag means "look at this" — so most threads carry none:**
 
 | flag | state | means |

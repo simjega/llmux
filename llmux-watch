@@ -544,6 +544,13 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
     (llmux _pr-refresh >/dev/null 2>&1 || true) &
   fi
 
+  # Check the daily Owner slot-maintenance schedule once a minute. The command
+  # stores its last successful kick-off in a session option, reuses the existing
+  # cleanup thread when idle, and creates no owner-wt slot of its own.
+  if [ $((cycle % 12)) -eq 1 ]; then
+    (llmux slot-cleanup _tick >/dev/null 2>&1 || true) &
+  fi
+
   # Mirror the live session to disk every ~60s. tmux pane options die with the
   # server, so without this a crash loses every running thread -- names, projects,
   # and the claude session ids that make them resumable.
