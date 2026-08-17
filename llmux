@@ -2516,10 +2516,15 @@ render_sidebar() {
 
   # Kept out of list_threads on purpose: its positional field contract has a dozen
   # read sites of varying arity, and widening it would touch every one.
-  local done_map codex_parent_map codex_agents_raw
+  local done_map codex_parent_map codex_agents_raw codex_agents_at
   done_map=$({ tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_done_at}' 2>/dev/null; } || true)
   codex_parent_map=$({ tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_codex_session}' 2>/dev/null; } || true)
   codex_agents_raw=$(tmux show-option -t "$SESSION" -qv @llmux_codex_agents 2>/dev/null || true)
+  codex_agents_at=$(tmux show-option -t "$SESSION" -qv @llmux_codex_agents_at 2>/dev/null || true)
+  if [[ -n "$codex_agents_raw" ]] \
+     && { [[ ! "$codex_agents_at" =~ ^[0-9]+$ ]] || (( now_ts - codex_agents_at > 15 )); }; then
+    codex_agents_raw=""
+  fi
   for key in ${sections[@]+"${sections[@]}"}; do
     [[ -z "$key" ]] && continue
     project_meta "$key" >/dev/null; meta="$R_PROJECT_META"
