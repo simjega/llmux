@@ -4524,7 +4524,7 @@ except Exception: print(999)" 2>/dev/null || echo 999)
   done < <(tmux list-panes -s -t "$SESSION" \
     -F '#{pane_id}|#{@llmux_name}|#{@llmux_done_at}|#{@llmux_status}|#{@llmux_tool}|#{pane_current_path}|#{@llmux_maintenance}' 2>/dev/null)
 
-  local prompt="Use the slot-cleanup skill. From $owner_root, inspect the existing owner-wt slot pool and reuse it: release only safe finished unclaimed slots; never create or remove slots; never touch active, recent, dirty, open-PR, or no-PR work; report every release and every held slot with the reason."
+  local prompt="Use the slot-cleanup skill. From $owner_root, inspect the existing owner-wt slot pool and reuse it: release only safe finished unclaimed slots; never create or remove slots; never touch active, recent, dirty, open-PR, or no-PR work; report every release and every held slot with the reason. Do not ask questions, request approval, suggest stopping processes, or leave follow-up input; report the current safe result and finish idle."
   if [[ -n "$cleanup_pane" ]]; then
     if [[ "$cleanup_tool" != "claude" || "$cleanup_cwd" != "$owner_root" \
           || ( -n "$cleanup_owner" && "$cleanup_owner" != "slot-cleanup" ) ]]; then
