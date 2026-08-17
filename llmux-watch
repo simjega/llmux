@@ -215,6 +215,280 @@ if total:
 PY
 }
 
+# Publish the Codex sub-agents that are actively running under each Codex pane.
+#
+# Codex's state db has the durable parent/child graph and display metadata, but
+# thread_spawn_edges.status is structural (it remains "open" after completion).
+# The child rollout is the lifecycle authority: its latest task_started /
+# task_complete / turn_aborted event says whether that agent is live.
+#
+# This runs once per 5s watcher tick for ALL Codex panes. One ps snapshot, one
+# lsof call and one sqlite connection keep that work out of the 2s paint loop.
+# The incremental rollout cache is a disposable tmux option; it remembers byte
+# offsets so a long-running agent's transcript is never rescanned from byte zero.
+refresh_codex_agents() {
+  local pane_rows="$1"
+  local codex_root="${CODEX_HOME:-$HOME/.codex}"
+  local codex_db="$codex_root/state_5.sqlite"
+  local lock_dir="$codex_root/thread-writer-locks"
+
+  if [ ! -f "$codex_db" ] || [ ! -d "$lock_dir" ]; then
+    tmux set-option -t "$SESSION" @llmux_codex_agents "" 2>/dev/null || true
+    return 0
+  fi
+
+  if ! CODEX_PANE_ROWS="$pane_rows" python3 - "$SESSION" "$codex_db" "$lock_dir" <<'PY' 2>/dev/null
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+
+session, db_path, lock_dir = sys.argv[1:4]
+uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+panes = []
+for line in os.environ.get("CODEX_PANE_ROWS", "").splitlines():
+    fields = line.split("|")
+    if len(fields) < 6 or fields[2] != "codex":
+        continue
+    try:
+        pane_pid = int(fields[5])
+    except ValueError:
+        continue
+    cached_root = fields[11] if len(fields) > 11 else ""
+    panes.append({"pane": fields[0], "pid": pane_pid, "cached": cached_root})
+
+if not panes:
+    subprocess.run(
+        ["tmux", "set-option", "-t", session, "@llmux_codex_agents", ""],
+        check=False,
+    )
+    sys.exit(0)
+
+children = {}
+process_discovery_ok = False
+try:
+    proc_result = subprocess.run(
+        ["ps", "-axo", "pid=,ppid="],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    proc_rows = proc_result.stdout.splitlines()
+    process_discovery_ok = True
+except (OSError, subprocess.TimeoutExpired):
+    proc_rows = []
+
+for row in proc_rows:
+    parts = row.split()
+    if len(parts) != 2:
+        continue
+    try:
+        pid, ppid = map(int, parts)
+    except ValueError:
+        continue
+    children.setdefault(ppid, []).append(pid)
+
+def descendants(root):
+    seen = set()
+    pending = [root]
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        pending.extend(children.get(pid, ()))
+    return seen
+
+for pane in panes:
+    pane["processes"] = descendants(pane["pid"])
+
+all_pids = sorted({pid for pane in panes for pid in pane["processes"]})
+locks_by_pid = {}
+lsof_discovery_ok = False
+if all_pids:
+    try:
+        lsof_result = subprocess.run(
+            ["lsof", "-a", "-p", ",".join(map(str, all_pids)), "+d", lock_dir, "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+        lsof_out = lsof_result.stdout
+        lsof_discovery_ok = True
+    except (OSError, subprocess.TimeoutExpired):
+        lsof_out = ""
+    current_pid = None
+    for line in lsof_out.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            current_pid = int(line[1:])
+        elif current_pid is not None and line.startswith("n"):
+            match = uuid_re.search(os.path.basename(line[1:]))
+            if match:
+                locks_by_pid.setdefault(current_pid, set()).add(match.group(0))
+
+try:
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
+except sqlite3.Error:
+    subprocess.run(
+        ["tmux", "set-option", "-t", session, "@llmux_codex_agents", ""],
+        check=False,
+    )
+    sys.exit(0)
+
+def held_thread_ids(pane):
+    held = set()
+    for pid in pane["processes"]:
+        held.update(locks_by_pid.get(pid, ()))
+    return held
+
+roots = {}
+process_binding_authoritative = process_discovery_ok and lsof_discovery_ok
+for pane in panes:
+    held = held_thread_ids(pane)
+    root = ""
+    if held:
+        marks = ",".join("?" for _ in held)
+        rows = con.execute(
+            f"SELECT id, thread_source, source FROM threads WHERE id IN ({marks})",
+            tuple(held),
+        ).fetchall()
+        candidates = [
+            thread_id
+            for thread_id, thread_source, source in rows
+            if thread_source == "user" or source == "cli"
+        ]
+        if pane["cached"] in candidates:
+            root = pane["cached"]
+        elif len(candidates) == 1:
+            root = candidates[0]
+    if not root and pane["cached"] and not process_binding_authoritative:
+        root = pane["cached"]
+    if root:
+        roots[pane["pane"]] = root
+        subprocess.run(
+            ["tmux", "set-option", "-p", "-t", pane["pane"], "@llmux_codex_session", root],
+            check=False,
+        )
+    elif process_binding_authoritative:
+        subprocess.run(
+            ["tmux", "set-option", "-p", "-t", pane["pane"], "@llmux_codex_session", ""],
+            check=False,
+        )
+
+try:
+    cache_raw = subprocess.run(
+        ["tmux", "show-option", "-t", session, "-qv", "@llmux_codex_agent_cache"],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    ).stdout
+    cache = json.loads(cache_raw) if cache_raw.strip() else {}
+except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+    cache = {}
+
+next_cache = {}
+active_rows = []
+lifecycle = {"task_started", "task_complete", "turn_aborted"}
+
+for root in dict.fromkeys(roots.values()):
+    descendants_rows = con.execute(
+        """
+        WITH RECURSIVE descendants(id, depth) AS (
+          SELECT child_thread_id, 1
+          FROM thread_spawn_edges
+          WHERE parent_thread_id = ?
+          UNION ALL
+          SELECT edge.child_thread_id, descendants.depth + 1
+          FROM thread_spawn_edges edge
+          JOIN descendants ON edge.parent_thread_id = descendants.id
+        )
+        SELECT descendants.depth, threads.id, threads.rollout_path,
+               COALESCE(threads.agent_nickname, ''),
+               COALESCE(threads.agent_role, ''),
+               COALESCE(threads.agent_path, '')
+        FROM descendants
+        JOIN threads ON threads.id = descendants.id
+        ORDER BY threads.created_at_ms, threads.id
+        """,
+        (root,),
+    ).fetchall()
+
+    for depth, child_id, rollout_path, nickname, role, agent_path in descendants_rows:
+        old = cache.get(child_id) if isinstance(cache.get(child_id), dict) else {}
+        offset = old.get("offset", 0)
+        state = old.get("state", "")
+        if old.get("path") != rollout_path:
+            offset, state = 0, ""
+        try:
+            size = os.path.getsize(rollout_path)
+            if not isinstance(offset, int) or offset < 0 or offset > size:
+                offset, state = 0, ""
+            with open(rollout_path, "rb") as rollout:
+                rollout.seek(offset)
+                chunk = rollout.read()
+            complete_at = chunk.rfind(b"\n")
+            if complete_at >= 0:
+                complete = chunk[: complete_at + 1]
+                offset += complete_at + 1
+                for raw in complete.splitlines():
+                    try:
+                        event = json.loads(raw)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if event.get("type") != "event_msg":
+                        continue
+                    event_type = (event.get("payload") or {}).get("type")
+                    if event_type in lifecycle:
+                        state = event_type
+        except OSError:
+            continue
+
+        next_cache[child_id] = {
+            "path": rollout_path,
+            "offset": offset,
+            "state": state,
+        }
+        if state == "task_started":
+            clean = lambda value: re.sub(r"[|\t\r\n]", " ", value or "")
+            active_rows.append(
+                "|".join(
+                    [
+                        root,
+                        str(depth),
+                        clean(nickname),
+                        clean(agent_path),
+                    ]
+                )
+            )
+
+con.close()
+subprocess.run(
+    ["tmux", "set-option", "-t", session, "@llmux_codex_agents", "\n".join(active_rows)],
+    check=False,
+)
+subprocess.run(
+    [
+        "tmux",
+        "set-option",
+        "-t",
+        session,
+        "@llmux_codex_agent_cache",
+        json.dumps(next_cache, separators=(",", ":")),
+    ],
+    check=False,
+)
+PY
+  then
+    tmux set-option -t "$SESSION" @llmux_codex_agents "" 2>/dev/null || true
+  fi
+}
+
 cycle=0
 while tmux has-session -t "$SESSION" 2>/dev/null; do
   cycle=$((cycle + 1))
@@ -236,7 +510,10 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
     (llmux _snapshot >/dev/null 2>&1 || true) &
   fi
 
-  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor asking visible; do
+  pane_rows=$(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}|#{?#{&&:#{pane_active},#{window_active}},1,}|#{@llmux_codex_session}' 2>/dev/null)
+  refresh_codex_agents "$pane_rows"
+
+  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor asking visible pane_codex_session; do
     [ "$is_term" = "1" ] && continue
     [ -z "$pane_id" ] && continue
     # Now that -s exposes them: the sidebar is a display that repaints every 2s
@@ -420,7 +697,7 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
   # loop only ever saw the ONE visible thread — every parked thread got no status
   # updates at all. That is precisely why a thread blocked on a question showed no
   # indicator: it was parked, so nothing ever looked at it.
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}|#{?#{&&:#{pane_active},#{window_active}},1,}' 2>/dev/null)
+  done <<< "$pane_rows"
 
   sleep 5
 done
