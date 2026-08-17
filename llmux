@@ -2516,8 +2516,10 @@ render_sidebar() {
 
   # Kept out of list_threads on purpose: its positional field contract has a dozen
   # read sites of varying arity, and widening it would touch every one.
-  local done_map
+  local done_map codex_parent_map codex_agents_raw
   done_map=$({ tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_done_at}' 2>/dev/null; } || true)
+  codex_parent_map=$({ tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_codex_session}' 2>/dev/null; } || true)
+  codex_agents_raw=$(tmux show-option -t "$SESSION" -qv @llmux_codex_agents 2>/dev/null || true)
   for key in ${sections[@]+"${sections[@]}"}; do
     [[ -z "$key" ]] && continue
     project_meta "$key" >/dev/null; meta="$R_PROJECT_META"
@@ -2740,6 +2742,49 @@ render_sidebar() {
       out+="${flag}"$'\n'
       rowmap+="${row}:${pane_id},"
       ((row++))
+
+      # Codex sub-agents are derived child rows, not threads: they have no pane,
+      # cannot be switched to, and therefore never enter rowmap. The watcher
+      # publishes only agents whose latest lifecycle event is task_started.
+      # Still bump the absolute row for each one so every clickable row below it
+      # keeps resolving against the pixels that were actually drawn.
+      if [[ "$tool" == "codex" && -n "$codex_agents_raw" ]]; then
+        local codex_sid="" cpane csid
+        while IFS='|' read -r cpane csid; do
+          if [[ "$cpane" == "$pane_id" ]]; then
+            codex_sid="$csid"
+            break
+          fi
+        done <<< "$codex_parent_map"
+
+        if [[ -n "$codex_sid" ]]; then
+          local agent_root agent_depth agent_nickname agent_path
+          while IFS='|' read -r agent_root agent_depth agent_nickname agent_path; do
+            [[ "$agent_root" == "$codex_sid" ]] || continue
+            [[ "$agent_depth" =~ ^[0-9]+$ ]] || agent_depth=1
+            local agent_indent=$(( 1 + agent_depth * 2 ))
+            (( agent_indent > 7 )) && agent_indent=7
+            local agent_prefix="" ai=0
+            while (( ai < agent_indent )); do agent_prefix+=" "; ((ai++)); done
+            agent_prefix+="↳ "
+
+            local agent_task="${agent_path##*/}"
+            [[ -z "$agent_task" ]] && agent_task="${agent_nickname:-sub-agent}"
+            local agent_tail=""
+            [[ -n "$agent_nickname" && "$agent_nickname" != "$agent_task" ]] \
+              && agent_tail=" · ${agent_nickname}"
+            local agent_w=$(( sb_w - ${#agent_prefix} ))
+            (( agent_w < 1 )) && agent_w=1
+            local agent_label="$agent_task"
+            if (( ${#agent_task} + ${#agent_tail} <= agent_w )); then
+              agent_label+="$agent_tail"
+            fi
+            agent_label="${agent_label:0:agent_w}"
+            out+="${agent_prefix%↳ }\033[38;5;44m↳\033[0m \033[38;5;245m${agent_label}\033[0m"$'\n'
+            ((row++))
+          done <<< "$codex_agents_raw"
+        fi
+      fi
     done
 
     # PR rows close each project section, below its threads: the threads are what

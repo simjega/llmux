@@ -63,6 +63,8 @@ one full-size thread to its right:
 │ LLMUX ───────────────────────│   (full size)      │
 │ ▶3 ✳ make-llmux-better       │                    │
 │  4 ◇ codex-dump              │                    │
+│    ↳ inspect_state · Nash    │                    │
+│    ↳ render_seam · Maxwell   │                    │
 │                              │                    │
 │ OWNER ───────────────────────│                    │
 │ ·5 ✳ vip-last-mile        🙋 │                    │
@@ -73,6 +75,12 @@ one full-size thread to its right:
 
 The list shows each thread's number and a status flag when `llmux-watch` has something
 to tell you about it.
+
+Codex sub-agents that are running appear as indented `↳` rows beneath their parent
+thread. The task name is always shown; widening the sidebar also reveals the Codex
+nickname when it fits. These rows are live status, not threads: they appear within one
+watcher tick (about five seconds), disappear after completion or interruption, and are
+intentionally inert when clicked because no tmux pane exists behind them.
 
 **Status flags. A flag means "look at this" — so most threads carry none:**
 
