@@ -244,6 +244,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 
 session, db_path, lock_dir = sys.argv[1:4]
 uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -278,7 +279,7 @@ try:
         check=False,
     )
     proc_rows = proc_result.stdout.splitlines()
-    process_discovery_ok = True
+    process_discovery_ok = proc_result.returncode == 0
 except (OSError, subprocess.TimeoutExpired):
     proc_rows = []
 
@@ -319,7 +320,9 @@ if all_pids:
             check=False,
         )
         lsof_out = lsof_result.stdout
-        lsof_discovery_ok = True
+        lsof_discovery_ok = lsof_result.returncode == 0 or (
+            lsof_result.returncode == 1 and not lsof_result.stderr.strip()
+        )
     except (OSError, subprocess.TimeoutExpired):
         lsof_out = ""
     current_pid = None
@@ -388,13 +391,35 @@ try:
         timeout=2,
         check=False,
     ).stdout
-    cache = json.loads(cache_raw) if cache_raw.strip() else {}
+    if cache_raw.lstrip().startswith("{"):
+        cache = json.loads(cache_raw)
+    else:
+        cache = {}
+        for line in cache_raw.splitlines():
+            parts = line.split("|")
+            if len(parts) == 3 and parts[1].isdigit():
+                cache[parts[0]] = [int(parts[1]), parts[2]]
 except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
     cache = {}
 
 next_cache = {}
 active_rows = []
 lifecycle = {"task_started", "task_complete", "turn_aborted"}
+state_codes = {"task_started": "s", "task_complete": "c", "turn_aborted": "a"}
+code_states = {code: state for state, code in state_codes.items()}
+
+def decode_lifecycle(raw):
+    try:
+        event = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False, None
+    if not isinstance(event, dict) or event.get("type") != "event_msg":
+        return True, None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return True, None
+    event_type = payload.get("type")
+    return True, event_type if event_type in lifecycle else None
 
 for root in dict.fromkeys(roots.values()):
     descendants_rows = con.execute(
@@ -420,10 +445,17 @@ for root in dict.fromkeys(roots.values()):
     ).fetchall()
 
     for depth, child_id, rollout_path, nickname, role, agent_path in descendants_rows:
-        old = cache.get(child_id) if isinstance(cache.get(child_id), dict) else {}
-        offset = old.get("offset", 0)
-        state = old.get("state", "")
-        if old.get("path") != rollout_path:
+        cache_key = child_id.replace("-", "")
+        old = cache.get(cache_key, cache.get(child_id))
+        if isinstance(old, list) and len(old) == 2:
+            offset, state = old
+            state = code_states.get(state, "")
+        elif isinstance(old, dict):
+            offset = old.get("offset", 0)
+            state = old.get("state", "")
+            if old.get("path") not in (None, rollout_path):
+                offset, state = 0, ""
+        else:
             offset, state = 0, ""
         try:
             size = os.path.getsize(rollout_path)
@@ -437,23 +469,24 @@ for root in dict.fromkeys(roots.values()):
                 complete = chunk[: complete_at + 1]
                 offset += complete_at + 1
                 for raw in complete.splitlines():
-                    try:
-                        event = json.loads(raw)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    if event.get("type") != "event_msg":
-                        continue
-                    event_type = (event.get("payload") or {}).get("type")
-                    if event_type in lifecycle:
+                    parsed, event_type = decode_lifecycle(raw)
+                    if not parsed:
+                        state = ""
+                    if event_type:
                         state = event_type
+            tail = chunk[complete_at + 1 :] if complete_at >= 0 else chunk
+            if tail:
+                parsed, event_type = decode_lifecycle(tail)
+                if parsed:
+                    offset += len(tail)
+                    if event_type:
+                        state = event_type
+                else:
+                    state = ""
         except OSError:
             continue
 
-        next_cache[child_id] = {
-            "path": rollout_path,
-            "offset": offset,
-            "state": state,
-        }
+        next_cache[cache_key] = [offset, state_codes.get(state, "")]
         if state == "task_started":
             clean = lambda value: re.sub(r"[|\t\r\n]", " ", value or "")
             active_rows.append(
@@ -473,13 +506,21 @@ subprocess.run(
     check=False,
 )
 subprocess.run(
+    ["tmux", "set-option", "-t", session, "@llmux_codex_agents_at", str(int(time.time()))],
+    check=False,
+)
+cache_rows = [
+    f"{child_id}|{entry[0]}|{entry[1]}"
+    for child_id, entry in next_cache.items()
+]
+subprocess.run(
     [
         "tmux",
         "set-option",
         "-t",
         session,
         "@llmux_codex_agent_cache",
-        json.dumps(next_cache, separators=(",", ":")),
+        "\n".join(cache_rows),
     ],
     check=False,
 )
