@@ -2343,9 +2343,11 @@ render_sidebar() {
   # The pane's ACTUAL width, not the SIDEBAR_WIDTH constant — that is only the width
   # the pane was CREATED at, so every text budget derived from it kept cutting names
   # short after a resize instead of showing what now fits.
-  local sb_w
-  sb_w=$(tmux display-message -p -t "$sb" '#{pane_width}' 2>/dev/null || true)
+  local sb_geometry sb_w sb_h
+  sb_geometry=$(tmux display-message -p -t "$sb" '#{pane_width}|#{pane_height}' 2>/dev/null || true)
+  IFS='|' read -r sb_w sb_h <<< "$sb_geometry"
   [[ "$sb_w" =~ ^[0-9]+$ ]] || sb_w="$SIDEBAR_WIDTH"
+  [[ "$sb_h" =~ ^[0-9]+$ ]] || sb_h=24
   # Treat the width the pane is actually at as the width you want, so dragging the
   # divider is all it takes to change it — and sidebar_apply_layout restores that
   # instead of the constant on the next switch.
@@ -2845,6 +2847,18 @@ render_sidebar() {
   done
 
   out+=$'\n\033[38;5;240m click a row, + to add\n prefix j/k  next/prev\n prefix M    move project\n prefix 1-9  jump\033[0m\n'
+
+  # Never write a newline from the pane's bottom row. Once the rendered list is
+  # taller than the sidebar, the terminal would scroll the first rows away while
+  # the click maps kept their original absolute coordinates. Clip the frame to
+  # the live pane height and omit its trailing newline so row zero stays row zero.
+  local clipped_out="" clipped_line clipped_rows=0
+  while (( clipped_rows < sb_h )) && IFS= read -r clipped_line; do
+    (( clipped_rows )) && clipped_out+=$'\n'
+    clipped_out+="$clipped_line"
+    ((clipped_rows++))
+  done <<< "$out"
+  out="$clipped_out"
 
   # Publish both maps together with the pixels. Set them right before the draw so
   # the mapping the click handler reads can never be newer than what's on screen.
