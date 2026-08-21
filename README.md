@@ -33,6 +33,7 @@ llmux attach                              # jump in
 |---------|-------------|
 | `llmux setup` | Install dependencies and configure your LLM tool |
 | `llmux add <name> [dir]` | Create a new named pane, launch configured tool |
+| `llmux add <name> --tool forge --task <tsk-id>` | Open a Forge task as a managed llmux thread |
 | `llmux resume [--tool <tool>] [--all]` | Browse & resume a past session in a new pane (picker only — it takes no name) |
 | `llmux grab <name> [pane]` | Move an existing tmux pane into llmux |
 | `llmux cycle [name]` | Restart a pane's tool in place, resuming the same session |
@@ -143,9 +144,32 @@ whatever is actually in flight rather than every PR you've ever authored.
   Fetched state — open/draft/last-activity — is a disposable tmux option refreshed by
   `llmux-watch` every ~2 min, never a file.
 
-### Forge tasks, per project
+### Forge sessions
 
-A Forge task is an agent working on the project somewhere else. Attach it and it gets
+Forge tasks can run as real llmux threads. llmux uses the installed OwnerForge CLI
+to discover owned tasks, start or resume their remote workspaces, and attach the
+remote OpenCode terminal over SSH:
+
+```bash
+llmux resume --tool forge
+llmux add marketing-pages --tool forge --task tsk-PJhst1k2tEhU --project lilo
+```
+
+The sidebar `+` includes Forge when the CLI is installed; choosing it opens the task
+picker. A running Forge thread carries the task id in `@llmux_forge_task`, so
+`pause`, `resume`, `cycle`, `refresh`, `snapshot`, and crash restore all reopen the
+same remote task. It gets its own Forge glyph and otherwise behaves like any local
+llmux thread. One task can be claimed by only one live or paused llmux pane. Because
+the actual checkout is remote, Forge panes always use `$HOME` as their neutral local
+cwd and reject local `--slot`, `--worktree`, and `--branch` options.
+
+`llmux send` cannot yet prove that the remote OpenCode UI is at a safe input prompt,
+so ordinary peer delivery to Forge is refused. Inspect the pane and use `--force`
+only when you have confirmed it is not showing a permission gate or choice menu.
+
+### Forge task links, per project
+
+A Forge task can also be tracked without opening a terminal. Attach it as a link and it gets
 **a row of its own**, directly above the threads:
 
 ```
@@ -162,9 +186,9 @@ monitor, two flags and two tasks ran off the right edge, and whatever came last 
 what fell off. A task also has a human-written name that wants room, unlike a flag
 whose label is a fixed identifier.
 
-Last before the threads on purpose — a Forge task is the same axis as a thread (work
-in progress, one line each), so the two read as one list, with the tasks llmux cannot
-switch to sitting just above the ones it can.
+Last before the threads on purpose — a linked Forge task is the same axis as a thread
+(work in progress, one line each), so the two read as one list, with unopened tasks
+sitting just above the terminal sessions llmux can switch to.
 
 ```bash
 llmux project forge custom-campaigns-me2 tsk-CJyj5XHDU6Pz shadow parity sweep
@@ -173,11 +197,10 @@ llmux project forge custom-campaigns-me2 --remove tsk-CJyj5XHDU6Pz
 llmux project forge                      # list them all
 ```
 
-- **A link, not a thread.** A Forge task is very nearly a thread — it just runs online
-  rather than in a pane — but a thread in llmux *is* a tmux pane, and everything that
-  switches, parks, cycles, resumes, snapshots or lays out threads acts on a pane id. A
-  row with no pane behind it would break all of them. So it is a link: one click to the
-  task, and no pretence that llmux can drive it.
+- **A link until you open it.** `llmux project forge` is tracking-only: one click opens
+  the task in a browser, and no tmux pane exists behind the row. Use `llmux resume
+  --tool forge` or `llmux add … --tool forge --task …` when you want an interactive
+  terminal that llmux can switch, pause, cycle, and restore.
 - **A bare `tsk-…` id is enough** — it expands to `forge.owner.sh/tasks/<id>`, which is
   what you have to hand the moment an agent spawns one. A full URL works too.
 - **Name it for the work, not for the task.** The trailing words become the row's
@@ -412,7 +435,8 @@ would only ever reach whatever happened to be running at the time.
 to the project of the thread you were looking at, since "another thread in what I'm
 working on" is the common case. Pick `shell` as the platform for a plain pane with
 no tool, which is `llmux add <name> --tool none` on the command line. New threads
-start in the *active thread's* directory, not the sidebar's.
+start in the *active thread's* directory, not the sidebar's. Forge is the one
+exception: choosing it opens the owned-task picker and attaches that remote task.
 
 Only a click in the `+`'s column counts — clicking the rule or a section label is
 deliberately inert, since "click the label" and "click the plus" would otherwise be
