@@ -48,11 +48,13 @@ usage() {
 llmux — multiplex LLM sessions in tmux
 
 Usage:
-  llmux add <name> [dir] [--tool <tool>] [--project <name>] [--worktree|--slot[=N]] [--branch <name>]
+  llmux add <name> [dir] [--tool <tool>] [--task <id>] [--project <name>] [--worktree|--slot[=N]] [--branch <name>]
                                                 Add a new pane. In Owner, --slot adopts an
                                                 idle owner-wt slot (--worktree is aliased
                                                 to --slot inside Owner).
                                                 --tool none leaves it a plain shell.
+                                                --tool forge requires --task tsk-… and
+                                                opens that remote Forge workspace.
                                                 --project puts it in a sidebar section
                                                 (default: SCRATCH). A project new to llmux
                                                 is offered a Tolaria project to keep its
@@ -64,6 +66,8 @@ Usage:
   llmux slot-cleanup [status|now]               Show the daily Owner slot cleanup schedule or
                                                 kick it off now in a reusable background thread.
   llmux resume [--tool <tool>] [--all]          Pick a past session to resume (hides entries >14d old; --all shows all)
+                                                `--tool forge` lists owned Forge tasks
+                                                and attaches the selected remote workspace.
   llmux grab <name> [pane]                      Move an existing tmux pane into llmux
   llmux rm [name] [--force]                     Remove pane (releases owned slot; refuses on dirty slot unless --force)
   llmux pause [name...] [--force]               Pause one or more panes (releases owned slot; refuses on dirty slot unless --force)
@@ -96,8 +100,9 @@ Usage:
   llmux project open <key>                      Open the project's hub note
   llmux project monitor [<key> <url|--clear>]   Attach a monitoring dashboard to a project
   llmux project forge [<key> <task-id|url>      Attach a Forge task to a project — a link
-             [name]] [--remove <id>] [--clear]  beside (Monitor), NOT a thread: llmux cannot
-                                                drive a task it has no pane for. A project may
+             [name]] [--remove <id>] [--clear]  beside (Monitor), not an interactive thread.
+                                                Open one with `llmux resume --tool forge`.
+                                                A project may
                                                 have several. Bare tsk-… ids expand to
                                                 forge.owner.sh/tasks/<id>. NAME IT FOR THE
                                                 WORK ("shadow parity sweep") — not the task id
@@ -171,8 +176,10 @@ Examples:
   llmux add "auth-refactor" --slot              # adopt an idle owner-wt slot, branch = pane name
   llmux add "auth-refactor" --slot=2 --branch feature/auth
   llmux add "bug-hunt" --tool amp
+  llmux add "forge-task" --tool forge --task tsk-CJyj5XHDU6Pz
   llmux resume                                  # resume with default tool
   llmux resume --tool claude                    # resume a claude session specifically
+  llmux resume --tool forge                     # choose and attach an owned Forge task
   llmux resume --all                            # include sessions older than the 14d cutoff
   llmux worktree "my-pane" feature/branch       # manually tag a pane's worktree
   llmux pause "auth-refactor"                   # pause pane (and release slot if owned)
@@ -195,7 +202,7 @@ check_deps() {
   fi
 }
 
-KNOWN_TOOLS=(amp claude codex opencode aider sgpt llm mods ollama)
+KNOWN_TOOLS=(amp claude codex opencode forge aider sgpt llm mods ollama)
 
 load_config() {
   LLMUX_TOOL=""
@@ -979,6 +986,66 @@ PY
   disown
 }
 
+# A Forge task id is a conversation identity, not just a launch argument. One task
+# may have at most one live or paused llmux pane, or two terminals can write to the
+# same remote OpenCode session and lifecycle actions become ambiguous.
+# Sets R_FORGE_TASK_CLAIM to "live:<name>" / "paused:<name>" when claimed.
+forge_task_claim() {
+  local task_id="${1:-}" ignored_paused_name="${2:-}" ignored_live_pane="${3:-}"
+  local pane_id pane_name forge_id
+  # EVERY read target declared local. `read` blanks its variables even when it hits
+  # EOF with no input, so an undeclared name here silently erases the CALLER's
+  # variable of the same name -- and the paused-entry loop below reads into `tool`,
+  # which is exactly what cmd_restore's loop is iterating on. That blanked $tool
+  # mid-restore, so a Forge thread came back with no @llmux_tool and the recovery
+  # guard then refused to commit the snapshot.
+  local _dir _worktree _paused_at session_id _slot _project tool
+  R_FORGE_TASK_CLAIM=""
+  [[ -n "$task_id" ]] || return 1
+  while IFS='|' read -r pane_id pane_name forge_id; do
+    [[ -n "$ignored_live_pane" && "$pane_id" == "$ignored_live_pane" ]] && continue
+    if [[ "$forge_id" == "$task_id" ]]; then
+      R_FORGE_TASK_CLAIM="live:${pane_name:-unnamed}"
+      return 0
+    fi
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{@llmux_forge_task}' 2>/dev/null || true)
+  while IFS='|' read -r pane_name _dir tool _worktree _paused_at session_id _slot _project; do
+    [[ -n "$ignored_paused_name" && "$pane_name" == "$ignored_paused_name" ]] && continue
+    if [[ "$tool" == "forge" && "$session_id" == "$task_id" ]]; then
+      R_FORGE_TASK_CLAIM="paused:${pane_name:-unnamed}"
+      return 0
+    fi
+  done < <(read_paused)
+  return 1
+}
+
+# Serialize claim-check + pane tagging. shlock atomically creates a PID-bearing
+# lock and only reaps it when kill(2) confirms that owner no longer exists.
+R_FORGE_CLAIM_LOCK=""
+acquire_forge_claim_lock() {
+  local lock="${TMPDIR:-/tmp}/llmux-forge-claim-${SESSION}.lock" waited=0
+  [[ -x /usr/bin/shlock ]] \
+    || { echo "Error: /usr/bin/shlock is required for safe Forge task claiming." >&2; return 1; }
+  while ! /usr/bin/shlock -f "$lock" -p "$$" 2>/dev/null; do
+    (( waited++ ))
+    if (( waited > 100 )); then
+      echo "Error: timed out waiting to claim a Forge task." >&2
+      return 1
+    fi
+    python3 -c 'import time; time.sleep(0.05)' 2>/dev/null || true
+  done
+  R_FORGE_CLAIM_LOCK="$lock"
+  trap 'release_forge_claim_lock' EXIT
+}
+
+release_forge_claim_lock() {
+  local owner=""
+  [[ -n "$R_FORGE_CLAIM_LOCK" ]] && owner=$(cat -- "$R_FORGE_CLAIM_LOCK" 2>/dev/null || true)
+  [[ "$owner" == "$$" ]] && rm -f "$R_FORGE_CLAIM_LOCK"
+  R_FORGE_CLAIM_LOCK=""
+  trap - EXIT
+}
+
 launch_tool_in_pane() {
   local pane_target="$1"
   local tool="${2:-}"
@@ -1082,12 +1149,26 @@ resume_tool_in_pane() {
         resume_cmd+="$tool_cmd --continue"
       fi
       ;;
+    forge)
+      if [[ -z "$session_id" ]]; then
+        echo "Error: a Forge task id is required. Use: llmux resume --tool forge" >&2
+        return 1
+      fi
+      if [[ ! "$session_id" =~ ^tsk-[A-Za-z0-9]+$ ]]; then
+        echo "Error: invalid Forge task id: $session_id" >&2
+        return 1
+      fi
+      resume_cmd+="$tool_cmd task open $(printf '%q' "$session_id")"
+      ;;
     amp)    resume_cmd+="$tool_cmd" ;;
     *)      resume_cmd+="$tool_cmd" ;;
   esac
   tmux set-option -p -t "$pane_target" @llmux_tool "$tool"
   if [[ "$tool" == "opencode" && -n "$session_id" ]]; then
     tmux set-option -p -t "$pane_target" @llmux_opencode_session "$session_id" 2>/dev/null || true
+  fi
+  if [[ "$tool" == "forge" && -n "$session_id" ]]; then
+    tmux set-option -p -t "$pane_target" @llmux_forge_task "$session_id" 2>/dev/null || true
   fi
   if [[ "$tool" == "claude" ]]; then
     if [[ -n "$session_id" ]]; then
@@ -1565,6 +1646,7 @@ TOOL_COLOURS=(
   "claude|173"
   "codex|44"
   "opencode|99"
+  "forge|214"
   "amp|205"
   "aider|179"
   "term|71"
@@ -2206,6 +2288,7 @@ thread_icon() {
       claude)   R_THREAD_ICON="✳" ;;
       codex)    R_THREAD_ICON="◇" ;;
       opencode) R_THREAD_ICON="▣" ;;
+      forge)    R_THREAD_ICON="⚒︎" ;;
       amp)      R_THREAD_ICON="◆" ;;
       aider)    R_THREAD_ICON="◈" ;;
       "")       R_THREAD_ICON="❯" ;;
@@ -3361,7 +3444,7 @@ sidebar_add_prompt() {
 # Platforms offered by the "+" picker, in order — claude first so Enter takes it.
 # Filtered to what's actually installed, with `shell` (a plain pane, no tool)
 # always available at the end.
-NEWTHREAD_TOOLS=(claude codex opencode amp aider)
+NEWTHREAD_TOOLS=(claude codex opencode forge amp aider)
 
 # Create a thread. $1 = project key, or "*" to ask. Called from inside the popup
 # above, and from `prefix m`'s sibling flow.
@@ -3383,6 +3466,24 @@ cmd__newthread() {
   tool=$(printf '%s' "$pick" | awk '{print $NF}')
   # `shell` means "no tool" — cmd_add spells that --tool none.
   [[ "$tool" == "shell" ]] && tool="none"
+
+  # Forge creates its agent remotely; locally we attach an existing task. Route
+  # straight to the Forge task picker instead of creating a pane that would only
+  # run `forge` with no task id and immediately print help.
+  if [[ "$tool" == "forge" ]]; then
+    local forge_project=""
+    if [[ "$target" != "*" ]]; then
+      forge_project=$(sanitize_project "$target")
+    elif [[ -n "$(known_projects | grep -v "^${SCRATCH_KEY}$" || true)" ]]; then
+      forge_project=$(prompt_for_project "$(active_thread_project)") || return 0
+    fi
+    if [[ -n "$forge_project" ]]; then
+      cmd_resume --tool forge --project "$forge_project"
+    else
+      cmd_resume --tool forge
+    fi
+    return 0
+  fi
 
   # --- name ---
   local name
@@ -4439,13 +4540,15 @@ create_worktree_for_pane() {
 }
 
 cmd_add() {
-  local name="" dir="" tool_override="" use_worktree=false
+  local name="" dir="" tool_override="" task_id="" use_worktree=false
   local use_slot=false explicit_slot="" explicit_branch="" project="" tolaria_intent=""
 
   # Parse args: name [directory] [--tool <tool>] [--project <name>] [--worktree|--slot[=N]] [--branch <name>]
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --tool) tool_override="${2:?--tool requires a value}"; shift 2 ;;
+      --task|--session) task_id="${2:?$1 requires a value}"; shift 2 ;;
+      --task=*|--session=*) task_id="${1#*=}"; shift ;;
       --project) project="${2:?--project requires a value}"; shift 2 ;;
       --project=*) project="${1#--project=}"; shift ;;
       --tolaria) tolaria_intent="${2:?--tolaria requires a value}"; shift 2 ;;
@@ -4475,7 +4578,31 @@ cmd_add() {
     esac
   done
 
-  [[ -z "$name" ]] && { echo "Usage: llmux add <name> [directory] [--tool <tool>] [--project <name>] [--worktree|--slot[=N]] [--branch <name>]"; exit 1; }
+  [[ -z "$name" ]] && { echo "Usage: llmux add <name> [directory] [--tool <tool>] [--task <id>] [--project <name>] [--worktree|--slot[=N]] [--branch <name>]"; exit 1; }
+  if [[ "$tool_override" == "forge" && -z "$task_id" ]]; then
+    echo "Error: --tool forge requires --task <tsk-id>." >&2
+    echo "       Or choose an existing task with: llmux resume --tool forge" >&2
+    exit 1
+  fi
+  if [[ -n "$task_id" && "$tool_override" != "forge" ]]; then
+    echo "Error: --task is only valid with --tool forge." >&2
+    exit 1
+  fi
+  if [[ "$tool_override" == "forge" ]]; then
+    command -v forge >/dev/null 2>&1 \
+      || { echo "Error: Forge CLI not found on PATH." >&2; exit 1; }
+    if [[ "$use_worktree" == true || "$use_slot" == true || -n "$explicit_branch" ]]; then
+      echo "Error: Forge runs in a remote workspace; --worktree, --slot, and --branch do not apply." >&2
+      exit 1
+    fi
+    task_id="${task_id##*/}"
+    [[ "$task_id" =~ ^tsk-[A-Za-z0-9]+$ ]] \
+      || { echo "Error: invalid Forge task id: $task_id" >&2; exit 1; }
+    # The CLI attaches to remote /home/coder/Owner and ignores local cwd. Force a
+    # neutral local directory so this pane cannot inherit/tag/release the caller's
+    # owner-wt slot.
+    dir="$HOME"
+  fi
 
   # No project = scratch. Deliberately NOT derived from the cwd: inside Owner
   # every thread lives in .workspaces/slot-N, which would invent a project per
@@ -4545,12 +4672,28 @@ cmd_add() {
     exit 1
   fi
 
+  # Keep the uniqueness check and pane tag in one critical section. Without
+  # this, two concurrent `add` calls can both pass the check before either pane
+  # advertises its task id.
+  if [[ "$tool_override" == "forge" ]]; then
+    acquire_forge_claim_lock || exit 1
+    if forge_task_claim "$task_id"; then
+      echo "Error: Forge task $task_id is already claimed by ${R_FORGE_TASK_CLAIM}." >&2
+      release_forge_claim_lock
+      exit 1
+    fi
+  fi
+
   # Always split a new pane for the LLM tool (terminal pane stays on top)
   local new_pane
   new_pane=$(spawn_llm_pane "$dir")
   tmux select-pane -t "$new_pane" -T "$name"
   tmux set-option -p -t "$new_pane" @llmux_name "$name"
-  tag_pane_worktree "$new_pane" "$dir"
+  if [[ "$tool_override" == "forge" ]]; then
+    tmux set-option -p -t "$new_pane" @llmux_forge_task "$task_id"
+    release_forge_claim_lock
+  fi
+  [[ "$tool_override" != "forge" ]] && tag_pane_worktree "$new_pane" "$dir"
   if [[ -n "$adopted_slot" ]]; then
     tmux set-option -p -t "$new_pane" @llmux_slot "$adopted_slot"
   fi
@@ -4566,7 +4709,9 @@ cmd_add() {
   # which is exactly what the sidebar classifier groups under TERMINALS. Passing
   # an empty tool would NOT do this — launch_tool_in_pane falls back to the
   # configured default when the tool is empty.
-  if [[ "$tool_override" != "none" ]]; then
+  if [[ "$tool_override" == "forge" ]]; then
+    resume_tool_in_pane "$new_pane" forge "$name" "$task_id"
+  elif [[ "$tool_override" != "none" ]]; then
     launch_tool_in_pane "$new_pane" "$tool_override" "$name"
   fi
   snapshot_session
@@ -4960,8 +5105,8 @@ pause_one() {
   fi
 
   local target_pane="" pane_dir="" pane_tool="" pane_wt="" pane_sid="" pane_slot="" pane_project=""
-  local pane_ocsid="" pane_csid=""
-  while IFS='|' read -r pid pname pdir ptool pwt pterm psid pocsid pcsid pslot pproj; do
+  local pane_ocsid="" pane_csid="" pane_forge_task=""
+  while IFS='|' read -r pid pname pdir ptool pwt pterm psid pocsid pcsid pforge pslot pproj; do
     if [[ "$pname" == "$name" ]]; then
       target_pane="$pid"
       pane_dir="$pdir"
@@ -4970,11 +5115,12 @@ pause_one() {
       pane_sid="$psid"
       pane_ocsid="$pocsid"
       pane_csid="$pcsid"
+      pane_forge_task="$pforge"
       pane_slot="$pslot"
       pane_project="$pproj"
       break
     fi
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_slot}|#{@llmux_project}')
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_forge_task}|#{@llmux_slot}|#{@llmux_project}')
 
   if [[ -z "$target_pane" ]]; then
     echo "Skipping '$name': no pane with that name"
@@ -5001,9 +5147,30 @@ pause_one() {
   case "$pane_tool" in
     opencode) pane_sid="$pane_ocsid" ;;
     codex) pane_sid="$pane_csid" ;;
+    forge) pane_sid="$pane_forge_task" ;;
   esac
+  if [[ "$pane_tool" == "forge" ]]; then
+    [[ "$pane_sid" =~ ^tsk-[A-Za-z0-9]+$ ]] \
+      || { echo "Skipping '$name': invalid or missing Forge task id" >&2; return 1; }
+    acquire_forge_claim_lock || return 1
+    if forge_task_claim "$pane_sid" "$name" "$target_pane"; then
+      echo "Skipping '$name': Forge task $pane_sid is already claimed by ${R_FORGE_TASK_CLAIM}" >&2
+      release_forge_claim_lock
+      return 1
+    fi
+  fi
   add_paused "$name" "$pane_dir" "$pane_tool" "$pane_wt" "$pane_sid" "$pane_slot" "$pane_project"
-  tmux kill-pane -t "$target_pane"
+  if ! tmux kill-pane -t "$target_pane"; then
+    remove_paused "$name" >/dev/null 2>&1 || true
+    if [[ "$pane_tool" == "forge" ]]; then
+      release_forge_claim_lock
+    fi
+    echo "Skipping '$name': could not remove its live pane" >&2
+    return 1
+  fi
+  if [[ "$pane_tool" == "forge" ]]; then
+    release_forge_claim_lock
+  fi
   if [[ -n "$pane_slot" ]]; then
     release_slot "$pane_slot"
   fi
@@ -5263,14 +5430,14 @@ cmd_cycle() {
   # Capture pane metadata before killing — including the captured claude session
   # UUID so we resume the exact same session (--resume <id>) rather than
   # --continue, which only grabs the most-recent session in the cwd.
-  local target_pane="" pane_dir="" pane_tool="" pane_wt="" pane_pinned="" pane_sid="" pane_ocsid="" pane_csid="" pane_project=""
-  while IFS='|' read -r pid pname pdir ptool pwt _pterm ppin psid pocsid pcsid pproj; do
+  local target_pane="" pane_dir="" pane_tool="" pane_wt="" pane_pinned="" pane_sid="" pane_ocsid="" pane_csid="" pane_forge_task="" pane_project=""
+  while IFS='|' read -r pid pname pdir ptool pwt _pterm ppin psid pocsid pcsid pforge pproj; do
     if [[ "$pname" == "$name" ]]; then
       target_pane="$pid"; pane_dir="$pdir"; pane_tool="$ptool"; pane_wt="$pwt"; pane_pinned="$ppin"
-      pane_sid="$psid"; pane_ocsid="$pocsid"; pane_csid="$pcsid"; pane_project="$pproj"
+      pane_sid="$psid"; pane_ocsid="$pocsid"; pane_csid="$pcsid"; pane_forge_task="$pforge"; pane_project="$pproj"
       break
     fi
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_project}')
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_forge_task}|#{@llmux_project}')
 
   if [[ -z "$target_pane" ]]; then
     echo "Error: no pane named '$name'"
@@ -5309,7 +5476,7 @@ cmd_cycle() {
       echo "Error: '$name' has no tool tagged, so there is nothing to resume." >&2
       echo "       It's either a plain shell (--tool none) or an adopted pane (llmux grab)." >&2
       echo "       To restart it as a bare shell:  llmux cycle $name --tool none" >&2
-      echo "       To give it a platform:          llmux cycle $name --tool <claude|codex|opencode|amp>" >&2
+      echo "       To give it a platform:          llmux cycle $name --tool <claude|codex|opencode|forge|amp>" >&2
       exit 1
     fi
     pane_tool="$tool_override"
@@ -5332,6 +5499,19 @@ cmd_cycle() {
     pane_sid="$pane_ocsid"
   elif [[ "$pane_tool" == "codex" ]]; then
     pane_sid="$pane_csid"
+  fi
+  if [[ "$pane_tool" == "forge" ]]; then
+    pane_sid="$pane_forge_task"
+    if [[ -z "$pane_sid" ]]; then
+      echo "Error: '$name' has no Forge task id; refusing to reopen an arbitrary task." >&2
+      exit 1
+    fi
+    acquire_forge_claim_lock || exit 1
+    if forge_task_claim "$pane_sid" "" "$target_pane"; then
+      echo "Error: Forge task $pane_sid is already claimed by ${R_FORGE_TASK_CLAIM}." >&2
+      release_forge_claim_lock
+      exit 1
+    fi
   fi
 
   if [[ "$pane_tool" == "claude" ]]; then
@@ -5390,6 +5570,10 @@ cmd_cycle() {
   new_pane=$(spawn_llm_pane "$pane_dir")
   tmux select-pane -t "$new_pane" -T "$name"
   tmux set-option -p -t "$new_pane" @llmux_name "$name"
+  if [[ "$pane_tool" == "forge" ]]; then
+    tmux set-option -p -t "$new_pane" @llmux_forge_task "$pane_sid"
+    release_forge_claim_lock
+  fi
   [[ -n "$pane_wt" ]] && tmux set-option -p -t "$new_pane" @llmux_worktree "$pane_wt"
   # Preserve pinned state so apply_layout repositions the pane back into the
   # top-right slot instead of treating it like a regular LLM pane.
@@ -5617,10 +5801,15 @@ cmd_worktree() {
 # on every trivial one; a list of exact paths costs a few lines and the agent reads
 # what its task actually needs.
 cmd_context() {
-  local pane="${TMUX_PANE:-}" name="" project="" tool="" cwd="" sid=""
+  local pane="${TMUX_PANE:-}" name="" project="" tool="" cwd="" sid="" csid="" osid="" forge_task=""
   if [[ -n "$pane" ]]; then
-    IFS='|' read -r name project tool cwd sid < <(tmux display-message -p -t "$pane" \
-      '#{@llmux_name}|#{@llmux_project}|#{@llmux_tool}|#{pane_current_path}|#{@llmux_claude_session}' 2>/dev/null || true)
+    IFS='|' read -r name project tool cwd csid osid forge_task < <(tmux display-message -p -t "$pane" \
+      '#{@llmux_name}|#{@llmux_project}|#{@llmux_tool}|#{pane_current_path}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_forge_task}' 2>/dev/null || true)
+    case "$tool" in
+      claude) sid="$csid" ;;
+      opencode) sid="$osid" ;;
+      forge) sid="$forge_task" ;;
+    esac
   fi
   [[ -n "${1:-}" ]] && project="$1"
   [[ -z "$project" ]] && project="$SCRATCH_KEY"
@@ -5786,10 +5975,10 @@ sender_thread_name() {
 # have nobody to talk to.
 thread_directory() {
   tmux list-panes -s -t "$SESSION" \
-    -F '#{pane_id}|#{@llmux_name}|#{@llmux_project}|#{@llmux_tool}|#{@llmux_status}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{pane_current_path}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_done_at}' \
+    -F '#{pane_id}|#{@llmux_name}|#{@llmux_project}|#{@llmux_tool}|#{@llmux_status}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{pane_current_path}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_done_at}|#{@llmux_forge_task}' \
     2>/dev/null | awk -F'|' '
       $2 != "" && $10 != "1" && $11 != "1" && $12 != "1" {
-        sid = ($6 != "") ? $6 : (($7 != "") ? $7 : $8)
+        sid = ($6 != "") ? $6 : (($7 != "") ? $7 : (($8 != "") ? $8 : $14))
         printf "%s|%s|%s|%s|%s|%s|%s|%s\n", $1, $2, ($3 == "" ? "scratch" : $3), $4, $5, sid, $9, $13
       }'
 }
@@ -5879,6 +6068,16 @@ cmd_send() {
   sender_thread_name
   local from="$R_SENDER"
   [[ -n "$from" && "$from" == "$hit_name" ]] && { echo "Error: that is this thread" >&2; return 1; }
+
+  # Forge is a remote OpenCode TUI, but this watcher version cannot positively
+  # distinguish its input prompt from a permission/choice menu. Ordinary send
+  # would append Enter and could approve or answer something. Refuse unless the
+  # caller has visibly verified the prompt and explicitly takes responsibility.
+  if [[ "$hit_tool" == "forge" ]] && (( ! force )); then
+    echo "Error: $hit_name is a remote Forge prompt whose readiness llmux cannot verify." >&2
+    echo "       Inspect it first, then re-run with --force." >&2
+    return 1
+  fi
 
   # A pane sitting on a permission prompt or a choice menu is READING KEYSTROKES AS
   # ANSWERS. Typing a message into it would pick an option -- approving a tool call
@@ -6082,8 +6281,13 @@ cmd_setup() {
 
   # --- Pick default tool ---
   echo ""
-  local selected
-  selected=$(printf '%s\n' "(none)" "${found_tools[@]}" | gum choose --header "Select DEFAULT LLM tool")
+  # Forge always needs a task id, so it is available in the sidebar/resume
+  # pickers but cannot be the implicit tool for a plain `llmux add <name>`.
+  local default_tools=() selected
+  for tool in "${found_tools[@]}"; do
+    [[ "$tool" != "forge" ]] && default_tools+=("$tool")
+  done
+  selected=$(printf '%s\n' "(none)" "${default_tools[@]}" | gum choose --header "Select DEFAULT LLM tool")
   [[ "$selected" == "(none)" ]] && selected=""
 
   # Write default at the top of config
@@ -6282,6 +6486,82 @@ else: print(f'{diff//86400}d ago')
   done
 }
 
+# Forge tasks are remote OpenCode workspaces. The OwnerForge CLI owns workspace
+# startup and SSH attachment; llmux only needs the stable task id so lifecycle
+# operations can reopen the same task instead of creating a local agent session.
+#
+# Harvester contract: `id|cwd|relative_ts|title`. The local cwd is intentionally
+# HOME: `forge task open` attaches to the task's remote /home/coder/Owner and does
+# not use the pane's local directory.
+harvest_forge_sessions() {
+  command -v forge >/dev/null 2>&1 || return 0
+  local task_json forge_cmd claimed="" pane_name forge_id
+  task_json=$(mktemp) || return 0
+  forge_cmd=$(build_tool_cmd forge)
+  # Match the profile/arguments used by `task open`. Config is already trusted
+  # shell input (load_config sources it); eval preserves quoted multi-word args.
+  eval "$forge_cmd task list --json" >"$task_json" 2>/dev/null \
+    || { rm -f "$task_json"; return 0; }
+  while IFS='|' read -r pane_name forge_id; do
+    [[ -n "$forge_id" ]] && claimed+="${claimed:+,}${forge_id}"
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}|#{@llmux_forge_task}' 2>/dev/null || true)
+  while IFS='|' read -r pane_name _dir tool _worktree _paused_at session_id _slot _project; do
+    [[ "$tool" == "forge" && -n "$session_id" ]] && claimed+="${claimed:+,}${session_id}"
+  done < <(read_paused)
+  if ! python3 - "$HOME" "$task_json" "$claimed" <<'PY'
+import datetime, json, sys, time
+
+home, task_file, claimed_csv = sys.argv[1:4]
+claimed = {task_id for task_id in claimed_csv.split(",") if task_id}
+try:
+    with open(task_file) as f:
+        tasks = json.load(f).get("tasks", [])
+except Exception:
+    raise SystemExit(0)
+
+def epoch(value):
+    if not value:
+        return 0
+    try:
+        return int(datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return 0
+
+def relative(ts):
+    delta = max(0, int(time.time()) - ts)
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+for task in tasks:
+    if not task.get("isOwner", True):
+        continue
+    task_id = task.get("id") or ""
+    if (not task_id or task_id in claimed or not task_id.startswith("tsk-")
+            or not task_id[4:].isalnum()):
+        continue
+    timestamps = [
+        epoch(task.get("updatedAt")),
+        epoch(task.get("createdAt")),
+        epoch((task.get("cost") or {}).get("updatedAt")),
+        epoch((task.get("stage") or {}).get("ownerlingSessionCreatedAt")),
+    ]
+    updated = max(timestamps)
+    title = " ".join((task.get("title") or "untitled Forge task").split())
+    title = title.replace("|", "/")[:80]
+    print(f"{task_id}|{home}|{relative(updated)}|{title}")
+PY
+  then
+    rm -f "$task_json"
+    return 0
+  fi
+  rm -f "$task_json"
+}
+
 fetch_thread_title() {
   local tool="$1" thread_id="$2"
   case "$tool" in
@@ -6384,10 +6664,14 @@ for i, t in enumerate(data):
 cmd_resume() {
   local tool_override=""
   local show_all=""
+  local project_override=""
+  local exact_paused_name=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --tool) tool_override="${2:?--tool requires a value}"; shift 2 ;;
+      --project) project_override="$(sanitize_project "${2:?--project requires a value}")"; shift 2 ;;
+      --name) exact_paused_name="${2:?--name requires a value}"; shift 2 ;;
       --all)  show_all=1; shift ;;
       *) shift ;;
     esac
@@ -6443,10 +6727,14 @@ else: print(f'{delta // 86400}d ago')
 
   # --- Determine tool for session history ---
   local tool="$tool_override"
-  if [[ -z "$tool" ]]; then
+  # Internal exact-paused resumes (used by dash) need no history lookup or
+  # platform picker; the paused record already carries its tool and identity.
+  if [[ -n "$exact_paused_name" ]]; then
+    tool=""
+  elif [[ -z "$tool" ]]; then
     load_config
     local resumable=()
-    for t in claude amp codex; do
+    for t in claude amp codex forge; do
       command -v "$t" &>/dev/null && resumable+=("$t")
     done
 
@@ -6472,6 +6760,7 @@ else: print(f'{delta // 86400}d ago')
       amp)      harvest_fn=harvest_amp_sessions ;;
       codex)    harvest_fn=harvest_codex_sessions ;;
       opencode) harvest_fn=harvest_opencode_sessions ;;
+      forge)    harvest_fn=harvest_forge_sessions ;;
     esac
 
     if [[ -n "$harvest_fn" ]]; then
@@ -6529,16 +6818,29 @@ else: print(f'{delta // 86400}d ago')
     exit 0
   fi
 
-  local selected_line
-  selected_line=$(printf '%s\n' "${all_display[@]}" | gum filter \
-    --header "Resume" \
-    --indicator "▸" \
-    --indicator.foreground "212" \
-    --text.foreground "245" \
-    --match.foreground "212" \
-    --header.foreground "99" \
-    --prompt.foreground "39" \
-    --cursor-text.foreground "white")
+  local selected_line=""
+  if [[ -n "$exact_paused_name" ]]; then
+    for i in "${!all_raw[@]}"; do
+      local candidate_type candidate_name
+      IFS='|' read -r candidate_type candidate_name _ <<< "${all_raw[$i]}"
+      if [[ "$candidate_type" == "paused" && "$candidate_name" == "$exact_paused_name" ]]; then
+        selected_line="${all_display[$i]}"
+        break
+      fi
+    done
+    [[ -n "$selected_line" ]] \
+      || { echo "Error: no paused pane named '$exact_paused_name'." >&2; exit 1; }
+  else
+    selected_line=$(printf '%s\n' "${all_display[@]}" | gum filter \
+      --header "Resume" \
+      --indicator "▸" \
+      --indicator.foreground "212" \
+      --text.foreground "245" \
+      --match.foreground "212" \
+      --header.foreground "99" \
+      --prompt.foreground "39" \
+      --cursor-text.foreground "white")
+  fi
 
   [[ -z "$selected_line" ]] && exit 0
 
@@ -6567,8 +6869,6 @@ else: print(f'{delta // 86400}d ago')
     local pane_name="$entry_id"
     local pane_dir="$entry_dir"
     local pane_tool="$entry_tool"
-
-    remove_paused "$pane_name" || echo "Warning: could not remove '$pane_name' from paused list"
 
     # If the paused pane was riding an owner-wt slot, re-grab the same branch
     # into a fresh idle slot. The original slot may have been claimed by another
@@ -6603,10 +6903,38 @@ else: print(f'{delta // 86400}d ago')
 
     ensure_session
 
+    # A paused Forge row is itself the durable claim. Hold the claim lock while
+    # moving that identity from paused.json onto the new pane, ignoring only the
+    # exact paused row being resumed. A concurrent resume then sees the live tag.
+    if [[ "$pane_tool" == "forge" ]]; then
+      [[ "$entry_sid" =~ ^tsk-[A-Za-z0-9]+$ ]] \
+        || { echo "Error: paused Forge pane '$pane_name' has an invalid task id." >&2; exit 1; }
+      acquire_forge_claim_lock || exit 1
+      if forge_task_claim "$entry_sid" "$pane_name"; then
+        echo "Error: Forge task $entry_sid is already claimed by ${R_FORGE_TASK_CLAIM}." >&2
+        release_forge_claim_lock
+        exit 1
+      fi
+    fi
+
+    if [[ "$pane_tool" != "forge" ]] && ! remove_paused "$pane_name"; then
+      echo "Warning: could not remove '$pane_name' from paused list"
+    fi
+
     local new_pane
     new_pane=$(spawn_llm_pane "$pane_dir")
     tmux select-pane -t "$new_pane" -T "$pane_name"
     tmux set-option -p -t "$new_pane" @llmux_name "$pane_name"
+    if [[ "$pane_tool" == "forge" ]]; then
+      tmux set-option -p -t "$new_pane" @llmux_forge_task "$entry_sid"
+      if ! remove_paused "$pane_name"; then
+        tmux kill-pane -t "$new_pane" 2>/dev/null || true
+        echo "Error: paused pane '$pane_name' is no longer available." >&2
+        release_forge_claim_lock
+        exit 1
+      fi
+      release_forge_claim_lock
+    fi
     [[ -n "$entry_wt" ]] && tmux set-option -p -t "$new_pane" @llmux_worktree "$entry_wt"
     [[ -n "$adopted_slot" ]] && tmux set-option -p -t "$new_pane" @llmux_slot "$adopted_slot"
     # A resumed thread returns to the project it was paused from — including one
@@ -6667,9 +6995,21 @@ else: print(f'{delta // 86400}d ago')
       claude) resume_cmd="$tool_cmd --resume $selected_id" ;;
       amp)    resume_cmd="$tool_cmd threads continue $selected_id" ;;
       codex)  resume_cmd="$tool_cmd resume $selected_id" ;;
+      forge)  resume_cmd="$tool_cmd task open $(printf '%q' "$selected_id")" ;;
     esac
 
     ensure_session
+
+    # Close the race between harvesting and selection, and keep the lock until
+    # the pane carries the claim. No prompt or remote call occurs while held.
+    if [[ "$selected_tool" == "forge" ]]; then
+      acquire_forge_claim_lock || exit 1
+      if forge_task_claim "$selected_id"; then
+        echo "Error: Forge task $selected_id is already claimed by ${R_FORGE_TASK_CLAIM}." >&2
+        release_forge_claim_lock
+        exit 1
+      fi
+    fi
 
     # If the resumed session shares a name with a paused entry, drop the stale
     # entry so it doesn't show up duplicated in `llmux ls` / `llmux resume`.
@@ -6684,12 +7024,25 @@ else: print(f'{delta // 86400}d ago')
       claude) tmux set-option -p -t "$new_pane" @llmux_claude_session "$selected_id" ;;
       codex) tmux set-option -p -t "$new_pane" @llmux_codex_session "$selected_id" ;;
       opencode) tmux set-option -p -t "$new_pane" @llmux_opencode_session "$selected_id" ;;
+      forge)
+        tmux set-option -p -t "$new_pane" @llmux_forge_task "$selected_id"
+        release_forge_claim_lock
+        ;;
     esac
+    if [[ -n "$project_override" ]]; then
+      tmux set-option -p -t "$new_pane" @llmux_project "$project_override"
+      register_project "$project_override"
+    fi
     tag_pane_worktree "$new_pane" "$selected_dir"
     apply_layout
     tmux send-keys -t "$new_pane" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
     snapshot_session
     echo "Resuming as '$pane_name'"
+    if sidebar_enabled; then
+      cmd_switch "$pane_name"
+    else
+      attach_to_pane "$pane_name"
+    fi
   fi
 }
 
@@ -7136,6 +7489,7 @@ durable_session_exists() {
       [[ -f "$OPENCODE_DB" ]] || return 1
       [[ "$(sqlite3 "$OPENCODE_DB" "SELECT COUNT(*) FROM session WHERE id='$sid';" 2>/dev/null)" == "1" ]]
       ;;
+    forge) [[ "$sid" =~ ^tsk-[A-Za-z0-9]+$ ]] ;;
     *) return 0 ;;
   esac
 }
@@ -7167,7 +7521,7 @@ snapshot_session() {
   fi
   local rows=""
   if ! rows=$(tmux list-panes -s -t "$SESSION" \
-      -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_project}|#{@llmux_worktree}|#{@llmux_slot}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_order}|#{@llmux_pinned}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_maintenance}' \
+      -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_project}|#{@llmux_worktree}|#{@llmux_slot}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_order}|#{@llmux_pinned}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_maintenance}|#{@llmux_forge_task}' \
       2>/dev/null); then
     echo "llmux: cannot snapshot: pane inventory failed" >&2
     return 4
@@ -7207,7 +7561,7 @@ raw = sys.stdin.read()
 rows, _, opts = raw.partition("\x00")
 keys = ["name","dir","tool","project","worktree","slot","claude_session",
         "opencode_session","codex_session","order","pinned","terminal",
-        "sidebar","anchor","maintenance"]
+        "sidebar","anchor","maintenance","forge_task"]
 threads = []
 for line in rows.splitlines():
     if not line.strip():
@@ -7259,6 +7613,7 @@ server_changed = ((old_instance and instance_id != old_instance)
 if old_content:
     current = {t.get("name"): t for t in new_content}
     id_key = {"claude": "claude_session", "opencode": "opencode_session",
+              "forge": "forge_task",
               "codex": "codex_session"}
     missing = []
     for old_t in old_content:
@@ -7287,11 +7642,12 @@ if old_content:
 # failure this whole feature exists to prevent, so a blank never beats a known value.
 prev = {t.get("name"): t for t in ((d.get("session") or {}).get("threads") or [])}
 id_key = {"claude": "claude_session", "opencode": "opencode_session",
+          "forge": "forge_task",
           "codex": "codex_session"}
 for t in threads:
     old_t = prev.get(t.get("name"))
     keep_id = id_key.get(t.get("tool"))
-    for k in ("claude_session", "opencode_session", "codex_session"):
+    for k in ("claude_session", "opencode_session", "codex_session", "forge_task"):
         if k != keep_id:
             t[k] = ""
     if not old_t:
@@ -7404,7 +7760,8 @@ for t in s.get("threads", []):
         continue
     print("|".join([t.get(k, "") for k in
         ["name","dir","tool","project","worktree","slot","claude_session",
-         "opencode_session","codex_session","order","pinned","maintenance"]]))
+         "opencode_session","codex_session","order","pinned","maintenance",
+         "forge_task"]]))
 ' "$PAUSED_FILE" 2>/dev/null || true)
   if [[ -z "$rows" ]]; then
     echo "No session snapshot to restore." >&2
@@ -7420,6 +7777,19 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
 ' "$PAUSED_FILE") || return 1
   restore_sidebar=$(printf '%s\n' "$sopts" | awk -F= '$1=="sidebar_mode"{print $2; exit}')
 
+  # Claim every saved Forge task up front. A task may only be live in one pane, and
+  # the restore below creates panes one at a time -- so without a lock held across
+  # the WHOLE loop, a concurrent `llmux add --tool forge` can claim a task this
+  # restore is about to recreate. Held even when the snapshot has no Forge panes,
+  # because one can land mid-restore.
+  local restore_has_forge=0
+  while IFS='|' read -r _n _d _t _p _w _s _cs _os _cx _o _pin _m _forge; do
+    [[ "$_t" == "forge" && -n "$_forge" ]] && restore_has_forge=1
+  done <<< "$rows"
+  if (( restore_has_forge )); then
+    acquire_forge_claim_lock || return 1
+  fi
+
   # The base session supplies terminal + pinned furniture. The pinned tool must
   # stay stopped until its exact saved identity is applied below.
   local bootstrapped=0
@@ -7431,9 +7801,9 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
   fi
   tmux set-option -t "$SESSION" @llmux_restoring 1
 
-  local name dir tool project worktree slot csid osid codexid order pinned maintenance
+  local name dir tool project worktree slot csid osid codexid order pinned maintenance forge_task
   local pane n=0 failures=() expected_sid current_sid existing existing_tool identity_ok recovery_pane recovery_complete failure_text failure_count_before
-  while IFS='|' read -r name dir tool project worktree slot csid osid codexid order pinned maintenance; do
+  while IFS='|' read -r name dir tool project worktree slot csid osid codexid order pinned maintenance forge_task; do
     [[ -z "$name" ]] && continue
     failure_count_before=${#failures[@]}
     [[ -d "$dir" ]] || dir="$HOME"
@@ -7442,10 +7812,20 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
       claude) expected_sid="$csid" ;;
       opencode) expected_sid="$osid" ;;
       codex) expected_sid="$codexid" ;;
+      forge) expected_sid="$forge_task" ;;
     esac
     identity_ok=1
-    if [[ "$tool" =~ ^(claude|codex|opencode)$ && -z "$expected_sid" ]]; then
+    # A Forge task id IS that thread's durable identity, exactly like a Claude
+    # session uuid -- so it goes through the same refuse-rather-than-guess gate.
+    # Recreating a claimed task would put the same task in two panes.
+    if [[ "$tool" =~ ^(claude|codex|opencode|forge)$ && -z "$expected_sid" ]]; then
       failures+=("$name: saved $tool thread has no durable session id; refusing to start a replacement conversation")
+      identity_ok=0
+    elif [[ "$tool" == "forge" && ! "$expected_sid" =~ ^tsk-[A-Za-z0-9]+$ ]]; then
+      failures+=("$name: saved Forge task id '$expected_sid' is malformed")
+      identity_ok=0
+    elif [[ "$tool" == "forge" ]] && forge_task_claim "$expected_sid" "$name"; then
+      failures+=("$name: Forge task $expected_sid is already claimed by ${R_FORGE_TASK_CLAIM}")
       identity_ok=0
     elif [[ -n "$expected_sid" ]] && ! durable_session_exists "$tool" "$expected_sid" "$dir"; then
       failures+=("$name: saved $tool session $expected_sid no longer exists")
@@ -7458,19 +7838,20 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
         failures+=("$name: could not restore pinned working directory $dir")
       fi
       existing=$(tmux display-message -p -t "$pane" \
-        '#{pane_id}|#{@llmux_name}|#{@llmux_tool}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_pinned}|#{@llmux_recovery_pane}|#{@llmux_recovery_complete}' 2>/dev/null || true)
+        '#{pane_id}|#{@llmux_name}|#{@llmux_tool}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_forge_task}|#{@llmux_pinned}|#{@llmux_recovery_pane}|#{@llmux_recovery_complete}' 2>/dev/null || true)
     else
       existing=$(tmux list-panes -s -t "$SESSION" \
-        -F '#{pane_id}|#{@llmux_name}|#{@llmux_tool}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_pinned}|#{@llmux_recovery_pane}|#{@llmux_recovery_complete}' 2>/dev/null \
+        -F '#{pane_id}|#{@llmux_name}|#{@llmux_tool}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_forge_task}|#{@llmux_pinned}|#{@llmux_recovery_pane}|#{@llmux_recovery_complete}' 2>/dev/null \
         | awk -F'|' -v n="$name" '$2==n{print; exit}')
     fi
     if [[ -n "$existing" ]]; then
-      IFS='|' read -r pane _ existing_tool _cs _os _codex _pin recovery_pane recovery_complete <<< "$existing"
+      IFS='|' read -r pane _ existing_tool _cs _os _codex _forge _pin recovery_pane recovery_complete <<< "$existing"
       current_sid=""
       case "$tool" in
         claude) current_sid="$_cs" ;;
         opencode) current_sid="$_os" ;;
         codex) current_sid="$_codex" ;;
+        forge) current_sid="$_forge" ;;
       esac
       # A just-created pinned pane is empty furniture and is safe to populate.
       # Any other collision is reused only when it already IS the saved thread;
@@ -7530,6 +7911,13 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
             || failures+=("$name: tool resume command failed")
         fi
         ;;
+      forge)
+        if [[ -n "$forge_task" && "$identity_ok" == "1" ]]; then
+          tmux set-option -p -t "$pane" @llmux_forge_task "$forge_task"
+          resume_tool_in_pane "$pane" forge "$name" "$forge_task" 2>/dev/null \
+            || failures+=("$name: tool resume command failed")
+        fi
+        ;;
       "") ;;
       *)
         launch_tool_in_pane "$pane" "$tool" "$name" 2>/dev/null \
@@ -7542,6 +7930,9 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
     n=$((n + 1))
     echo "  + $name${tool:+ ($tool)}${project:+ → $project}"
   done <<< "$rows"
+  if (( restore_has_forge )); then
+    release_forge_claim_lock
+  fi
 
   local k v
   while IFS='=' read -r k v; do
@@ -7680,16 +8071,24 @@ cmd_refresh() {
   # The project goes in the snapshot too: refresh kills the session, and with it
   # every @llmux_project and the project registry — so without carrying it, a
   # refresh would silently dump every thread back into SCRATCH.
+  # Acquire before collecting pane state so pause cannot create a new durable
+  # Forge claim after our snapshot but before we destroy and rebuild the session.
+  acquire_forge_claim_lock || exit 1
   local pane_data=()
-  while IFS='|' read -r name dir tool is_term is_pin csid osid codexid project; do
+  while IFS='|' read -r name dir tool is_term is_pin csid osid codexid forge_task project; do
     local sid=""
     case "$tool" in
-      claude) sid="$csid" ;;
+      claude)   sid="$csid" ;;
       opencode) sid="$osid" ;;
-      codex) sid="$codexid" ;;
+      codex)    sid="$codexid" ;;
+      forge)    sid="$forge_task" ;;
     esac
     pane_data+=("$name|$dir|$tool|$is_term|$is_pin|$sid|$project")
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_project}')
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_forge_task}|#{@llmux_project}')
+
+  # A refresh temporarily destroys every live pane. Keep the claim lock even
+  # when the snapshot has no Forge panes: otherwise a new Forge add can land
+  # after the snapshot and be killed with the old session.
 
   # Stop watcher and kill the old session
   watch_stop
@@ -7741,6 +8140,7 @@ cmd_refresh() {
   fi
 
   if [[ ${#active[@]} -eq 0 ]]; then
+    release_forge_claim_lock
     echo "No named panes to restore."
     return
   fi
@@ -7771,6 +8171,8 @@ cmd_refresh() {
       resume_tool_in_pane "$new_pane" "$tool" "$name" "$sid"
     fi
   done
+
+  release_forge_claim_lock
 
   apply_layout
 
@@ -7870,21 +8272,10 @@ cmd_dash() {
           --header.foreground "99") || continue
         case "$action" in
           Resume)
-            # Remove from paused, recreate pane
-            remove_paused "$pname"
-            pdir=$(echo "${paused_entries[$i]}" | cut -d'|' -f2)
-            ptool=$(echo "${paused_entries[$i]}" | cut -d'|' -f3)
-            local new_pane
-            new_pane=$(tmux split-window -t "$SESSION" -v -c "$pdir" -P -F '#{pane_id}')
-            tmux select-pane -t "$new_pane" -T "$pname"
-            tmux set-option -p -t "$new_pane" @llmux_name "$pname"
-            tag_pane_worktree "$new_pane" "$pdir"
-            if [[ -n "$ptool" ]]; then
-              resume_tool_in_pane "$new_pane" "$ptool" "$pname"
-            fi
-            apply_layout
-            echo "Resumed '$pname'"
-            sleep 1
+            # One lifecycle implementation owns slot re-adoption, project and
+            # session identity, plus Forge's atomic paused-to-live handoff.
+            cmd_resume --all --name "$pname"
+            return
             ;;
           Remove)
             remove_paused "$pname"
