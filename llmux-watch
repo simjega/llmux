@@ -14,6 +14,7 @@
 # wrong process. Paths stay byte-identical for the default session, so a watcher that
 # is already running and an `llmux _watch-stop` from an older build both still work.
 SESSION="${LLMUX_SESSION:-llmux}"
+LLMUX_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/llmux"
 _watch_suffix=""
 [ "$SESSION" = "llmux" ] || _watch_suffix="-$SESSION"
 WATCH_STATE_DIR="/tmp/llmux-watch$_watch_suffix"
@@ -34,7 +35,8 @@ release_pidfile() {
   [ "$(cat "$WATCH_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_PIDFILE"
   return 0
 }
-trap 'release_pidfile; exit 0' INT TERM
+trap 'exit 0' INT TERM
+trap 'release_pidfile' EXIT
 
 notify() {
   local pane_name="$1"
@@ -237,7 +239,7 @@ refresh_codex_agents() {
     return 0
   fi
 
-  if ! CODEX_PANE_ROWS="$pane_rows" python3 - "$SESSION" "$codex_db" "$lock_dir" <<'PY' 2>/dev/null
+  if ! CODEX_PANE_ROWS="$pane_rows" python3 - "$SESSION" "$codex_db" "$lock_dir" "$LLMUX_SELF" <<'PY' 2>/dev/null
 import json
 import os
 import re
@@ -246,7 +248,7 @@ import subprocess
 import sys
 import time
 
-session, db_path, lock_dir = sys.argv[1:4]
+session, db_path, lock_dir, llmux_bin = sys.argv[1:5]
 uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 panes = []
@@ -259,7 +261,8 @@ for line in os.environ.get("CODEX_PANE_ROWS", "").splitlines():
     except ValueError:
         continue
     cached_root = fields[11] if len(fields) > 11 else ""
-    panes.append({"pane": fields[0], "pid": pane_pid, "cached": cached_root})
+    panes.append({"pane": fields[0], "pid": pane_pid, "cached": cached_root,
+                  "name": fields[3]})
 
 if not panes:
     subprocess.run(
@@ -350,6 +353,7 @@ def held_thread_ids(pane):
     return held
 
 roots = {}
+identity_replacements = []
 process_binding_authoritative = process_discovery_ok and lsof_discovery_ok
 for pane in panes:
     held = held_thread_ids(pane)
@@ -373,12 +377,14 @@ for pane in panes:
         root = pane["cached"]
     if root:
         roots[pane["pane"]] = root
-        subprocess.run(
+        tagged = subprocess.run(
             ["tmux", "set-option", "-p", "-t", pane["pane"], "@llmux_codex_session", root],
             check=False,
         )
+        if tagged.returncode == 0 and root != pane["cached"]:
+            identity_replacements.append(pane["name"])
     elif process_binding_authoritative:
-        subprocess.run(
+        cleared = subprocess.run(
             ["tmux", "set-option", "-p", "-t", pane["pane"], "@llmux_codex_session", ""],
             check=False,
         )
@@ -524,6 +530,12 @@ subprocess.run(
     ],
     check=False,
 )
+if identity_replacements:
+    cmd = [llmux_bin, "_snapshot"]
+    for name in identity_replacements:
+        cmd.extend(["--replace-identity", name])
+    subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, check=False)
 PY
   then
     tmux set-option -t "$SESSION" @llmux_codex_agents "" 2>/dev/null || true
@@ -541,21 +553,21 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
   # each, so it rides the existing daemon on a slow timer rather than becoming a
   # second one — and never runs in the sidebar's 2s render loop.
   if [ $((cycle % 24)) -eq 1 ]; then
-    (llmux _pr-refresh >/dev/null 2>&1 || true) &
+    ("$LLMUX_SELF" _pr-refresh >/dev/null 2>&1 || true) &
   fi
 
   # Check the daily Owner slot-maintenance schedule once a minute. The command
   # stores its last successful kick-off in a session option, reuses the existing
   # cleanup thread when idle, and creates no owner-wt slot of its own.
   if [ $((cycle % 12)) -eq 1 ]; then
-    (llmux slot-cleanup _tick >/dev/null 2>&1 || true) &
+    ("$LLMUX_SELF" slot-cleanup _tick >/dev/null 2>&1 || true) &
   fi
 
   # Mirror the live session to disk every ~60s. tmux pane options die with the
   # server, so without this a crash loses every running thread -- names, projects,
   # and the claude session ids that make them resumable.
   if [ $((cycle % 12)) -eq 5 ]; then
-    (llmux _snapshot >/dev/null 2>&1 || true) &
+    ("$LLMUX_SELF" _snapshot >/dev/null 2>&1 || true) &
   fi
 
   pane_rows=$(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}|#{?#{&&:#{pane_active},#{window_active}},1,}|#{@llmux_codex_session}' 2>/dev/null)

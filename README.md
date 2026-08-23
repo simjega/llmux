@@ -38,6 +38,8 @@ llmux attach                              # jump in
 | `llmux cycle [name]` | Restart a pane's tool in place, resuming the same session |
 | `llmux cycle all` | Cycle every pane (terminal excepted); rebuilds the sidebar in sidebar mode |
 | `llmux rm <name>` | Remove a pane by name |
+| `llmux snapshot [show\|save]` | Inspect or synchronously save the crash-recovery snapshot |
+| `llmux restore [--force]` | Reconcile a failed/partial recovery from the preserved snapshot |
 | `llmux ls` | List active panes |
 | `llmux attach` | Attach to the llmux session |
 | `llmux sidebar [on\|off]` | Toggle the thread-list UI (sidebar column, one thread visible at a time) |
@@ -46,6 +48,29 @@ llmux attach                              # jump in
 | `llmux project [ls\|new\|link\|unlink\|open]` | Tie a project to the Tolaria notes that hold its memory |
 | `llmux next` / `llmux prev` | Step to the next/previous thread (wraps) |
 | `llmux top <name>...` | Move threads to the top of their sidebar section, in the order given |
+
+### Crash recovery
+
+llmux mirrors every named live thread to `paused.json`: name, project, working
+directory, tool, layout metadata, and exact Claude, Codex, or OpenCode session ID.
+Structural commands commit that snapshot before reporting success; the sidebar and
+watcher snapshots are additional backstops.
+
+If the tmux session disappears unexpectedly, the next command that would create it
+automatically restores the complete snapshot first. Recovery is transactional:
+
+- restored panes are created independently of tmux's one-window pane-size limit;
+- the watcher and scheduled maintenance stay stopped until all panes exist;
+- every saved resumable ID is validated and restored exactly—llmux never guesses;
+- a partial recovery cannot replace the last complete snapshot;
+- malformed state or a missing transcript leaves a visible `RECOVERY FAILED` warning
+  and a retryable snapshot instead of silently booting an incomplete session.
+
+`llmux kill` is deliberate and clears only the live-session snapshot, so the next
+start is fresh. Paused threads and registered PRs remain untouched. The guarantee is
+for named threads and their last committed resumable identities; text still sitting
+unsent in a tool's composer and arbitrary process memory cannot survive a dead tmux
+server.
 
 ### Sidebar mode (thread list)
 
