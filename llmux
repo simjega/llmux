@@ -5,6 +5,7 @@ set -euo pipefail
 # exercised against a throwaway session instead of the live one:
 #   LLMUX_SESSION=llmux-test llmux sidebar on
 SESSION="${LLMUX_SESSION:-llmux}"
+LLMUX_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/llmux"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/llmux"
 CONFIG_FILE="$CONFIG_DIR/config"
 PAUSED_FILE="$CONFIG_DIR/paused.json"
@@ -274,18 +275,65 @@ warm_op_items() {
 # everything in it.
 PY_PAUSED_IO='
 def _load(path):
-    import json
+    import json, sys
     try:
         d = json.load(open(path))
-    except Exception:
+    except FileNotFoundError:
         return {"paused": [], "prs": []}
+    except Exception as e:
+        import sys
+        print("llmux: refusing to ignore invalid state in %s: %s" % (path, e), file=sys.stderr)
+        raise SystemExit(2)
     if isinstance(d, list):
         return {"paused": d, "prs": []}
+    if not isinstance(d, dict):
+        import sys
+        print("llmux: refusing to ignore invalid state in %s: expected object or list" % path, file=sys.stderr)
+        raise SystemExit(2)
     d.setdefault("paused", [])
     d.setdefault("prs", [])
     d.setdefault("session", {})
     d.setdefault("monitors", {})
     d.setdefault("flags", {})
+    for key in ("paused", "prs"):
+        if not isinstance(d[key], list):
+            print("llmux: refusing invalid state in %s: %s must be a list" % (path, key), file=sys.stderr)
+            raise SystemExit(2)
+        if any(not isinstance(row, dict) for row in d[key]):
+            print("llmux: refusing invalid state in %s: every %s entry must be an object" % (path, key), file=sys.stderr)
+            raise SystemExit(2)
+    for key in ("session", "monitors", "flags"):
+        if not isinstance(d[key], dict):
+            print("llmux: refusing invalid state in %s: %s must be an object" % (path, key), file=sys.stderr)
+            raise SystemExit(2)
+    if "threads" in d["session"] and not isinstance(d["session"]["threads"], list):
+        print("llmux: refusing invalid state in %s: session.threads must be a list" % path, file=sys.stderr)
+        raise SystemExit(2)
+    if any(not isinstance(row, dict) for row in d["session"].get("threads", [])):
+        print("llmux: refusing invalid state in %s: every session thread must be an object" % path, file=sys.stderr)
+        raise SystemExit(2)
+    thread_fields = ("name", "dir", "tool", "project", "worktree", "slot",
+                     "claude_session", "opencode_session", "codex_session",
+                     "order", "pinned", "terminal", "sidebar", "anchor",
+                     "maintenance")
+    for row in d["session"].get("threads", []):
+        if any(key in row and not isinstance(row[key], str) for key in thread_fields):
+            print("llmux: refusing invalid state in %s: session thread fields must be strings" % path, file=sys.stderr)
+            raise SystemExit(2)
+        if any("|" in row.get(key, "") or "\n" in row.get(key, "") for key in thread_fields):
+            print("llmux: refusing invalid state in %s: session thread fields contain a reserved delimiter" % path, file=sys.stderr)
+            raise SystemExit(2)
+    names = [row.get("name", "") for row in d["session"].get("threads", [])]
+    if any(names.count(name) > 1 for name in names if name):
+        print("llmux: refusing invalid state in %s: duplicate session thread names" % path, file=sys.stderr)
+        raise SystemExit(2)
+    for key in ("saved_at", "created_at"):
+        if key in d["session"] and not isinstance(d["session"][key], (int, float)):
+            print("llmux: refusing invalid state in %s: session.%s must be numeric" % (path, key), file=sys.stderr)
+            raise SystemExit(2)
+    if "options" in d["session"] and not isinstance(d["session"]["options"], dict):
+        print("llmux: refusing invalid state in %s: session.options must be an object" % path, file=sys.stderr)
+        raise SystemExit(2)
     return d
 
 def _save(path, d):
@@ -795,9 +843,9 @@ capture_claude_session_async() {
   local claimed
   claimed="$(tmux list-panes -s -t "$SESSION" -F '#{@llmux_claude_session}' 2>/dev/null | grep -v '^$' | paste -sd, - 2>/dev/null || true)"
   (
-    python3 - "$cwd" "$since_epoch" "$pane_target" "$claimed" <<'PY' 2>/dev/null &
+    python3 - "$cwd" "$since_epoch" "$pane_target" "$claimed" "$LLMUX_SELF" <<'PY' 2>/dev/null &
 import os, sys, glob, time, subprocess, re
-cwd, since, pane = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+cwd, since, pane, llmux_bin = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[5]
 claimed = {u for u in (sys.argv[4] if len(sys.argv) > 4 else '').split(',') if u}
 proj_root = os.path.expanduser('~/.claude/projects')
 # Resolve symlinks too: /tmp/x is stored under the -private-tmp slug on macOS.
@@ -849,10 +897,13 @@ while time.time() < deadline:
 if match:
     m = UUID_RE.search(match)
     if m:
-        subprocess.run(
+        tagged = subprocess.run(
             ['tmux', 'set-option', '-p', '-t', pane, '@llmux_claude_session', m.group(1)],
             check=False,
         )
+        if tagged.returncode == 0:
+            subprocess.run([llmux_bin, '_snapshot'], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=False)
 PY
   ) &
   disown
@@ -883,9 +934,9 @@ capture_opencode_session_async() {
   local claimed
   claimed="$(tmux list-panes -s -t "$SESSION" -F '#{@llmux_opencode_session}' 2>/dev/null | grep -v '^$' | paste -sd, - 2>/dev/null || true)"
   (
-    python3 - "$OPENCODE_DB" "$cwd" "$since_ms" "$pane_target" "$claimed" <<'PY' 2>/dev/null &
+    python3 - "$OPENCODE_DB" "$cwd" "$since_ms" "$pane_target" "$claimed" "$LLMUX_SELF" <<'PY' 2>/dev/null &
 import os, sqlite3, subprocess, sys, time
-db, cwd, since, pane = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+db, cwd, since, pane, llmux_bin = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[6]
 claimed = {s for s in (sys.argv[5] if len(sys.argv) > 5 else '').split(',') if s}
 real = os.path.realpath(cwd)
 
@@ -916,10 +967,13 @@ while time.time() < deadline and not found:
         time.sleep(2)
 
 if found:
-    subprocess.run(
+    tagged = subprocess.run(
         ['tmux', 'set-option', '-p', '-t', pane, '@llmux_opencode_session', found],
         check=False,
     )
+    if tagged.returncode == 0:
+        subprocess.run([llmux_bin, '_snapshot'], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
 PY
   ) &
   disown
@@ -1010,7 +1064,13 @@ resume_tool_in_pane() {
       fi
       [[ -n "$session_name" ]] && resume_cmd+=" -n $(printf '%q' "$session_name")"
       ;;
-    codex)  resume_cmd+="$tool_cmd resume --last" ;;
+    codex)
+      if [[ -n "$session_id" ]]; then
+        resume_cmd+="$tool_cmd resume $(printf '%q' "$session_id")"
+      else
+        resume_cmd+="$tool_cmd resume --last"
+      fi
+      ;;
     opencode)
       # opencode takes -s <session-id> (or -c for the most recent). Its ids are
       # opaque `ses_...` strings minted lazily on the first message, so unlike
@@ -1049,7 +1109,25 @@ is_default_title() {
 
 ensure_session() {
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    # A vanished tmux server is a recovery event, not permission to start over.
+    # Restore before creating a blank session so `attach`, `add`, scheduled
+    # maintenance, and every other ensure_session caller converge on the same
+    # behaviour. cmd_restore sets the skip flag while it creates the base session
+    # to avoid recursing back into itself.
+    if [[ "${LLMUX_SKIP_AUTO_RESTORE:-}" != "1" ]]; then
+      local snapshot_state=0
+      snapshot_has_recoverable_threads || snapshot_state=$?
+      if (( snapshot_state == 0 )); then
+        echo "[llmux] Session disappeared; restoring the last complete snapshot..." >&2
+        LLMUX_SKIP_AUTO_RESTORE=1 cmd_restore --auto
+        return $?
+      elif (( snapshot_state > 1 )); then
+        echo "Error: recovery state is unreadable; refusing to create a blank session." >&2
+        return "$snapshot_state"
+      fi
+    fi
     tmux new-session -d -s "$SESSION" -x 200 -y 50
+    tmux set-option -t "$SESSION" @llmux_instance_id "$(uuidgen | tr '[:upper:]' '[:lower:]')"
     # Enable pane titles in the border (with waiting indicator)
     tmux set-option -t "$SESSION" pane-border-status top
     # Status prefix, most-urgent first. `blocked`/`perm` get a WORD, not just a
@@ -1098,7 +1176,7 @@ ensure_session() {
     # Auto re-layout when a pane exits
     tmux set-hook -t "$SESSION" pane-exited "run-shell 'llmux _relayout 2>/dev/null || true'"
     # Start the background watcher for waiting-state detection
-    watch_start
+    [[ "${LLMUX_SKIP_WATCH_START:-}" == "1" ]] || watch_start
     INITIAL_PANE=1
   fi
 }
@@ -1129,7 +1207,7 @@ ensure_session() {
 # #[...] must be escaped as #, — see the pane-border format below.
 apply_status_right() {
   tmux set-option -t "$SESSION" status-right \
-    "#(llmux _slot-status)#(llmux _status-count)#(reviewq _status-count)#{?mouse,,#[fg=colour203#,bold] MOUSE OFF (prefix+m) #[default]} %H:%M " 2>/dev/null || true
+    "#{?#{@llmux_restore_error},#[fg=colour203#,bold] RECOVERY FAILED: #{@llmux_restore_error} #[default],}#(llmux _slot-status)#(llmux _status-count)#(reviewq _status-count)#{?mouse,,#[fg=colour203#,bold] MOUSE OFF (prefix+m) #[default]} %H:%M " 2>/dev/null || true
   tmux set-option -t "$SESSION" status-right-length 200 2>/dev/null || true
 }
 
@@ -2915,10 +2993,11 @@ sidebar_loop() {
     # Snapshot when the thread set CHANGES, not on a timer: a crash moments after
     # adding or removing a thread should still recover it, and the digest makes the
     # common case (nothing changed) free.
-    _sig=$(tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}|#{@llmux_project}|#{@llmux_tool}' 2>/dev/null | md5 -q 2>/dev/null || true)
+    _sig="$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_mode 2>/dev/null || true)|"
+    _sig+=$(tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}|#{@llmux_project}|#{@llmux_tool}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_order}' 2>/dev/null | md5 -q 2>/dev/null || true)
     if [[ -n "$_sig" && "$_sig" != "${_snap_sig:-}" ]]; then
       _snap_sig="$_sig"
-      snapshot_session
+      snapshot_session || true
     fi
     sleep 2
   done
@@ -3214,6 +3293,7 @@ move_thread_to() {
   if sidebar_enabled; then
     render_sidebar
   fi
+  snapshot_session || return $?
   echo "Moved '${name:-$pane}' to ${label}"
 }
 
@@ -3769,6 +3849,7 @@ cmd_top() {
       [[ -z "$pane_id" ]] && continue
       tmux set-option -p -t "$pane_id" @llmux_order "" 2>/dev/null || true
     done < <(list_threads)
+    snapshot_session || return $?
     render_sidebar
     echo "Thread order reset."
     return 0
@@ -3791,6 +3872,7 @@ cmd_top() {
     ((rank++))
   done
 
+  snapshot_session || return $?
   render_sidebar
   echo "Thread order:"
   local n=1 pane_id name rest2
@@ -3954,6 +4036,7 @@ cmd_sidebar() {
       sidebar_unbind_keys
       sidebar_unhook_resize
       apply_layout
+      snapshot_unless_restoring || return $?
       echo "Sidebar mode off — classic layout restored."
       return 0
       ;;
@@ -3980,6 +4063,7 @@ cmd_sidebar() {
     apply_status_right
     sidebar_apply_layout
     render_sidebar
+    snapshot_unless_restoring || return $?
     echo "Sidebar mode already on — bindings re-registered."
     return 0
   fi
@@ -4067,6 +4151,7 @@ cmd_sidebar() {
   local loop_cmd="clear; while :; do ${inner} || break; sleep 1; done"
   tmux send-keys -t "$sb" "$loop_cmd" Enter
   tmux select-pane -t "$first_pane" 2>/dev/null || true
+  snapshot_unless_restoring || return $?
 
   echo "Sidebar mode on — ${#threads[@]} thread(s):"
   local n=1
@@ -4323,6 +4408,7 @@ cmd_add() {
   if [[ "$tool_override" != "none" ]]; then
     launch_tool_in_pane "$new_pane" "$tool_override" "$name"
   fi
+  snapshot_session
   echo "Created pane '$name' in $dir"
   # In sidebar mode the pane was spawned off the terminal pane, which lives in the
   # hidden _parked window — attach_to_pane does select-window and would drag the
@@ -4421,6 +4507,7 @@ cmd_prompt() {
     apply_layout
   fi
   launch_tool_in_pane "$new_pane" "$tool_override" "$name"
+  snapshot_session
 
   # After tool is ready (and /rename has fired at t≈3s), paste the prompt + Enter
   (
@@ -4568,6 +4655,7 @@ except Exception: print(999)" 2>/dev/null || echo 999)
     tmux set-option -p -t "$cleanup_pane" @llmux_maintenance slot-cleanup 2>/dev/null || return 1
   fi
 
+  snapshot_session
   set_slot_cleanup_last "$now" || return 1
   tmux set-option -t "$SESSION" @llmux_slot_cleanup_at "$now" 2>/dev/null || true
   echo "Slot cleanup kicked off in background thread '$cleanup_name'"
@@ -4672,17 +4760,17 @@ cmd_rm() {
   if [[ "$pane_count" -le 2 ]]; then
     # Only terminal + this pane left — kill just the LLM pane, keep terminal
     tmux kill-pane -t "$target_pane"
-    echo "Removed pane '$name'"
   else
     tmux kill-pane -t "$target_pane"
     apply_layout
-    echo "Removed pane '$name'"
   fi
 
   if [[ -n "$pane_slot" ]]; then
     release_slot "$pane_slot"
-    echo "Released $pane_slot back to idle"
   fi
+  snapshot_session --remove "$name" || return $?
+  echo "Removed pane '$name'"
+  [[ -n "$pane_slot" ]] && echo "Released $pane_slot back to idle"
 }
 
 # Pause a single pane by name. Echoes a status line; returns 0 on success,
@@ -4711,18 +4799,21 @@ pause_one() {
   fi
 
   local target_pane="" pane_dir="" pane_tool="" pane_wt="" pane_sid="" pane_slot="" pane_project=""
-  while IFS='|' read -r pid pname pdir ptool pwt pterm psid pslot pproj; do
+  local pane_ocsid="" pane_csid=""
+  while IFS='|' read -r pid pname pdir ptool pwt pterm psid pocsid pcsid pslot pproj; do
     if [[ "$pname" == "$name" ]]; then
       target_pane="$pid"
       pane_dir="$pdir"
       pane_tool="$ptool"
       pane_wt="$pwt"
       pane_sid="$psid"
+      pane_ocsid="$pocsid"
+      pane_csid="$pcsid"
       pane_slot="$pslot"
       pane_project="$pproj"
       break
     fi
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_claude_session}|#{@llmux_slot}|#{@llmux_project}')
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_slot}|#{@llmux_project}')
 
   if [[ -z "$target_pane" ]]; then
     echo "Skipping '$name': no pane with that name"
@@ -4746,10 +4837,17 @@ pause_one() {
     remove_paused "$name" >/dev/null 2>&1 || true
   fi
 
+  case "$pane_tool" in
+    opencode) pane_sid="$pane_ocsid" ;;
+    codex) pane_sid="$pane_csid" ;;
+  esac
   add_paused "$name" "$pane_dir" "$pane_tool" "$pane_wt" "$pane_sid" "$pane_slot" "$pane_project"
   tmux kill-pane -t "$target_pane"
   if [[ -n "$pane_slot" ]]; then
     release_slot "$pane_slot"
+  fi
+  snapshot_session --remove "$name" || return $?
+  if [[ -n "$pane_slot" ]]; then
     echo "Paused '$name' (released $pane_slot back to idle)"
   else
     echo "Paused '$name'"
@@ -4803,15 +4901,20 @@ cmd_pause() {
     done <<< "$selection"
   fi
 
-  local paused_count=0
+  local paused_count=0 pause_failures=0
   for name in "${names[@]}"; do
-    pause_one "$name" "$force" && paused_count=$((paused_count + 1))
+    if pause_one "$name" "$force"; then
+      paused_count=$((paused_count + 1))
+    else
+      pause_failures=$((pause_failures + 1))
+    fi
   done
 
   if [[ $paused_count -gt 0 ]]; then
     apply_layout
     echo "Resume anytime with: llmux resume"
   fi
+  (( pause_failures == 0 ))
 }
 
 # Does session <sid> have a transcript under <cwd>'s claude project dir?
@@ -4875,10 +4978,13 @@ cmd_cycle_all() {
   local was_sidebar=0
   if sidebar_enabled; then
     was_sidebar=1
-    cmd_sidebar off >/dev/null 2>&1 || true
+    if ! cmd_sidebar off >/dev/null; then
+      echo "Error: could not durably disable the sidebar; no panes were cycled." >&2
+      return 1
+    fi
   fi
 
-  local entry nm tl
+  local entry nm tl failures=0 cycled=0
   for entry in "${names[@]}"; do
     nm="${entry%%|*}"
     tl="${entry#*|}"
@@ -4886,9 +4992,19 @@ cmd_cycle_all() {
     # session it refuses to guess) skips just that pane instead of aborting the
     # whole sweep. CYCLE_NO_ATTACH stops focus bouncing across every pane.
     if [[ -z "$tl" ]]; then
-      ( CYCLE_NO_ATTACH=1 cmd_cycle "$nm" --tool none ) || echo "  (skipped '$nm')" >&2
+      if ( CYCLE_NO_ATTACH=1 cmd_cycle "$nm" --tool none ); then
+        cycled=$((cycled + 1))
+      else
+        failures=$((failures + 1))
+        echo "  (failed '$nm')" >&2
+      fi
     else
-      ( CYCLE_NO_ATTACH=1 cmd_cycle "$nm" ) || echo "  (skipped '$nm')" >&2
+      if ( CYCLE_NO_ATTACH=1 cmd_cycle "$nm" ); then
+        cycled=$((cycled + 1))
+      else
+        failures=$((failures + 1))
+        echo "  (failed '$nm')" >&2
+      fi
     fi
   done
 
@@ -4901,10 +5017,15 @@ cmd_cycle_all() {
     if ! cmd_sidebar on >/dev/null 2>&1 || ! sidebar_enabled; then
       echo "Warning: could not rebuild the sidebar after cycling — the session is in" >&2
       echo "         classic mode. Re-run: llmux sidebar on" >&2
+      failures=$((failures + 1))
     fi
   fi
 
-  echo "Cycled ${#names[@]} pane(s)."
+  if (( failures > 0 )); then
+    echo "Cycle incomplete: $cycled of ${#names[@]} pane(s) succeeded." >&2
+    return 1
+  fi
+  echo "Cycled $cycled pane(s)."
 }
 
 # Restart a pane as a bare shell, IN PLACE. respawn-pane keeps the pane id and
@@ -4926,7 +5047,6 @@ respawn_bare_shell() {
   if sidebar_enabled; then
     render_sidebar
   fi
-  echo "Cycled '${name:-$pane}' (bare shell)"
   return 0
 }
 
@@ -4982,14 +5102,14 @@ cmd_cycle() {
   # Capture pane metadata before killing — including the captured claude session
   # UUID so we resume the exact same session (--resume <id>) rather than
   # --continue, which only grabs the most-recent session in the cwd.
-  local target_pane="" pane_dir="" pane_tool="" pane_wt="" pane_pinned="" pane_sid="" pane_ocsid="" pane_project=""
-  while IFS='|' read -r pid pname pdir ptool pwt _pterm ppin psid pocsid pproj; do
+  local target_pane="" pane_dir="" pane_tool="" pane_wt="" pane_pinned="" pane_sid="" pane_ocsid="" pane_csid="" pane_project=""
+  while IFS='|' read -r pid pname pdir ptool pwt _pterm ppin psid pocsid pcsid pproj; do
     if [[ "$pname" == "$name" ]]; then
       target_pane="$pid"; pane_dir="$pdir"; pane_tool="$ptool"; pane_wt="$pwt"; pane_pinned="$ppin"
-      pane_sid="$psid"; pane_ocsid="$pocsid"; pane_project="$pproj"
+      pane_sid="$psid"; pane_ocsid="$pocsid"; pane_csid="$pcsid"; pane_project="$pproj"
       break
     fi
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_project}')
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_worktree}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_project}')
 
   if [[ -z "$target_pane" ]]; then
     echo "Error: no pane named '$name'"
@@ -5018,8 +5138,10 @@ cmd_cycle() {
   # must NOT be stored as a tool named "none" or resume_tool_in_pane would try to
   # launch that. It is the one --tool value that is a sentinel, not a program.
   if [[ "$tool_override" == "none" ]]; then
-    respawn_bare_shell "$target_pane" "$pane_dir" "$name"
-    return $?
+    respawn_bare_shell "$target_pane" "$pane_dir" "$name" || return $?
+    snapshot_session --replace-identity "$name" || return $?
+    echo "Cycled '$name' (bare shell)"
+    return 0
   fi
   if [[ -z "$pane_tool" ]]; then
     if [[ -z "$tool_override" ]]; then
@@ -5047,6 +5169,8 @@ cmd_cycle() {
   # available guess for a session id that is only minted on the first message.
   if [[ "$pane_tool" == "opencode" ]]; then
     pane_sid="$pane_ocsid"
+  elif [[ "$pane_tool" == "codex" ]]; then
+    pane_sid="$pane_csid"
   fi
 
   if [[ "$pane_tool" == "claude" ]]; then
@@ -5123,6 +5247,7 @@ cmd_cycle() {
     echo "Warning: '$name' had no @llmux_tool and no default tool configured — pane is bare shell" >&2
   fi
 
+  snapshot_session --replace-identity "$name" || return $?
   echo "Cycled '$name'"
   # `cycle all` sets CYCLE_NO_ATTACH so focus doesn't bounce across every pane
   # as the sweep runs; a plain `cycle <name>` still attaches as before.
@@ -5481,11 +5606,11 @@ sender_thread_name() {
 # have nobody to talk to.
 thread_directory() {
   tmux list-panes -s -t "$SESSION" \
-    -F '#{pane_id}|#{@llmux_name}|#{@llmux_project}|#{@llmux_tool}|#{@llmux_status}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{pane_current_path}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_done_at}' \
+    -F '#{pane_id}|#{@llmux_name}|#{@llmux_project}|#{@llmux_tool}|#{@llmux_status}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{pane_current_path}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_done_at}' \
     2>/dev/null | awk -F'|' '
-      $2 != "" && $9 != "1" && $10 != "1" && $11 != "1" {
-        sid = ($6 != "") ? $6 : $7
-        printf "%s|%s|%s|%s|%s|%s|%s|%s\n", $1, $2, ($3 == "" ? "scratch" : $3), $4, $5, sid, $8, $12
+      $2 != "" && $10 != "1" && $11 != "1" && $12 != "1" {
+        sid = ($6 != "") ? $6 : (($7 != "") ? $7 : $8)
+        printf "%s|%s|%s|%s|%s|%s|%s|%s\n", $1, $2, ($3 == "" ? "scratch" : $3), $4, $5, sid, $9, $13
       }'
 }
 
@@ -6318,6 +6443,8 @@ else: print(f'{delta // 86400}d ago')
       resume_tool_in_pane "$new_pane" "$pane_tool" "$pane_name" "$entry_sid"
     fi
 
+    snapshot_session
+
     if [[ -n "$adopted_slot" ]]; then
       echo "Resumed '$pane_name' on $adopted_slot"
     else
@@ -6372,9 +6499,16 @@ else: print(f'{delta // 86400}d ago')
     new_pane=$(spawn_llm_pane "$selected_dir")
     tmux select-pane -t "$new_pane" -T "$pane_name"
     tmux set-option -p -t "$new_pane" @llmux_name "$pane_name"
+    tmux set-option -p -t "$new_pane" @llmux_tool "$selected_tool"
+    case "$selected_tool" in
+      claude) tmux set-option -p -t "$new_pane" @llmux_claude_session "$selected_id" ;;
+      codex) tmux set-option -p -t "$new_pane" @llmux_codex_session "$selected_id" ;;
+      opencode) tmux set-option -p -t "$new_pane" @llmux_opencode_session "$selected_id" ;;
+    esac
     tag_pane_worktree "$new_pane" "$selected_dir"
     apply_layout
     tmux send-keys -t "$new_pane" "unset CLAUDECODE CLAUDE_CODE_SESSION; $resume_cmd" Enter
+    snapshot_session
     echo "Resuming as '$pane_name'"
   fi
 }
@@ -6434,11 +6568,14 @@ cmd_grab() {
   grab_dir=$(tmux display-message -p -t "$SESSION" '#{pane_current_path}')
   tag_pane_worktree "$SESSION" "$grab_dir"
   apply_layout
+  snapshot_session
   echo "Grabbed pane '$source' as '$name'"
 }
 
-WATCH_PIDFILE="/tmp/llmux-watch.pid"
-WATCH_STATE_DIR="/tmp/llmux-watch"
+_watch_suffix=""
+[[ "$SESSION" == "llmux" ]] || _watch_suffix="-$SESSION"
+WATCH_PIDFILE="/tmp/llmux-watch${_watch_suffix}.pid"
+WATCH_STATE_DIR="/tmp/llmux-watch${_watch_suffix}"
 
 watch_stop() {
   # Kill any tracked watcher first.
@@ -6446,10 +6583,12 @@ watch_stop() {
     kill "$(cat "$WATCH_PIDFILE")" 2>/dev/null || true
     rm -f "$WATCH_PIDFILE"
   fi
-  # Also kill any orphaned watcher processes — restarts before this fix
-  # could leave stale watchers around that compete to write @llmux_ctx,
-  # causing the displayed value to oscillate. Clean slate every start.
-  pkill -f "bash .*/llmux-watch" 2>/dev/null || true
+  # The legacy default watcher predates session-scoped pidfiles, so retain its
+  # orphan cleanup. Never use that broad fallback for an isolated session: it
+  # would kill Jay's live watcher while testing llmux-dev.
+  if [[ "$SESSION" == "llmux" ]]; then
+    pkill -f "bash .*/llmux-watch" 2>/dev/null || true
+  fi
 }
 
 watch_start() {
@@ -6770,15 +6909,93 @@ cmd_review() {
 # was atomicity (fixed: temp file + fsync + rename) and concurrent-write safety
 # (fixed: flock). A database would add a dependency and a migration without
 # persisting one byte more than this does.
+
+# True when disk holds at least one real thread worth recovering. Terminal and
+# scheduled-maintenance panes do not make a session; the pinned development
+# thread does. This is intentionally cheap because ensure_session calls it only
+# when no tmux session exists.
+snapshot_has_recoverable_threads() {
+  [[ -f "$PAUSED_FILE" ]] || return 1
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+d = _load(sys.argv[1])
+threads = (d.get("session") or {}).get("threads") or []
+raise SystemExit(0 if any(t.get("terminal") != "1" and not t.get("maintenance")
+                          for t in threads) else 1)
+' "$PAUSED_FILE"
+}
+
+# `llmux kill` is deliberate, unlike a dead tmux server. Clear only the derived
+# live-session mirror; paused threads and registered PRs share this file and must
+# survive. Without this marker, auto-restore would correctly—but surprisingly—
+# resurrect a session the user explicitly killed.
+clear_session_snapshot() {
+  [[ -f "$PAUSED_FILE" ]] || return 0
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+path = sys.argv[1]
+_lk = _lock(path)
+d = _load(path)
+d.pop("session", None)
+_save(path, d)
+' "$PAUSED_FILE"
+}
+
+durable_session_exists() {
+  local tool="$1" sid="$2" dir="$3"
+  [[ -z "$sid" ]] && return 0
+  case "$tool" in
+    claude) claude_session_in_cwd "$sid" "$dir" ;;
+    codex)
+      [[ "$sid" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+      [[ -f "$HOME/.codex/state_5.sqlite" ]] || return 1
+      [[ "$(sqlite3 "$HOME/.codex/state_5.sqlite" "SELECT COUNT(*) FROM threads WHERE id='$sid';" 2>/dev/null)" == "1" ]]
+      ;;
+    opencode)
+      [[ "$sid" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+      [[ -f "$OPENCODE_DB" ]] || return 1
+      [[ "$(sqlite3 "$OPENCODE_DB" "SELECT COUNT(*) FROM session WHERE id='$sid';" 2>/dev/null)" == "1" ]]
+      ;;
+    *) return 0 ;;
+  esac
+}
+
 snapshot_session() {
-  tmux has-session -t "$SESSION" 2>/dev/null || return 0
-  local rows="" line
-  while IFS='|' read -r line; do
-    [[ -n "$line" ]] && rows+="${line}"$'\n'
-  done < <(tmux list-panes -s -t "$SESSION" \
-      -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_project}|#{@llmux_worktree}|#{@llmux_slot}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_order}|#{@llmux_pinned}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}' \
-      2>/dev/null || true)
-  [[ -z "$rows" ]] && return 0
+  local removed_names="${LLMUX_SNAPSHOT_REMOVED:-}" replaced_names="${LLMUX_SNAPSHOT_REPLACED:-}"
+  local recovery_commit="${LLMUX_SNAPSHOT_RECOVERY_COMMIT:-0}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --remove)
+        removed_names+="${2:?--remove requires a pane name}"$'\n'
+        shift 2
+        ;;
+      --replace-identity)
+        replaced_names+="${2:?--replace-identity requires a pane name}"$'\n'
+        shift 2
+        ;;
+      --recovery-commit) recovery_commit=1; shift ;;
+      *) echo "Error: unknown snapshot authorization '$1'" >&2; return 2 ;;
+    esac
+  done
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "llmux: cannot snapshot: session '$SESSION' disappeared" >&2
+    return 4
+  fi
+  if [[ "$(tmux show-option -t "$SESSION" -qv @llmux_restoring 2>/dev/null || true)" == "1" \
+        && "$recovery_commit" != "1" ]]; then
+    return 3
+  fi
+  local rows=""
+  if ! rows=$(tmux list-panes -s -t "$SESSION" \
+      -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_project}|#{@llmux_worktree}|#{@llmux_slot}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_order}|#{@llmux_pinned}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_maintenance}' \
+      2>/dev/null); then
+    echo "llmux: cannot snapshot: pane inventory failed" >&2
+    return 4
+  fi
+  if [[ -z "$rows" ]]; then
+    echo "llmux: cannot snapshot: pane inventory was unexpectedly empty" >&2
+    return 4
+  fi
 
   local opts=""
   local o
@@ -6791,28 +7008,46 @@ snapshot_session() {
   # the writer so it can refuse to clobber a rich snapshot with the empty one.
   local screated
   screated=$(tmux display-message -p -t "$SESSION" '#{session_created}' 2>/dev/null || echo 0)
+  local instance_id
+  instance_id=$(tmux show-option -t "$SESSION" -qv @llmux_instance_id 2>/dev/null || true)
+  if [[ -z "$instance_id" ]]; then
+    instance_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+    tmux set-option -t "$SESSION" @llmux_instance_id "$instance_id"
+  fi
 
-  printf '%s\x00%s' "$rows" "$opts" | python3 -c "$PY_PAUSED_IO"'
+  local snapshot_rc
+  if printf '%s\x00%s' "$rows" "$opts" | python3 -c "$PY_PAUSED_IO"'
 import sys, time
 path = sys.argv[1]
 session_created = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 0
+instance_id = sys.argv[3]
+removed_names = {n for n in sys.argv[4].split("\n") if n}
+replaced_names = {n for n in sys.argv[5].split("\n") if n}
 raw = sys.stdin.read()
 rows, _, opts = raw.partition("\x00")
 keys = ["name","dir","tool","project","worktree","slot","claude_session",
-        "opencode_session","order","pinned","terminal","sidebar","anchor"]
+        "opencode_session","codex_session","order","pinned","terminal",
+        "sidebar","anchor","maintenance"]
 threads = []
 for line in rows.splitlines():
     if not line.strip():
         continue
     f = line.split("|")
-    f += [""] * (len(keys) - len(f))
+    if len(f) != len(keys):
+        print("llmux: refusing snapshot with malformed pane metadata", file=sys.stderr)
+        sys.exit(2)
     t = dict(zip(keys, f))
     # The sidebar and the parked-window placeholder are furniture, not work.
     if t["sidebar"] == "1" or t["anchor"] == "1" or not t["name"]:
         continue
     threads.append(t)
 if not threads:
-    sys.exit(0)
+    print("llmux: refusing snapshot with no named panes", file=sys.stderr)
+    sys.exit(4)
+names = [t["name"] for t in threads]
+if len(names) != len(set(names)):
+    print("llmux: refusing snapshot with duplicate pane names", file=sys.stderr)
+    sys.exit(2)
 options = {}
 for line in opts.splitlines():
     k, _, v = line.partition("=")
@@ -6821,23 +7056,49 @@ for line in opts.splitlines():
 _lk = _lock(path)
 d = _load(path)
 
-# Crash-recovery guard. After a reboot the tmux server comes up with a bare
-# session (a terminal, maybe one auto-launched pane) and the snapshotter would
-# overwrite the rich pre-crash record that `llmux restore` needs -- which is
-# exactly how a live session was lost once. Refuse to shrink a multi-thread
-# snapshot down to at most one real thread WHEN the server has restarted since
-# that snapshot was taken (session_created > saved_at). A genuine wind-down on
-# the SAME server is not blocked: there session_created predates saved_at. And
-# the moment the session grows back past one thread the guard stops firing, so
-# it never freezes a snapshot that is legitimately changing.
+# Crash-recovery guard. After a reboot, NO partial replacement is allowed—not
+# even 8 of 9 threads. That exact case silently erased build-great-emails-how.
+# A prior thread counts as recovered only when name/tool and every durable
+# session id match. The old snapshot remains untouched until the whole set is
+# present, so `llmux snapshot show` and the next restore still surface anything
+# that failed instead of laundering the partial result into the new truth.
 old_sess = d.get("session") or {}
 old_threads = old_sess.get("threads") or []
 old_saved = old_sess.get("saved_at", 0)
-new_content = [t for t in threads if t.get("terminal") != "1"]
-old_content = [t for t in old_threads if t.get("terminal") != "1"]
-if (len(new_content) <= 1 and len(old_content) >= 2
-        and old_saved > 0 and session_created > old_saved):
-    sys.exit(0)
+old_created = old_sess.get("created_at", 0)
+old_instance = old_sess.get("instance_id", "")
+def _content(ts):
+    return [t for t in ts
+            if t.get("terminal") != "1" and not t.get("maintenance")]
+new_content = _content(threads)
+old_content = _content(old_threads)
+server_changed = ((old_instance and instance_id != old_instance)
+                  or (not old_instance and old_created and session_created != old_created)
+                  or (not old_instance and not old_created and old_saved > 0
+                      and session_created > old_saved))
+if old_content:
+    current = {t.get("name"): t for t in new_content}
+    id_key = {"claude": "claude_session", "opencode": "opencode_session",
+              "codex": "codex_session"}
+    missing = []
+    for old_t in old_content:
+        new_t = current.get(old_t.get("name"))
+        key = id_key.get(old_t.get("tool"))
+        name = old_t.get("name")
+        if not new_t:
+            if name not in removed_names:
+                missing.append(name or "(unnamed)")
+        elif old_t.get("tool") and new_t.get("tool") != old_t.get("tool"):
+            if name not in replaced_names:
+                missing.append(name or "(unnamed)")
+        elif key and old_t.get(key) and new_t.get(key) != old_t.get(key):
+            if name not in replaced_names:
+                missing.append(name or "(unnamed)")
+    if missing:
+        reason = "partial recovery" if server_changed else "implicit thread removal"
+        print("llmux: refusing %s snapshot; still missing: %s" %
+              (reason, ", ".join(missing)), file=sys.stderr)
+        sys.exit(3)
 
 # Identity is monotonic: a thread that HAD a session id has not stopped having one
 # just because this read came back blank. Without this, one degraded snapshot -- a
@@ -6845,24 +7106,75 @@ if (len(new_content) <= 1 and len(old_content) >= 2
 # overwrites the only record of how to resume that conversation. Losing that is the
 # failure this whole feature exists to prevent, so a blank never beats a known value.
 prev = {t.get("name"): t for t in ((d.get("session") or {}).get("threads") or [])}
+id_key = {"claude": "claude_session", "opencode": "opencode_session",
+          "codex": "codex_session"}
 for t in threads:
     old_t = prev.get(t.get("name"))
+    keep_id = id_key.get(t.get("tool"))
+    for k in ("claude_session", "opencode_session", "codex_session"):
+        if k != keep_id:
+            t[k] = ""
     if not old_t:
         continue
-    for k in ("claude_session", "opencode_session", "worktree", "slot", "project", "tool"):
+    if (keep_id and old_t.get("tool") == t.get("tool")
+            and not t.get(keep_id) and old_t.get(keep_id)):
+        t[keep_id] = old_t[keep_id]
+    for k in ("worktree", "slot", "project", "tool"):
         if not t.get(k) and old_t.get(k):
             t[k] = old_t[k]
 
-d["session"] = {"saved_at": int(time.time()), "threads": threads, "options": options}
+# Same rule as the per-thread fields above, for the options a bare session
+# reports blank. These two are only ever legitimately empty before the sidebar
+# has been turned on for the first time -- `sidebar off` writes "0", so a
+# deliberate switch-off still records as itself. Without this, one degraded
+# snapshot erases sidebar_mode and `llmux restore` rebuilds the session in
+# classic layout with no sidebar at all. project_order and pr_expanded are
+# deliberately NOT here: those go empty legitimately.
+old_options = old_sess.get("options") or {}
+for k in ("sidebar_mode", "sidebar_width"):
+    if not options.get(k) and old_options.get(k):
+        options[k] = old_options[k]
+
+d["session"] = {"saved_at": int(time.time()), "created_at": session_created,
+                "instance_id": instance_id,
+                "threads": threads, "options": options}
 _save(path, d)
-' "$PAUSED_FILE" 2>/dev/null || true
+' "$PAUSED_FILE" "$screated" "$instance_id" "$removed_names" "$replaced_names"; then
+    return 0
+  else
+    snapshot_rc=$?
+  fi
+  # Pane rows are collected before the on-disk lock is acquired. Another
+  # structural snapshot can therefore commit a just-created pane while this
+  # process is waiting, making these rows stale by the time the guard compares
+  # them. Re-read tmux once; a real omission fails the same way again.
+  if [[ "$snapshot_rc" == "3" && "${LLMUX_SNAPSHOT_RETRY:-0}" != "1" ]]; then
+    LLMUX_SNAPSHOT_RETRY=1 \
+    LLMUX_SNAPSHOT_REMOVED="$removed_names" \
+    LLMUX_SNAPSHOT_REPLACED="$replaced_names" \
+    LLMUX_SNAPSHOT_RECOVERY_COMMIT="$recovery_commit" \
+      snapshot_session
+    return $?
+  fi
+  return "$snapshot_rc"
+}
+
+snapshot_unless_restoring() {
+  if [[ "$(tmux show-option -t "$SESSION" -qv @llmux_restoring 2>/dev/null || true)" == "1" ]]; then
+    return 0
+  fi
+  snapshot_session "$@"
 }
 
 # Print what the snapshot holds, so "did it capture my work?" is answerable without
 # reading JSON by hand.
 cmd_snapshot() {
   case "${1:-show}" in
-    save) snapshot_session; echo "Snapshot saved."; return 0 ;;
+    save)
+      snapshot_session || { echo "Error: snapshot was not saved." >&2; return 1; }
+      echo "Snapshot saved."
+      return 0
+      ;;
     show) ;;
     *) echo "Usage: llmux snapshot [show|save]" >&2; return 1 ;;
   esac
@@ -6886,8 +7198,14 @@ for t in s.get("threads", []):
 # a live session unless forced: the live one is the source of truth and restoring on
 # top of it would duplicate every thread.
 cmd_restore() {
-  local force=0
-  [[ "${1:-}" == "--force" ]] && force=1
+  local force=0 auto=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=1 ;;
+      --auto) auto=1 ;;
+      *) echo "Usage: llmux restore [--force]" >&2; return 1 ;;
+    esac
+  done
   if tmux has-session -t "$SESSION" 2>/dev/null && (( ! force )); then
     local n
     n=$({ tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}' 2>/dev/null | grep -c . ; } || echo 0)
@@ -6905,19 +7223,101 @@ for t in s.get("threads", []):
     if t.get("terminal") == "1":
         continue
     print("|".join([t.get(k, "") for k in
-        ["name","dir","tool","project","worktree","slot","claude_session","opencode_session","order","pinned"]]))
+        ["name","dir","tool","project","worktree","slot","claude_session",
+         "opencode_session","codex_session","order","pinned","maintenance"]]))
 ' "$PAUSED_FILE" 2>/dev/null || true)
   if [[ -z "$rows" ]]; then
     echo "No session snapshot to restore." >&2
     return 1
   fi
 
-  ensure_session
-  local name dir tool project worktree slot csid osid order pinned pane n=0
-  while IFS='|' read -r name dir tool project worktree slot csid osid order pinned; do
+  local sopts restore_sidebar
+  sopts=$(python3 -c "$PY_PAUSED_IO"'
+import sys
+d = _load(sys.argv[1])
+for k, v in ((d.get("session") or {}).get("options") or {}).items():
+    print("%s=%s" % (k, v))
+' "$PAUSED_FILE") || return 1
+  restore_sidebar=$(printf '%s\n' "$sopts" | awk -F= '$1=="sidebar_mode"{print $2; exit}')
+
+  # The base session supplies terminal + pinned furniture. The pinned tool must
+  # stay stopped until its exact saved identity is applied below.
+  local bootstrapped=0
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    LLMUX_SKIP_AUTO_RESTORE=1 LLMUX_SKIP_PINNED_LAUNCH=1 LLMUX_SKIP_WATCH_START=1 ensure_session
+    bootstrapped=1
+  else
+    watch_stop
+  fi
+  tmux set-option -t "$SESSION" @llmux_restoring 1
+
+  local name dir tool project worktree slot csid osid codexid order pinned maintenance
+  local pane n=0 failures=() expected_sid current_sid existing existing_tool identity_ok recovery_pane recovery_complete failure_text failure_count_before
+  while IFS='|' read -r name dir tool project worktree slot csid osid codexid order pinned maintenance; do
     [[ -z "$name" ]] && continue
+    failure_count_before=${#failures[@]}
     [[ -d "$dir" ]] || dir="$HOME"
-    pane=$(spawn_llm_pane "$dir") || continue
+    expected_sid=""
+    case "$tool" in
+      claude) expected_sid="$csid" ;;
+      opencode) expected_sid="$osid" ;;
+      codex) expected_sid="$codexid" ;;
+    esac
+    identity_ok=1
+    if [[ "$tool" =~ ^(claude|codex|opencode)$ && -z "$expected_sid" ]]; then
+      failures+=("$name: saved $tool thread has no durable session id; refusing to start a replacement conversation")
+      identity_ok=0
+    elif [[ -n "$expected_sid" ]] && ! durable_session_exists "$tool" "$expected_sid" "$dir"; then
+      failures+=("$name: saved $tool session $expected_sid no longer exists")
+      identity_ok=0
+    fi
+
+    if [[ "$pinned" == "1" && "$bootstrapped" == "1" ]]; then
+      pane=$(get_pinned_pane)
+      if ! tmux respawn-pane -k -t "$pane" -c "$dir" 2>/dev/null; then
+        failures+=("$name: could not restore pinned working directory $dir")
+      fi
+      existing=$(tmux display-message -p -t "$pane" \
+        '#{pane_id}|#{@llmux_name}|#{@llmux_tool}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_pinned}|#{@llmux_recovery_pane}|#{@llmux_recovery_complete}' 2>/dev/null || true)
+    else
+      existing=$(tmux list-panes -s -t "$SESSION" \
+        -F '#{pane_id}|#{@llmux_name}|#{@llmux_tool}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_pinned}|#{@llmux_recovery_pane}|#{@llmux_recovery_complete}' 2>/dev/null \
+        | awk -F'|' -v n="$name" '$2==n{print; exit}')
+    fi
+    if [[ -n "$existing" ]]; then
+      IFS='|' read -r pane _ existing_tool _cs _os _codex _pin recovery_pane recovery_complete <<< "$existing"
+      current_sid=""
+      case "$tool" in
+        claude) current_sid="$_cs" ;;
+        opencode) current_sid="$_os" ;;
+        codex) current_sid="$_codex" ;;
+      esac
+      # A just-created pinned pane is empty furniture and is safe to populate.
+      # Any other collision is reused only when it already IS the saved thread;
+      # never type a resume command into an unrelated live TUI.
+      if [[ "$existing_tool" == "$tool" && "$current_sid" == "$expected_sid" \
+            && ( "$recovery_pane" != "1" || "$recovery_complete" == "1" ) ]]; then
+        n=$((n + 1))
+        echo "  = $name already restored"
+        continue
+      fi
+      if [[ ! ( "$pinned" == "1" && "$_pin" == "1" && -z "$existing_tool" ) \
+            && "$recovery_pane" != "1" ]]; then
+        failures+=("$name: a different live pane already has this name")
+        continue
+      fi
+    else
+      # Always create detached windows first. Splitting directly into the target
+      # layout hits tmux's minimum-pane-size limit at roughly five panes, in both
+      # sidebar and classic mode. apply_layout rebuilds topology only after the
+      # complete durable set exists.
+      pane=$(tmux new-window -d -t "$SESSION:" -c "$dir" -P -F '#{pane_id}' 2>/dev/null || true)
+      if [[ -z "$pane" ]]; then
+        failures+=("$name: could not create pane")
+        continue
+      fi
+    fi
+    tmux set-option -p -t "$pane" @llmux_recovery_pane 1
     tmux set-option -p -t "$pane" @llmux_name "$name"
     [[ -n "$tool" ]]      && tmux set-option -p -t "$pane" @llmux_tool "$tool"
     [[ -n "$project" ]]   && tmux set-option -p -t "$pane" @llmux_project "$project"
@@ -6925,40 +7325,92 @@ for t in s.get("threads", []):
     [[ -n "$slot" ]]      && tmux set-option -p -t "$pane" @llmux_slot "$slot"
     [[ -n "$order" ]]     && tmux set-option -p -t "$pane" @llmux_order "$order"
     [[ "$pinned" == "1" ]] && tmux set-option -p -t "$pane" @llmux_pinned 1
+    [[ -n "$maintenance" ]] && tmux set-option -p -t "$pane" @llmux_maintenance "$maintenance"
     # Resume the SAME conversation rather than starting a fresh one — the session id
     # is the whole reason the snapshot bothers to carry it.
-    if [[ -n "$csid" ]]; then
-      tmux set-option -p -t "$pane" @llmux_claude_session "$csid"
-      resume_tool_in_pane "$pane" "${tool:-claude}" "$name" "$csid" 2>/dev/null || true
-    elif [[ -n "$osid" ]]; then
-      tmux set-option -p -t "$pane" @llmux_opencode_session "$osid"
-      resume_tool_in_pane "$pane" "${tool:-opencode}" "$name" "$osid" 2>/dev/null || true
-    elif [[ -n "$tool" ]]; then
-      launch_tool_in_pane "$pane" "$tool" "$name" 2>/dev/null || true
+    case "$tool" in
+      claude)
+        if [[ -n "$csid" && "$identity_ok" == "1" ]]; then
+          tmux set-option -p -t "$pane" @llmux_claude_session "$csid"
+          resume_tool_in_pane "$pane" claude "$name" "$csid" 2>/dev/null \
+            || failures+=("$name: tool resume command failed")
+        fi
+        ;;
+      opencode)
+        if [[ -n "$osid" && "$identity_ok" == "1" ]]; then
+          tmux set-option -p -t "$pane" @llmux_opencode_session "$osid"
+          resume_tool_in_pane "$pane" opencode "$name" "$osid" 2>/dev/null \
+            || failures+=("$name: tool resume command failed")
+        fi
+        ;;
+      codex)
+        if [[ -n "$codexid" && "$identity_ok" == "1" ]]; then
+          tmux set-option -p -t "$pane" @llmux_codex_session "$codexid"
+          resume_tool_in_pane "$pane" codex "$name" "$codexid" 2>/dev/null \
+            || failures+=("$name: tool resume command failed")
+        fi
+        ;;
+      "") ;;
+      *)
+        launch_tool_in_pane "$pane" "$tool" "$name" 2>/dev/null \
+          || failures+=("$name: tool launch command failed")
+        ;;
+    esac
+    if [[ "$identity_ok" == "1" && ${#failures[@]} -eq "$failure_count_before" ]]; then
+      tmux set-option -p -t "$pane" @llmux_recovery_complete 1 2>/dev/null || true
     fi
-    ((n++))
+    n=$((n + 1))
     echo "  + $name${tool:+ ($tool)}${project:+ → $project}"
   done <<< "$rows"
 
-  local sopts
-  sopts=$(python3 -c "$PY_PAUSED_IO"'
-import sys
-d = _load(sys.argv[1])
-for k, v in ((d.get("session") or {}).get("options") or {}).items():
-    print("%s=%s" % (k, v))
-' "$PAUSED_FILE" 2>/dev/null || true)
   local k v
   while IFS='=' read -r k v; do
     [[ -n "$k" && -n "$v" ]] && tmux set-option -t "$SESSION" "@llmux_${k}" "$v" 2>/dev/null || true
   done <<< "$sopts"
+
+  # Do not build layout furniture around a partial recovery. A retry then sees
+  # only the transaction-owned panes and can safely continue in place.
+  if [[ ${#failures[@]} -gt 0 ]]; then
+    failure_text=$(IFS='; '; echo "${failures[*]}")
+    tmux set-option -t "$SESSION" @llmux_restore_error "$failure_text" 2>/dev/null || true
+    echo "Recovery incomplete; the previous snapshot was preserved:" >&2
+    printf '  - %s\n' "${failures[@]}" >&2
+    echo "Run 'llmux restore --force' after resolving the conflicts." >&2
+    return 1
+  fi
 
   apply_layout
   # The sidebar is rebuilt rather than restored: its pane is furniture, and
   # `sidebar on` is the one supported way to register bindings and hooks.
   if [[ "$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_mode 2>/dev/null || true)" == "1" ]]; then
     tmux set-option -t "$SESSION" @llmux_sidebar_mode "0" 2>/dev/null || true
-    cmd_sidebar on >/dev/null 2>&1 || true
+    cmd_sidebar on >/dev/null 2>&1 || failures+=("sidebar: could not rebuild")
   fi
+
+  if [[ ${#failures[@]} -gt 0 ]]; then
+    failure_text=$(IFS='; '; echo "${failures[*]}")
+    tmux set-option -t "$SESSION" @llmux_restore_error "$failure_text" 2>/dev/null || true
+    echo "Recovery incomplete; the previous snapshot was preserved:" >&2
+    printf '  - %s\n' "${failures[@]}" >&2
+    echo "Run 'llmux restore --force' after resolving the conflicts." >&2
+    return 1
+  fi
+
+  if ! snapshot_session --recovery-commit; then
+    failure_text="could not commit the complete recovered session to disk"
+    tmux set-option -t "$SESSION" @llmux_restore_error "$failure_text" 2>/dev/null || true
+    echo "Recovery incomplete; $failure_text. The previous snapshot was preserved." >&2
+    return 1
+  fi
+  tmux set-option -t "$SESSION" -u @llmux_restore_error 2>/dev/null || true
+  tmux set-option -t "$SESSION" -u @llmux_restoring 2>/dev/null || true
+  while IFS= read -r pane; do
+    if [[ -n "$pane" ]]; then
+      tmux set-option -p -t "$pane" -u @llmux_recovery_pane 2>/dev/null || true
+      tmux set-option -p -t "$pane" -u @llmux_recovery_complete 2>/dev/null || true
+    fi
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}' 2>/dev/null)
+  watch_start
   echo "Restored $n thread(s) from snapshot."
 }
 
@@ -7030,6 +7482,7 @@ cmd_kill() {
   watch_stop
   rm -rf "$WATCH_STATE_DIR"
   tmux kill-session -t "$SESSION"
+  clear_session_snapshot
   echo "Killed llmux session"
 }
 
@@ -7048,9 +7501,15 @@ cmd_refresh() {
   # every @llmux_project and the project registry — so without carrying it, a
   # refresh would silently dump every thread back into SCRATCH.
   local pane_data=()
-  while IFS='|' read -r name dir tool is_term is_pin sid project; do
+  while IFS='|' read -r name dir tool is_term is_pin csid osid codexid project; do
+    local sid=""
+    case "$tool" in
+      claude) sid="$csid" ;;
+      opencode) sid="$osid" ;;
+      codex) sid="$codexid" ;;
+    esac
     pane_data+=("$name|$dir|$tool|$is_term|$is_pin|$sid|$project")
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_project}')
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_terminal}|#{@llmux_pinned}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_project}')
 
   # Stop watcher and kill the old session
   watch_stop
@@ -7090,7 +7549,7 @@ cmd_refresh() {
   done
 
   # Recreate session (creates terminal + pinned, skipping pinned tool launch)
-  LLMUX_SKIP_PINNED_LAUNCH=1 ensure_session
+  LLMUX_SKIP_AUTO_RESTORE=1 LLMUX_SKIP_PINNED_LAUNCH=1 ensure_session
 
   # Resume tool in pinned pane if it was running one
   if [[ -n "$had_pinned_tool" ]]; then
@@ -7348,7 +7807,7 @@ case "$command" in
   _status-count) cmd__status_count ;;
   _slot-status)  cmd__slot_status ;;
   _pr-refresh)   cmd__pr_refresh ;;
-  _snapshot)     snapshot_session ;;
+  _snapshot)     snapshot_session "$@" ;;
   help)          usage ;;
   *)             echo "Unknown command: $command"; usage; exit 1 ;;
 esac
