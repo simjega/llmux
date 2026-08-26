@@ -1350,7 +1350,20 @@ apply_pane_border_format() {
   sflag+="#{?#{==:#{@llmux_status},blocked},${st_bl},"
   sflag+="#{?#{==:#{@llmux_status},perm},${st_pm},"
   sflag+="#{?#{==:#{@llmux_status},busy},${st_bs},}}}}"
-  tmux set-option -t "$SESSION" pane-border-format " ${sflag}#{?#{@llmux_name},#{@llmux_name},#{pane_title}}#{?#{@llmux_ctx}, #[fg=colour244]#{@llmux_ctx}#[default],}#{?#{@llmux_slot}, #[fg=colour39][#{@llmux_slot}]#[default],} [#{pane_current_path}]#{?#{@llmux_worktree}, (#{@llmux_worktree}),} " 2>/dev/null || true
+  # The last thing Jay said to this thread, LAST on the row and in quotes. The border
+  # is the top line of every pane, so this is the one surface where the current
+  # instruction stays put no matter how far the transcript has scrolled away — which
+  # is the whole point, and why it is here rather than in the sidebar (30 columns) or
+  # the status bar (one line for the whole session).
+  #
+  # Last on purpose: it is the longest and least fixed-width field, so it is the one
+  # that should absorb the clipping when a pane is narrow. Everything identifying the
+  # pane is already drawn by then.
+  #
+  # Written by llmux-watch (refresh_last_messages), never here: computing it means
+  # tailing a transcript, which is watcher work, not render work.
+  local lastmsg='#{?#{@llmux_last_msg}, #[fg=colour109]“#{@llmux_last_msg}”#[default],}'
+  tmux set-option -t "$SESSION" pane-border-format " ${sflag}#{?#{@llmux_name},#{@llmux_name},#{pane_title}}#{?#{@llmux_ctx}, #[fg=colour244]#{@llmux_ctx}#[default],}#{?#{@llmux_slot}, #[fg=colour39][#{@llmux_slot}]#[default],} [#{pane_current_path}]#{?#{@llmux_worktree}, (#{@llmux_worktree}),}${lastmsg} " 2>/dev/null || true
 }
 
 get_terminal_pane() {
