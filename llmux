@@ -5536,12 +5536,22 @@ cmd_context() {
   done < <(build_review_rows "$(known_projects | tr '\n' ',')" 2>/dev/null || true)
 
   # ── who else is here ───────────────────────────────────────────────────────
-  local p_id p_name p_proj p_tool p_status p_sid p_cwd p_done had_sib=0
-  while IFS='|' read -r p_id p_name p_proj p_tool p_status p_sid p_cwd p_done; do
-    [[ "$p_proj" == "$project" && "$p_name" != "$name" ]] || continue
-    (( had_sib )) || { echo; echo "# Other threads on this project -- ASK THEM before redoing their work"; echo "# (llmux send <name> \"...\")"; had_sib=1; }
-    echo "  ${p_name}  [${p_status:-working}]  ${p_cwd/#$HOME/~}"
-  done < <(thread_directory)
+  #
+  # SCRATCH is deliberately excluded. It is a holding area, not a project: threads
+  # land there because they have nothing in common, so listing them as "other
+  # threads on this project -- ASK THEM before redoing their work" invents a
+  # collaboration that does not exist and sends agents off interrogating unrelated
+  # work. Coordination is a property of a shared project; scratch has no shared
+  # anything. `llmux who` still lists every thread for the cases that genuinely
+  # want the full directory.
+  if [[ "$project" != "$SCRATCH_KEY" ]]; then
+    local p_id p_name p_proj p_tool p_status p_sid p_cwd p_done had_sib=0
+    while IFS='|' read -r p_id p_name p_proj p_tool p_status p_sid p_cwd p_done; do
+      [[ "$p_proj" == "$project" && "$p_name" != "$name" ]] || continue
+      (( had_sib )) || { echo; echo "# Other threads on this project -- ASK THEM before redoing their work"; echo "# (llmux send <name> \"...\")"; had_sib=1; }
+      echo "  ${p_name}  [${p_status:-working}]  ${p_cwd/#$HOME/~}"
+    done < <(thread_directory)
+  fi
 
   # ── the repo you are standing in ───────────────────────────────────────────
   if [[ -n "$cwd" && -d "$cwd" ]]; then
@@ -5561,10 +5571,19 @@ cmd_context() {
 
   echo
   echo "# Before taking instructions"
-  echo "Read the notes listed above -- at minimum the hub, intent, decisions and"
-  echo "open-questions -- plus any CLAUDE.md/AGENTS.md in the repo. Then say in one or"
-  echo "two lines what this project is and where it stands. If a sibling thread already"
-  echo "owns the piece you are being asked for, message it rather than duplicating it."
+  if [[ "$project" == "$SCRATCH_KEY" ]]; then
+    # No notes, no siblings, nothing settled to re-open -- so none of the project
+    # ceremony applies. What is left is the repo you are standing in.
+    echo "This thread is in SCRATCH: a holding area, not a project. There are no"
+    echo "project notes to read and no sibling threads to coordinate with -- the other"
+    echo "threads here are unrelated to yours. Read any CLAUDE.md/AGENTS.md in the repo"
+    echo "you are standing in, then get on with the work."
+  else
+    echo "Read the notes listed above -- at minimum the hub, intent, decisions and"
+    echo "open-questions -- plus any CLAUDE.md/AGENTS.md in the repo. Then say in one or"
+    echo "two lines what this project is and where it stands. If a sibling thread already"
+    echo "owns the piece you are being asked for, message it rather than duplicating it."
+  fi
 }
 
 # ── Message passing between threads ──────────────────────────────────────────
