@@ -120,6 +120,7 @@ schedule or `llmux slot-cleanup now` to kick it off immediately. Set
 
 | flag | state | means |
 |---|---|---|
+| 🚨 | `urgent` | the thread says this one needs you **now** |
 | 🙋 | `blocked` | a question or choice is waiting on **you** |
 | 🔐 | `perm` | a permission / approval gate |
 | 🌀 | `busy` | working 2+ minutes, needs nothing |
@@ -372,6 +373,13 @@ didn't. The transcript knows the difference, so that is what is read now.
   asked-in-prose kind retires on sight.
 - **Tools without hooks say so themselves**: `llmux asking` / `llmux asking off` —
   codex, amp, opencode, a plain shell.
+- **`llmux urgent` is the escalation above it.** Same mechanism, louder result: the row
+  goes RED with 🚨 and sorts first in both tallies, for when this thread is the one that
+  needs you rather than one of eleven that do. Every thread has it whatever tool it
+  runs — it is one command and no hook, because "a turn ended in a question" can be
+  inferred but "this matters more than the others" cannot. Looking at the thread clears
+  it, exactly like 🙋. It never overrides a DETECTED state: a live permission gate or an
+  unanswered menu is a harder fact than an assertion, so 🔐 wins the row.
 - **The flag is `@llmux_asking` on the pane, never `@llmux_status`.** `llmux-watch`
   owns the status option and recomputes it every 5s, so anything written there
   directly is erased within one cycle; the watcher reads `@llmux_asking` and promotes
