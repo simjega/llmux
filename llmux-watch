@@ -674,10 +674,10 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
   # END on purpose -- refresh_codex_agents indexes this row positionally (fields[11]
   # is the cached Codex root), so adding a field anywhere earlier would silently
   # rebind every index after it.
-  pane_rows=$(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}|#{?#{&&:#{pane_active},#{window_active}},1,}|#{@llmux_codex_session}|#{@llmux_prompt}' 2>/dev/null)
+  pane_rows=$(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}|#{?#{&&:#{pane_active},#{window_active}},1,}|#{@llmux_codex_session}|#{@llmux_prompt}|#{@llmux_urgent}' 2>/dev/null)
   refresh_codex_agents "$pane_rows"
 
-  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor asking visible pane_codex_session pane_prompt; do
+  while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor asking visible pane_codex_session pane_prompt urgent; do
     [ "$is_term" = "1" ] && continue
     [ -z "$pane_id" ] && continue
     # Now that -s exposes them: the sidebar is a display that repaints every 2s
@@ -843,7 +843,17 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
       # than racy: mark_thread_seen clears the flag, but the snapshot this loop is
       # working from was taken before the click, so without the guard the very next
       # write would put the 🙋 straight back for another cycle.
-      if [ -n "$asking" ] && [ -z "$visible" ] \
+      # `urgent` is checked FIRST because it outranks the ask -- a thread that called
+      # `llmux urgent` is saying this beats the other eleven. Same two guards as the
+      # ask, for the same reasons: never the thread Jay is already looking at, and
+      # never over a DETECTED state (a live permission gate or an unanswered menu is
+      # a harder fact than an assertion, and overwriting it would erase something he
+      # has not dealt with).
+      if [ -n "$urgent" ] && [ -z "$visible" ] \
+         && { [ -z "$detected" ] || [ "$detected" = "idle" ]; }; then
+        detected="urgent"
+        status_src="urgent"
+      elif [ -n "$asking" ] && [ -z "$visible" ] \
          && { [ -z "$detected" ] || [ "$detected" = "idle" ]; }; then
         detected="blocked"
         status_src="asking"

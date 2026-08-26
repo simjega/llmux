@@ -146,6 +146,11 @@ Usage:
                                                 Claude threads do this automatically (Stop /
                                                 Notification hooks); this is for the tools
                                                 without hooks.
+  llmux urgent [on|off]                         Escalate: draw this thread's row RED with a
+                                                🚨 until Jay looks at it. Above `asking`
+                                                (yellow) — for when this thread is the one
+                                                that needs him now. Any tool, no hooks;
+                                                looking at the thread clears it.
   llmux review ls | done <id> | dismiss <id>    List / sign off / discard. Marking it done
              | open <id> | mv <id> [project]    clears the 👀; the row fades out after
                                                 LLMUX_REVIEW_KEEP_HOURS (24). mv re-files an
@@ -1333,16 +1338,18 @@ apply_pane_border_format() {
   # Note the `#,` escapes: inside a #{?...} conditional a literal comma separates
   # the true/false arms, so the comma in #[fg=colour220,bold] must be written
   # #[fg=colour220#,bold] or tmux truncates the attribute list.
-  local st_bl st_pm st_bs sflag
+  local st_bl st_pm st_bs st_ur sflag
   st_bl='#[fg=colour220#,bold]🙋 ANSWER ME #[default]'
   st_pm='#[fg=colour203#,bold]🔐 APPROVE? #[default]'
-  st_bs='#[fg=colour38]🌀 #[default]'
+  st_ur='#[fg=colour203#,bold]🚨 URGENT #[default]'
+  st_bs='#[fg=colour38]🌀 #[default]' 
   # blocked > perm > busy > nothing. `idle` (and its legacy `waiting` alias) draw
   # NOTHING — see STATUS_FLAGS: idle is the resting state of most threads, so a
   # glyph on it is decoration. A bare border means "fine, nothing wanted".
-  sflag="#{?#{==:#{@llmux_status},blocked},${st_bl},"
+  sflag="#{?#{==:#{@llmux_status},urgent},${st_ur},"
+  sflag+="#{?#{==:#{@llmux_status},blocked},${st_bl},"
   sflag+="#{?#{==:#{@llmux_status},perm},${st_pm},"
-  sflag+="#{?#{==:#{@llmux_status},busy},${st_bs},}}}"
+  sflag+="#{?#{==:#{@llmux_status},busy},${st_bs},}}}}"
   tmux set-option -t "$SESSION" pane-border-format " ${sflag}#{?#{@llmux_name},#{@llmux_name},#{pane_title}}#{?#{@llmux_ctx}, #[fg=colour244]#{@llmux_ctx}#[default],}#{?#{@llmux_slot}, #[fg=colour39][#{@llmux_slot}]#[default],} [#{pane_current_path}]#{?#{@llmux_worktree}, (#{@llmux_worktree}),} " 2>/dev/null || true
 }
 
@@ -1517,6 +1524,11 @@ NEW_PROJECT_ITEM="＋ new project…"
 # The label is kept for anywhere that wants to spell the state out in words.
 STATUS_FLAGS=(
   "blocked|🙋|220|needs an answer"
+  # Red, like `perm`, because both mean "stop scrolling and deal with this" -- but a
+  # separate GLYPH, because they want different things from Jay. perm is detected
+  # from the pane; urgent is ASSERTED by the thread via `llmux urgent`, which is the
+  # only way a thread can say "this matters more than the other eleven".
+  "urgent|🚨|203|needs you now"
   "perm|🔐|203|needs approval"
   "idle||244|done — at the prompt"
   "busy|🌀|38|still working"
@@ -1602,18 +1614,27 @@ mark_thread_seen() {
   # unless there is something to clear.
   local seen_state
   seen_state=$(tmux display-message -p -t "$pane" \
-    '#{@llmux_asking}|#{@llmux_status_src}|#{@llmux_status}' 2>/dev/null || true)
-  case "$seen_state" in
-    \|*) return 0 ;;   # not asking — the common case, and it costs one query
-  esac
+    '#{@llmux_asking}|#{@llmux_status_src}|#{@llmux_status}|#{@llmux_urgent}' 2>/dev/null || true)
+  # Explicit field tests, not a glob: the row is "asking|src|status|urgent" and a
+  # pattern counting pipes is one field-order change away from silently never
+  # matching -- which turns the cheap early return into a write on every paint.
+  local a_flag="${seen_state%%|*}" u_flag="${seen_state##*|}"
+  [[ -z "$a_flag" && -z "$u_flag" ]] && return 0
   tmux set-option -p -t "$pane" @llmux_asking "" 2>/dev/null || true
+  # Same rule as the ask: LOOKING at the thread is the whole point of the 🚨, so
+  # seeing it retires it. `llmux urgent` is an assertion by the thread, which is
+  # exactly the kind of state a look can answer -- unlike a permission gate.
+  tmux set-option -p -t "$pane" @llmux_urgent "" 2>/dev/null || true
   # Clear the derived status too, or the row keeps its colour for up to one watcher
   # cycle (5s) after the click. ONLY when the watcher says the `blocked` came from
   # the asking flag: a thread sitting on a real permission gate or an unanswered
   # choice menu is still blocked whether or not Jay has looked at it, and blanking
   # that would erase a state he has not actually dealt with.
-  local src="${seen_state#*|}"; local st="${src#*|}"; src="${src%%|*}"
-  if [[ "$st" == "blocked" && "$src" == "asking" ]]; then
+  local rest="${seen_state#*|}"
+  local src="${rest%%|*}"; rest="${rest#*|}"
+  local st="${rest%%|*}"
+  if [[ ( "$st" == "blocked" && "$src" == "asking" ) \
+     || ( "$st" == "urgent"  && "$src" == "urgent"  ) ]]; then
     tmux set-option -p -t "$pane" @llmux_status "" 2>/dev/null || true
     tmux set-option -p -t "$pane" @llmux_status_src "" 2>/dev/null || true
   fi
@@ -2567,7 +2588,7 @@ render_sidebar() {
     [[ -n "$tline" ]] && threads_snap+=("$tline")
   done < <(list_threads)
 
-  local n_blocked=0 n_perm=0 st
+  local n_blocked=0 n_perm=0 n_urgent=0 st
   for tline in ${threads_snap[@]+"${threads_snap[@]}"}; do
     # Inline parameter expansion, not $(cut_field4 …) — a command substitution is a
     # fork, which is the exact cost this loop is trying to avoid.
@@ -2575,6 +2596,7 @@ render_sidebar() {
     case "$st" in
       blocked) ((n_blocked++)) ;;
       perm)    ((n_perm++)) ;;
+      urgent)  ((n_urgent++)) ;;
     esac
   done
 
@@ -2586,6 +2608,9 @@ render_sidebar() {
   while (( ri < SIDEBAR_PLUS_COL - 2 )); do rule+="─"; ((ri++)); done
   local title=$' \033[1;38;5;39mllmux threads\033[0m'
   # Blocked counts ride on the title row, bold, in the alert colour.
+  # Urgent first, for the same reason it sorts first in the status-bar tally: the
+  # title row is read left to right and this is the count that means now.
+  (( n_urgent ))  && title+="  \033[1;38;5;203m🚨${n_urgent}\033[0m"
   (( n_blocked )) && title+="  \033[1;38;5;220m🙋${n_blocked}\033[0m"
   (( n_perm ))    && title+="  \033[1;38;5;203m🔐${n_perm}\033[0m"
   out+="${title}"$'\n'
@@ -2999,7 +3024,7 @@ render_sidebar() {
       scolour="${smeta#*|}"; scolour="${scolour%%|*}"
       if [[ -n "$semoji" ]]; then
         flag=" \033[1;38;5;${scolour}m${semoji}\033[0m"
-        if [[ "$status" == "blocked" || "$status" == "perm" ]]; then
+        if [[ "$status" == "blocked" || "$status" == "perm" || "$status" == "urgent" ]]; then
           name_col="\033[1;38;5;${scolour}m"
           marker="${marker/ /·}"
         fi
@@ -7297,6 +7322,39 @@ cmd_pr() {
 # Claude threads get this automatically from the Stop/Notification hooks. This
 # command is for the tools with no hook system (codex, amp, opencode, a plain
 # shell), and for the case where an agent knows it is asking before it stops.
+# The escalation above `llmux asking`. Same shape and the same one-writer rule: this
+# sets a PANE option and llmux-watch promotes it to the `urgent` status, because
+# @llmux_status has exactly one writer and anything else that touches it is erased
+# within a cycle.
+#
+# Deliberately not automatic. `asking` can be inferred from a turn ending in a
+# question; "this is more urgent than the other eleven threads" cannot be, so it is
+# always an explicit call -- which also means EVERY thread has it, whatever tool it
+# runs, since it is one command and no hook.
+cmd_urgent() {
+  local action="${1:-on}"
+  local pane="${TMUX_PANE:-}"
+  # -t "$TMUX_PANE" for the same reason cmd_asking needs it: a bare display-message
+  # answers for the ACTIVE pane, so a background agent would flag whichever thread
+  # Jay happens to be looking at.
+  if [[ -z "$pane" ]]; then
+    echo "Error: not inside a tmux pane — run this from the thread that needs you" >&2
+    return 1
+  fi
+  case "$action" in
+    on|"")
+      tmux set-option -p -t "$pane" @llmux_urgent "$(date +%s)" 2>/dev/null || true
+      echo "Flagged $(tmux show-option -p -t "$pane" -qv @llmux_name 2>/dev/null || echo "$pane") as URGENT — it draws red until you look at it."
+      ;;
+    off|clear|done)
+      tmux set-option -p -t "$pane" @llmux_urgent "" 2>/dev/null || true
+      echo "Cleared."
+      ;;
+    *) echo "Usage: llmux urgent [on|off]" >&2; return 1 ;;
+  esac
+  render_sidebar 2>/dev/null || true
+}
+
 cmd_asking() {
   local action="${1:-on}"
   local pane="${TMUX_PANE:-}"
@@ -8030,16 +8088,19 @@ cmd__slot_status() {
 # information — see STATUS_FLAGS. An empty tally means nothing needs you, which is
 # the useful reading.
 cmd__status_count() {
-  local blocked=0 perm=0
+  local blocked=0 perm=0 urgent=0
   while IFS='|' read -r status is_term; do
     [[ "$is_term" == "1" ]] && continue
     case "$status" in
       blocked)         blocked=$((blocked + 1)) ;;
       perm)            perm=$((perm + 1)) ;;
+      urgent)          urgent=$((urgent + 1)) ;;
     esac
     # -s: parked threads live in a hidden window, and a tally that silently omits
   # them is worse than no tally.
   done < <(tmux list-panes -s -t "$SESSION" -F '#{@llmux_status}|#{@llmux_terminal}' 2>/dev/null)
+  # Urgent first: the tally is read left to right and this is the one that means now.
+  [[ $urgent  -gt 0 ]] && printf '🚨%d ' "$urgent"
   [[ $blocked -gt 0 ]] && printf '🙋%d ' "$blocked"
   [[ $perm    -gt 0 ]] && printf '🔐%d ' "$perm"
   return 0
@@ -8373,6 +8434,7 @@ case "$command" in
   _click)        sidebar_click "$@" ;;
   _newthread)    cmd__newthread "$@" ;;
   _movethread)   cmd__movethread "$@" ;;
+  urgent)        cmd_urgent "$@" ;;
   _watch)        watch_start; echo "Watcher started" ;;
   _watch-stop)   watch_stop; echo "Watcher stopped" ;;
   _status-count) cmd__status_count ;;
