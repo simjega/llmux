@@ -148,6 +148,14 @@ whatever is actually in flight rather than every PR you've ever authored.
   ⌥ #53625 footer addresses  ← click opens it in a browser
 ```
 
+- **Only the project you're working in shows its docs and PRs.** Every other section
+  folds them into one summary row — `· 👀2  ⌥3   ▸` — because a doc queued in July and
+  a PR opened last week are not what you're looking at right now. Click the row to peek
+  (`▾`), click it again to fold it back. The thread rows never fold: those are the
+  switch targets, and a sidebar you have to expand to change threads is worse than a
+  cluttered one. Relevance is derived from the thread on screen, so it follows every
+  switch path with nothing to keep in sync, and a peek is deliberately not persisted —
+  a restore lands on the clean folded view.
 - **Drag the divider to read more.** Every label — thread names, PR titles, stack
   names — is cut to what the pane can actually show at its current width, never to a
   fixed cap, so widening the sidebar reveals more text on the next repaint (≤2s). The

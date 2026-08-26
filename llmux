@@ -2512,7 +2512,7 @@ render_sidebar() {
   #
   # Absolute rows mean spacers and headings appear in neither map, so clicking
   # them is a no-op for free.
-  local rowmap="" addmap="1:*," prmap="" linkmap=""
+  local rowmap="" addmap="1:*," prmap="" linkmap="" foldmap=""
   local key meta label gcolour drawn=0 entry eidx
 
   # PR rows, precomputed per project so the draw loop below stays a straight walk.
@@ -2621,6 +2621,29 @@ render_sidebar() {
      && { [[ ! "$codex_agents_at" =~ ^[0-9]+$ ]] || (( now_ts - codex_agents_at > 15 )); }; then
     codex_agents_raw=""
   fi
+  # Relevance is "the project I am working in". Its docs and PRs draw in full;
+  # every other section collapses them to one summary row, because a doc queued
+  # in July and a PR opened last week are not what you are looking at right now.
+  # The thread rows themselves NEVER fold -- those are the switch targets, and a
+  # sidebar you have to expand to change threads is worse than a cluttered one.
+  #
+  # Derived from the pane already on screen rather than stored, so it follows
+  # every switch path (click, prefix+n, prefix+j/k, `llmux switch`) with nothing
+  # to keep in sync. No fork: the entry fields are split in bash.
+  local active_key="" e_rest
+  for entry in ${lines[@]+"${lines[@]}"}; do
+    e_rest="${entry#*|}"
+    if [[ "${e_rest%%|*}" == "$active" ]]; then
+      active_key="${entry##*|}"
+      break
+    fi
+  done
+  # Sections the reader has explicitly peeked into. Deliberately NOT persisted to
+  # the snapshot: a peek is about this minute, and a restore should land on the
+  # clean auto-folded view rather than resurrecting last week's expansions.
+  local unfolded
+  unfolded=$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_unfolded 2>/dev/null || true)
+
   for key in ${sections[@]+"${sections[@]}"}; do
     [[ -z "$key" ]] && continue
     project_meta "$key" >/dev/null; meta="$R_PROJECT_META"
@@ -2701,6 +2724,77 @@ render_sidebar() {
       ((row++))
     fi
 
+    # Fold decision for this section. The active project is never folded; a
+    # section the reader has clicked open is never folded either.
+    # The project you are working in is never foldable -- its rows are the ones
+    # you came here for, and a toggle on them is noise. Every other section is
+    # foldable, and folded unless it has been clicked open.
+    local foldable=1 folded=1
+    [[ -n "$active_key" && "$key" == "$active_key" ]] && foldable=0
+    (( foldable )) || folded=0
+    [[ ",${unfolded}," == *",${key},"* ]] && folded=0
+
+    # One summary row standing in for everything folded away, so a folded section
+    # still answers "is anything waiting on me here" from the glyphs alone -- the
+    # 👀 keeps its alert colour when any doc is unresolved. Counting ROWS, not
+    # items: a collapsed stack draws one row, so it counts one, and the number on
+    # screen matches what unfolding actually adds.
+    # Counted whether or not this section is currently folded: an unfolded section
+    # keeps its summary row (with a ▾) so there is a way back. A section with no
+    # affordance to re-fold is a one-way door -- you can peek and never undo it.
+    local fold_docs=0 fold_prs=0 fold_pending=0
+    if (( foldable )); then
+      local f_entry f_proj f_kind f_rest f_state
+      for f_entry in ${rev_rows[@]+"${rev_rows[@]}"}; do
+        IFS=$'\t' read -r f_proj _ f_state _ _ <<< "$f_entry"
+        [[ "$f_proj" == "$key" ]] || continue
+        ((fold_docs++))
+        [[ "$f_state" == "pending" ]] && fold_pending=1
+      done
+      for f_entry in ${pr_rows[@]+"${pr_rows[@]}"}; do
+        IFS=$'\t' read -r f_proj f_kind f_rest <<< "$f_entry"
+        [[ "$f_proj" == "$key" ]] || continue
+        # A stack's members only draw when the stack is open, so they are not
+        # rows this fold is hiding -- counting them would overstate every stack.
+        [[ "$f_kind" == "member" ]] && continue
+        ((fold_prs++))
+      done
+    fi
+
+    if (( foldable )) && (( fold_docs || fold_prs )); then
+      # Width accounting is explicit because the glyphs are not all one column:
+      # 👀 is two, · ⌥ ▸ are one each. Getting this wrong pushes ▸ off the pane
+      # and, worse, desyncs every row below it from its map.
+      local fold_body="" fold_cols=0 fold_gap
+      if (( fold_docs )); then
+        local fold_col="38;5;250"
+        (( fold_pending )) && fold_col="1;38;5;220"
+        fold_body+=" \033[${fold_col}m👀${fold_docs}\033[0m"
+        fold_cols=$(( fold_cols + 3 + ${#fold_docs} ))
+      fi
+      if (( fold_prs )); then
+        # Two spaces between the two counts, one if the PR count is the only thing
+        # on the row -- otherwise a section with no docs reads with a gap where the
+        # 👀 would have been.
+        local fold_sep="  "
+        [[ -z "$fold_body" ]] && fold_sep=" "
+        fold_body+="${fold_sep}\033[38;5;${gcolour}m⌥\033[0m\033[38;5;244m${fold_prs}\033[0m"
+        fold_cols=$(( fold_cols + ${#fold_sep} + 1 + ${#fold_prs} ))
+      fi
+      # " ·" prefix is 2 columns, the trailing ▸ is 1.
+      local fold_pad=$(( sb_w - 2 - fold_cols - 1 ))
+      (( fold_pad < 1 )) && fold_pad=1
+      printf -v fold_gap '%*s' "$fold_pad" ''
+      # ▸ closed / ▾ open, the same marker vocabulary the stack rows already use.
+      local fold_marker="▸"
+      (( folded )) || fold_marker="▾"
+      out+=" \033[38;5;240m·\033[0m${fold_body}${fold_gap}\033[38;5;244m${fold_marker}\033[0m"$'\n'
+      # Whole row is the hotspot: nothing else competes for the click, and one
+      # column is not something anyone should have to aim at.
+      foldmap+="${row}:${key},"
+      ((row++))
+    fi
+
     # Docs awaiting review, ABOVE the threads. A doc Jay hasn't signed off on is
     # usually the thing holding its project up, so it reads before the work it is
     # holding up — the inverse of PR rows, which record what already shipped.
@@ -2710,6 +2804,8 @@ render_sidebar() {
     # answers "is anything waiting on me" from the glyphs alone.
     local rev_entry r_proj r_id r_state r_title r_url
     for rev_entry in ${rev_rows[@]+"${rev_rows[@]}"}; do
+      # Folded: the summary row above already stands in for every one of these.
+      (( folded )) && break
       IFS=$'\t' read -r r_proj r_id r_state r_title r_url <<< "$rev_entry"
       [[ "$r_proj" == "$key" ]] || continue
       local r_glyph="  " r_col="38;5;250" r_ind=" "
@@ -2892,6 +2988,7 @@ render_sidebar() {
     # you act in, the PRs are what that work has already produced.
     local pr_entry p_proj p_kind p_rest
     for pr_entry in ${pr_rows[@]+"${pr_rows[@]}"}; do
+      (( folded )) && break
       IFS=$'\t' read -r p_proj p_kind p_rest <<< "$pr_entry"
       [[ "$p_proj" == "$key" ]] || continue
       case "$p_kind" in
@@ -2947,6 +3044,9 @@ render_sidebar() {
   # pixels no longer show.
   tmux set-option -t "$SESSION" @llmux_sidebar_prmap "${prmap%,}" 2>/dev/null || true
   tmux set-option -t "$SESSION" @llmux_sidebar_linkmap "$linkmap" 2>/dev/null || true
+  # Same contract again: the fold summary rows are published in the call that
+  # paints them, so a click cannot toggle a section the pixels no longer show.
+  tmux set-option -t "$SESSION" @llmux_sidebar_foldmap "${foldmap%,}" 2>/dev/null || true
 
   # respawn-pane would kill the loop; write straight into the pane instead.
   tmux send-keys -t "$sb" "" 2>/dev/null || true
@@ -3094,7 +3194,37 @@ sidebar_click() {
     done <<< "$linkmap"
   fi
 
-  # PR rows first: prmap and rowmap are disjoint by construction (each row draws
+  # Fold summary rows first, and cheapest: one option read, and the row is
+  # disjoint from every other map by construction (it draws in place of the rows
+  # it hides, so nothing else can occupy it).
+  local foldmap fpair fkey
+  foldmap=$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_foldmap 2>/dev/null || true)
+  if [[ -n "$foldmap" ]]; then
+    local IFS_FOLD="$IFS"
+    IFS=','
+    for fpair in $foldmap; do
+      if [[ "${fpair%%:*}" == "$y" ]]; then
+        IFS="$IFS_FOLD"
+        fkey="${fpair#*:}"
+        local unf
+        unf=$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_unfolded 2>/dev/null || true)
+        if [[ ",${unf}," == *",${fkey},"* ]]; then
+          # `|| true` for the same reason the stack toggle needs it: re-folding the
+          # only unfolded section leaves grep with no matches, and its exit 1 under
+          # `set -euo pipefail` would abort the substitution and wedge the row open.
+          unf=$({ printf '%s' "$unf" | tr ',' '\n' | grep -vxF "$fkey" | paste -sd, -; } || true)
+        else
+          unf="${unf:+$unf,}$fkey"
+        fi
+        tmux set-option -t "$SESSION" @llmux_sidebar_unfolded "$unf" 2>/dev/null || true
+        render_sidebar
+        return 0
+      fi
+    done
+    IFS="$IFS_FOLD"
+  fi
+
+  # PR rows next: prmap and rowmap are disjoint by construction (each row draws
   # either a thread or a PR), so order is about cost, not correctness.
   local prmap ppair
   prmap=$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_prmap 2>/dev/null || true)
