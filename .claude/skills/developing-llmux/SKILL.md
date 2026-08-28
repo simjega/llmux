@@ -89,7 +89,13 @@ Every subcommand is `cmd_<verb>()` and gets dispatched in the case statement nea
 Three of them, in `harvest_<tool>_sessions`:
 - **Claude** — Python script that scans `~/.claude/projects/<encoded-cwd>/*.jsonl` for the first user message and timestamp.
 - **Amp** — shells out to `amp threads search --json`.
-- **Codex** — sqlite query against `~/.codex/state_5.sqlite` (`threads` table). Newer codex versions might rename this; check before assuming.
+- **Codex** — sqlite query against `~/.codex/state_5.sqlite` (`threads` table). Newer codex versions might rename this; check before assuming. Two things it MUST do, both learned the hard way:
+  spawned sub-agent threads are excluded (`id NOT IN (SELECT child_thread_id FROM
+  thread_spawn_edges)`) because they outnumber real threads ~3:1 and carry no title,
+  and the llmux thread NAME is recovered from the rollout head — the SessionStart hook
+  injects `llmux thread named "X"` as a developer message, reliably inside the first
+  256KB. Without both, the picker lists mostly blank rows identified only by a
+  first-prompt fragment.
 
 Other supported tools (aider, sgpt, llm, mods, ollama) are add-only — no resume.
 
