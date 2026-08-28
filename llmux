@@ -6461,22 +6461,85 @@ harvest_amp_sessions() {
 harvest_codex_sessions() {
   local db="$HOME/.codex/state_5.sqlite"
   [[ -f "$db" ]] || return
-  sqlite3 -separator '|' "$db" \
-    "SELECT id, cwd, updated_at, REPLACE(SUBSTR(title, 1, 80), CHAR(10), ' ')
-     FROM threads WHERE archived = 0
-     ORDER BY updated_at DESC LIMIT 50" 2>/dev/null | while IFS='|' read -r sid cwd ts title; do
-    [[ -z "$sid" ]] && continue
-    local rel_ts
-    rel_ts=$(python3 -c "
-import time
-diff = int(time.time()) - int('$ts')
-if diff < 60: print(f'{diff}s ago')
-elif diff < 3600: print(f'{diff//60}m ago')
-elif diff < 86400: print(f'{diff//3600}h ago')
-else: print(f'{diff//86400}d ago')
-" 2>/dev/null)
-    echo "${sid}|${cwd}|${rel_ts:-unknown}|${title}"
-  done
+  # ONE python start, not one per row. The old shape forked python inside the read
+  # loop purely to format a relative timestamp -- 50 rows, 50 interpreter starts,
+  # several seconds before the picker could draw.
+  python3 - "$db" "$PAUSED_FILE" <<'PY' 2>/dev/null || true
+import json, os, re, sqlite3, sys, time
+
+db, paused_file = sys.argv[1:3]
+# The llmux name is injected into every codex thread by the SessionStart hook, as a
+# `developer` message. It is not in the first few KB (session_meta and turn_context
+# come first) but it is reliably inside the first quarter-megabyte, and reading that
+# much of 50 files costs single-digit milliseconds because only the head is touched.
+HEAD = 262144
+NAME_RE = re.compile(r'llmux thread named \\{0,2}"([^"\\]+)')
+
+try:
+    con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=1)
+    rows = con.execute("""
+        SELECT id, cwd, updated_at, title, rollout_path, first_user_message
+        FROM threads
+        WHERE archived = 0
+          AND id NOT IN (SELECT child_thread_id FROM thread_spawn_edges)
+        ORDER BY updated_at DESC LIMIT 50""").fetchall()
+except sqlite3.Error:
+    raise SystemExit(0)
+
+# Codex sub-agent threads outnumber real ones roughly three to one (387 of 518 here),
+# and they are unresumable noise: no title, no llmux name, spawned by a parent that
+# owns them. Excluding them in SQL is what makes the list readable at all.
+
+# llmux's own records are authoritative when present -- a thread that is live or
+# paused RIGHT NOW should read with the name Jay knows it by.
+known = {}
+try:
+    d = json.load(open(paused_file))
+    for t in (d.get("session") or {}).get("threads", []):
+        if t.get("codex_session"):
+            known[t["codex_session"]] = t.get("name") or ""
+    for pz in d.get("paused") or []:
+        if pz.get("tool") == "codex" and pz.get("session_id"):
+            known[pz["session_id"]] = pz.get("name") or ""
+except Exception:
+    pass
+
+def rel(ts):
+    try:
+        diff = int(time.time()) - int(ts)
+    except (TypeError, ValueError):
+        return "unknown"
+    if diff < 60:    return "%ds ago" % diff
+    if diff < 3600:  return "%dm ago" % (diff // 60)
+    if diff < 86400: return "%dh ago" % (diff // 3600)
+    return "%dd ago" % (diff // 86400)
+
+def name_from_rollout(path):
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            head = f.read(HEAD).decode("utf8", "ignore")
+    except OSError:
+        return None
+    m = NAME_RE.search(head)
+    return m.group(1) if m else None
+
+for sid, cwd, ts, title, rollout, first_msg in rows:
+    if not sid:
+        continue
+    name = known.get(sid) or name_from_rollout(rollout)
+    title = " ".join((title or "").split())
+    first = " ".join((first_msg or "").split())
+    # Name first because it is what Jay searches by; the topic still rides along so a
+    # thread he never named is not reduced to an opaque id.
+    if name and title:
+        summary = "%s — %s" % (name, title[:60])
+    else:
+        summary = name or title or first[:60] or "(untitled)"
+    summary = summary.replace("|", "/")[:110]
+    print("%s|%s|%s|%s" % (sid, cwd or "", rel(ts), summary))
+PY
 }
 
 # Harvester contract (shared by all of these): emit `id|cwd|relative_ts|title`.
