@@ -4437,6 +4437,10 @@ cmd_sidebar() {
   inner+="$(printf '%q' "$self") _sidebar-loop"
   local loop_cmd="clear; while :; do ${inner} || break; sleep 1; done"
   tmux send-keys -t "$sb" "$loop_cmd" Enter
+  # select-pane does not change the session's active window. Recovery creates
+  # and parks many detached windows, so without this explicit window selection
+  # the next `llmux attach` can land on `_parked` and expose every hidden thread.
+  tmux select-window -t "$first_pane" 2>/dev/null || true
   tmux select-pane -t "$first_pane" 2>/dev/null || true
   snapshot_unless_restoring || return $?
 
@@ -6230,6 +6234,18 @@ cmd_ls() {
 
 cmd_attach() {
   ensure_session
+  # Attach to the user-facing sidebar window, never the hidden holding window.
+  # A background restore or stale last-window pointer can otherwise make tmux
+  # expose `_parked` as a giant grid of every inactive thread.
+  if sidebar_enabled; then
+    local sb active_thread
+    sb=$(get_sidebar_pane)
+    if [[ -n "$sb" ]]; then
+      tmux select-window -t "$sb" 2>/dev/null || true
+      active_thread=$(get_active_thread_pane)
+      [[ -n "$active_thread" ]] && tmux select-pane -t "$active_thread" 2>/dev/null || true
+    fi
+  fi
   if [[ -n "${TMUX:-}" ]]; then
     tmux switch-client -t "$SESSION"
   else

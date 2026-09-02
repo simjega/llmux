@@ -139,6 +139,9 @@ assert_eq "$restored_count" 14 "all saved non-terminal threads restored"
 assert_eq "$(tmux list-panes -s -t "$SESSION" -F '#{@llmux_pinned}' | awk '$1==1{n++} END{print n+0}')" 1 "one pinned pane"
 assert_eq "$(tmux list-panes -s -t "$SESSION" -F '#{@llmux_sidebar}' | awk '$1==1{n++} END{print n+0}')" 1 "one sidebar"
 assert_eq "$(tmux list-panes -s -t "$SESSION" -F '#{@llmux_parked_anchor}' | awk '$1==1{n++} END{print n+0}')" 1 "one parked anchor"
+sidebar_win=$(tmux list-panes -s -t "$SESSION" -F '#{window_index}|#{@llmux_sidebar}' | awk -F'|' '$2==1{print $1; exit}')
+active_win=$(tmux display-message -p -t "$SESSION" '#{window_index}')
+assert_eq "$active_win" "$sidebar_win" "recovery leaves the sidebar window active for attach"
 grep -q -- "--resume $CLAUDE_ID -n saved-pinned" "$LLMUX_TEST_LOG/claude" \
   || fail "Claude was not resumed by exact ID"
 grep -q -- "resume $CODEX_ID" "$LLMUX_TEST_LOG/codex" \
