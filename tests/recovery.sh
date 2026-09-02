@@ -7,6 +7,7 @@ ORIGINAL_PATH="$PATH"
 SESSION="llmux-recovery-test-$$"
 CLAUDE_ID="11111111-1111-4111-8111-111111111111"
 CODEX_ID="22222222-2222-4222-8222-222222222222"
+FORGE_ID="tsk-RestoreRetry123"
 
 cleanup() {
   local pidfile="/tmp/llmux-watch-${SESSION}.pid"
@@ -44,11 +45,16 @@ cat > "$TEST_ROOT/bin/codex" <<'EOF'
 printf '%s\n' "$*" >> "$LLMUX_TEST_LOG/codex"
 exec sleep 60
 EOF
+cat > "$TEST_ROOT/bin/forge" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$LLMUX_TEST_LOG/forge"
+exec sleep 60
+EOF
 cat > "$TEST_ROOT/bin/noop" <<'EOF'
 #!/bin/sh
 exec sleep 60
 EOF
-chmod +x "$TEST_ROOT/bin/claude" "$TEST_ROOT/bin/codex" "$TEST_ROOT/bin/noop"
+chmod +x "$TEST_ROOT/bin/claude" "$TEST_ROOT/bin/codex" "$TEST_ROOT/bin/forge" "$TEST_ROOT/bin/noop"
 
 cat > "$XDG_CONFIG_HOME/llmux/config" <<EOF
 LLMUX_PINNED_NAME="configured-pinned"
@@ -278,6 +284,10 @@ bad_pane=$(tmux new-window -d -t "$LLMUX_SESSION:" -c "$TEST_ROOT/project" -P -F
 tmux set-option -p -t "$bad_pane" @llmux_name missing-transcript
 tmux set-option -p -t "$bad_pane" @llmux_tool claude
 tmux set-option -p -t "$bad_pane" @llmux_claude_session "$BAD_ID"
+retry_forge=$(tmux new-window -d -t "$LLMUX_SESSION:" -c "$TEST_ROOT/project" -P -F '#{pane_id}')
+tmux set-option -p -t "$retry_forge" @llmux_name retry-forge
+tmux set-option -p -t "$retry_forge" @llmux_tool forge
+tmux set-option -p -t "$retry_forge" @llmux_forge_task "$FORGE_ID"
 "$LLMUX_BIN" snapshot save >/dev/null
 tmux kill-session -t "$LLMUX_SESSION"
 if "$LLMUX_BIN" prompt blocked --name blocked --tool noop --background >/dev/null 2>&1; then
@@ -296,6 +306,9 @@ done
   || fail "successful retry left recovery marked in progress"
 [[ -z "$(tmux show-option -t "$LLMUX_SESSION" -qv @llmux_restore_error)" ]] \
   || fail "successful retry left the recovery error visible"
+assert_eq "$(tmux list-panes -s -t "$LLMUX_SESSION" -F '#{@llmux_name}|#{@llmux_forge_task}' | awk -F'|' '$1=="retry-forge"{print $2}')" "$FORGE_ID" "Forge identity survived recovery retry"
+grep -q -- "task open $FORGE_ID" "$LLMUX_TEST_LOG/forge" \
+  || fail "Forge task was not resumed by exact ID during recovery"
 "$LLMUX_BIN" kill >/dev/null
 
 # Pre-identity snapshots never silently start a replacement LLM conversation.
