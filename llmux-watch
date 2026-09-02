@@ -640,6 +640,254 @@ with open(jsonl, 'rb') as f:
 PY
 }
 
+# The last thing JAY said to each thread, published to @llmux_last_msg so the pane
+# border can show it. The border is the top line of every pane, so this is the one
+# place a thread's current instruction stays visible no matter how far the transcript
+# has scrolled.
+#
+# ONE python start per tick for ALL panes, not one per pane: this runs every 5s and an
+# interpreter start is ~140ms, so per-pane would cost ~3s a tick across a full session.
+# Same reasoning (and same shape) as refresh_codex_agents.
+#
+# Transcripts are TAILED, never read whole. A codex rollout is routinely 15MB and a
+# long Claude session is not much better; reading either from byte zero every 5s would
+# dwarf everything else the watcher does. Only the last LAST_BYTES are parsed, and a
+# file whose size has not changed since the previous tick is skipped outright.
+refresh_last_messages() {
+  local pane_rows="$1" force="${2:-0}"
+  # Gate the interpreter behind a single `stat`. Every pane whose transcript path is
+  # already known carries it on the inventory row, so one stat call covers the whole
+  # session and the common case -- nobody typed anything in the last 5s -- costs one
+  # fork instead of a ~140ms python start. Without this the watcher paid that start
+  # every tick forever, which is most of what it would spend all day doing.
+  local known=1 paths=() line f0 fpath fsize
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local fsid
+    IFS='|' read -r _ _ f0 _ _ _ fcl _ _ _ _ fcx _ _ fpath fsize <<< "$line"
+    case "$f0" in
+      claude) fsid="$fcl" ;;
+      codex)  fsid="$fcx" ;;
+      *) continue ;;
+    esac
+    # No session id means no transcript to read, now or ever this tick -- python
+    # would skip it too, so it must not be the thing that forces python to start.
+    # Getting this wrong is subtle: ONE unresolvable pane (a fresh thread, the
+    # terminal-ish pinned pane) would pin the interpreter start back on every tick
+    # and quietly undo the whole gate.
+    [[ -z "$fsid" ]] && continue
+    # "-" is the sentinel python stamps for a pane whose transcript it could not
+    # resolve (a session id minted before the file exists, or a transcript living
+    # under a different cwd slug). Without it, ONE such pane pins the interpreter
+    # start on every tick forever. The periodic force below is what stops the
+    # sentinel from being permanent.
+    [[ "$fpath" == "-" ]] && continue
+    # A pane we have never resolved a transcript for has to go through python at
+    # least once, to look the path up and record it.
+    if [[ -z "$fpath" || -z "$fsize" ]]; then known=0; break; fi
+    paths+=("$fpath|$fsize")
+  done <<< "$pane_rows"
+  if (( force )); then known=0; fi
+  if (( known )) && (( ${#paths[@]} )); then
+    local changed=0 statline cur want pth
+    # One stat for all of them; %z is size, %N echoes the name back so the two can be
+    # paired without a fork per file.
+    while IFS= read -r statline; do
+      cur="${statline%% *}"; pth="${statline#* }"
+      for want in "${paths[@]}"; do
+        [[ "${want%%|*}" == "$pth" ]] || continue
+        [[ "${want##*|}" == "$cur" ]] || changed=1
+      done
+    done < <(stat -f '%z %N' "${paths[@]%%|*}" 2>/dev/null || true)
+    (( changed )) || return 0
+  fi
+  LAST_PANE_ROWS="$pane_rows" python3 - "$SESSION" "$HOME" <<'PY' 2>/dev/null || true
+import json, os, re, sqlite3, subprocess, sys
+
+session, home = sys.argv[1:3]
+LAST_BYTES = 262144      # tail window; a turn is far smaller than this
+MAX_LEN    = 160         # stored length; the border clips for display anyway
+
+# Wrappers the harness injects as "user" turns. None of them are Jay talking, and
+# showing one as his instruction is worse than showing nothing.
+SYSTEM_PREFIXES = (
+    "<environment_context>", "<turn_aborted>", "<user_instructions>",
+    "<system-reminder>", "<command-name>", "<local-command-",
+    "Caveat:", "<task-notification>", "<persisted-output>",
+)
+
+# `llmux send` labels its own payload, which is what makes this decidable: a message
+# relayed from another THREAD is not Jay talking and must never be shown as his
+# instruction, while one he sent through llmux is -- so the peer form is dropped and
+# his form keeps its content with the label stripped.
+PEER_PREFIX = '[llmux message from thread '
+JAY_PREFIX  = '[llmux message from Jay]'
+
+def clean(text):
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t.startswith(PEER_PREFIX):
+        return None
+    if t.startswith(JAY_PREFIX):
+        t = t[len(JAY_PREFIX):].strip()
+        if not t:
+            return None
+    # A slash command carries its real content in <command-args>; a bare one is noise.
+    if "<command-name>" in t or "<command-args>" in t:
+        m = re.search(r"<command-args>(.*?)</command-args>", t, re.S)
+        t = (m.group(1).strip() if m else "")
+        if not t:
+            return None
+    t = re.sub(r"<[a-z-]*system-reminder>.*?</[a-z-]*system-reminder>", "", t, flags=re.S)
+    for line in t.splitlines():
+        s = line.strip()
+        if not s or (s.startswith("<") and s.endswith(">")):
+            continue
+        if any(s.startswith(p) for p in SYSTEM_PREFIXES):
+            continue
+        s = re.sub(r"^>\s*", "", s).strip()
+        if s:
+            return s[:MAX_LEN]
+    return None
+
+def tail_lines(path):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > LAST_BYTES:
+                f.seek(size - LAST_BYTES)
+                f.readline()          # discard the partial line we landed in
+            return size, f.read().splitlines()
+    except OSError:
+        return None, []
+
+def claude_last(path):
+    size, lines = tail_lines(path)
+    for raw in reversed(lines):
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if d.get("type") != "user" or d.get("isMeta"):
+            continue
+        msg = d.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        c = msg.get("content")
+        if isinstance(c, list):
+            # A pure tool_result turn is the harness answering itself, not Jay.
+            txts = [b.get("text", "") for b in c
+                    if isinstance(b, dict) and b.get("type") == "text"]
+            if not txts:
+                continue
+            c = "\n".join(txts)
+        if not isinstance(c, str):
+            continue
+        got = clean(c)
+        if got:
+            return got
+    return None
+
+def codex_last(path):
+    size, lines = tail_lines(path)
+    for raw in reversed(lines):
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if d.get("type") != "response_item":
+            continue
+        pl = d.get("payload")
+        if not isinstance(pl, dict) or pl.get("type") != "message":
+            continue
+        # `developer` is the llmux SessionStart text; `assistant` is the agent.
+        if pl.get("role") != "user":
+            continue
+        c = pl.get("content")
+        if isinstance(c, list):
+            c = " ".join(b.get("text", "") for b in c
+                         if isinstance(b, dict) and b.get("text"))
+        if not isinstance(c, str):
+            continue
+        got = clean(c)
+        if got:
+            return got
+    return None
+
+def claude_transcript(cwd, sid):
+    if not sid:
+        return None
+    root = os.path.join(home, ".claude", "projects")
+    for slug in {cwd.replace("/", "-"), cwd.replace("/", "-").replace(".", "-")}:
+        p = os.path.join(root, slug, sid + ".jsonl")
+        if os.path.isfile(p):
+            return p
+    return None
+
+_codex_db = os.path.join(home, ".codex", "state_5.sqlite")
+_codex_con = None
+def codex_transcript(sid):
+    global _codex_con
+    if not sid or not os.path.isfile(_codex_db):
+        return None
+    try:
+        if _codex_con is None:
+            _codex_con = sqlite3.connect("file:%s?mode=ro" % _codex_db, uri=True, timeout=1)
+        row = _codex_con.execute(
+            "SELECT rollout_path FROM threads WHERE id = ?", (sid,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row and row[0] else None
+
+def tmux_set(pane, option, value):
+    subprocess.run(["tmux", "set-option", "-p", "-t", pane, option, value], check=False)
+
+for line in os.environ.get("LAST_PANE_ROWS", "").splitlines():
+    f = line.split("|")
+    if len(f) < 13 or f[1] == "1":        # short row, or the terminal pane
+        continue
+    pane, tool, cwd = f[0], f[2], f[4]
+    claude_sid, codex_sid = f[6], f[11]
+    if tool == "claude":
+        path = claude_transcript(cwd, claude_sid)
+        reader = claude_last
+    elif tool == "codex":
+        path = codex_transcript(codex_sid)
+        reader = codex_last
+    else:
+        continue                          # forge/opencode/amp: nothing local to read
+    if not path:
+        # Stamp the sentinel so the bash gate stops paying an interpreter start for
+        # a pane that has nothing to read. A periodic forced pass re-resolves it.
+        if len(f) <= 14 or f[14] != "-":
+            tmux_set(pane, "@llmux_last_path", "-")
+            tmux_set(pane, "@llmux_last_size", "-")
+        continue
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        continue
+    # The cached size rides on the inventory row (field 16), so this costs no fork.
+    # It used to be a `tmux show-option` per pane, which on a full session was more
+    # subprocesses than the actual work.
+    seen = f[15] if len(f) > 15 else ""
+    if seen == str(size):
+        continue
+    tmux_set(pane, "@llmux_last_size", str(size))
+    # Recorded so the BASH gate above can stat it next tick without resolving a
+    # codex rollout path through sqlite again.
+    if (len(f) > 14 and f[14] != path) or len(f) <= 14:
+        tmux_set(pane, "@llmux_last_path", path)
+    got = reader(path)
+    # A blank never overwrites a known value: the tail window can legitimately hold no
+    # user turn at all (one very long agent turn), and blanking on that would make the
+    # border flicker empty mid-conversation.
+    if got:
+        tmux_set(pane, "@llmux_last_msg", got)
+PY
+}
+
 cycle=0
 while tmux has-session -t "$SESSION" 2>/dev/null; do
   cycle=$((cycle + 1))
@@ -674,8 +922,11 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
   # END on purpose -- refresh_codex_agents indexes this row positionally (fields[11]
   # is the cached Codex root), so adding a field anywhere earlier would silently
   # rebind every index after it.
-  pane_rows=$(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}|#{?#{&&:#{pane_active},#{window_active}},1,}|#{@llmux_codex_session}|#{@llmux_prompt}|#{@llmux_urgent}' 2>/dev/null)
+  pane_rows=$(tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_terminal}|#{@llmux_tool}|#{@llmux_name}|#{pane_current_path}|#{pane_pid}|#{@llmux_claude_session}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_asking}|#{?#{&&:#{pane_active},#{window_active}},1,}|#{@llmux_codex_session}|#{@llmux_prompt}|#{@llmux_urgent}|#{@llmux_last_path}|#{@llmux_last_size}' 2>/dev/null)
   refresh_codex_agents "$pane_rows"
+  # Forced full pass every 60 ticks (~5 min): re-resolves sentinels and picks up a
+  # transcript that only appeared after the thread's first turn.
+  refresh_last_messages "$pane_rows" "$([ $((cycle % 60)) -eq 3 ] && echo 1 || echo 0)"
 
   while IFS='|' read -r pane_id is_term pane_tool pane_name pane_cwd pane_pid pane_session is_sidebar is_anchor asking visible pane_codex_session pane_prompt urgent; do
     [ "$is_term" = "1" ] && continue

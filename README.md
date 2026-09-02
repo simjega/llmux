@@ -346,6 +346,28 @@ delivering to the wrong agent is worse than not delivering.
 - Nothing is queued: a thread that is not running has no mailbox, which is correct —
   there is nobody to read it.
 
+### Your last instruction stays on the pane border
+
+The border is the top line of every pane, so it is the one place a thread's current
+instruction cannot scroll away. `llmux-watch` tails each thread's transcript and
+publishes the last thing **you** said to `@llmux_last_msg`; the border draws it in
+quotes after the path.
+
+- **Claude and codex.** Both keep a local transcript, so both are read: Claude's
+  session `.jsonl`, and the codex rollout resolved through `state_5.sqlite`. Forge,
+  opencode and amp show nothing — a Forge task runs remotely and there is no local
+  transcript to tail.
+- **You, not the harness and not a peer.** Injected turns (`<environment_context>`,
+  system reminders, a bare slash command, a pure tool result) are skipped, and so is
+  a relayed `llmux send` from another THREAD — that one is labelled as not-Jay in its
+  own payload, which is what makes it decidable. A message *you* sent through
+  `llmux send` keeps its content with the label stripped.
+- **It costs almost nothing when nothing is happening.** Transcripts are tailed, never
+  read whole — a codex rollout is routinely 15MB — and a single `stat` over every
+  known transcript gates the interpreter, so a tick where nobody typed does not start
+  python at all. Measured ~75ms on a quiet session against a 5s cadence, ~150ms on a
+  tick where a transcript actually grew.
+
 ### A thread that is asking you something turns colour
 
 When an agent asks Jay a question, its row goes to the alert colour and picks up 🙋 —
@@ -656,7 +678,8 @@ All installed automatically by `llmux setup`:
 
 - A single tmux session (`llmux`) holds all panes in one window
 - Panes auto-arrange in a tiled grid layout as you add/remove them
-- Pane borders display `name [directory]` so you always know what each session is doing
+- Pane borders display `name [directory] “last thing you said”` so you always know what
+  each session is doing — and what you last asked it to do
 - The bottom-left status bar shows the **active pane's Claude token usage** (`used_k/left_k` against the 1M context window), so you always know how much room is left in the current session
 - The configured LLM tool launches automatically in new panes
 - `resume` harvests past sessions from the tool's local storage, letting you pick up where you left off — even from sessions started outside llmux
