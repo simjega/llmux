@@ -7923,7 +7923,7 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
   tmux set-option -t "$SESSION" @llmux_restoring 1
 
   local name dir tool project worktree slot csid osid codexid order pinned maintenance forge_task
-  local pane n=0 failures=() expected_sid current_sid existing existing_tool identity_ok recovery_pane recovery_complete failure_text failure_count_before
+  local pane n=0 failures=() expected_sid current_sid existing existing_tool identity_ok recovery_pane recovery_complete failure_text failure_count_before same_name_pane
   while IFS='|' read -r name dir tool project worktree slot csid osid codexid order pinned maintenance forge_task; do
     [[ -z "$name" ]] && continue
     failure_count_before=${#failures[@]}
@@ -7935,6 +7935,15 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
       codex) expected_sid="$codexid" ;;
       forge) expected_sid="$forge_task" ;;
     esac
+    same_name_pane=""
+    if [[ "$tool" == "forge" ]]; then
+      # A retry sees the Forge pane created by the previous recovery attempt.
+      # Ignore that same-name pane during the global claim check; the collision
+      # checks below still require it to be this saved thread before reuse.
+      same_name_pane=$(tmux list-panes -s -t "$SESSION" \
+        -F '#{pane_id}|#{@llmux_name}' 2>/dev/null \
+        | awk -F'|' -v n="$name" '$2==n{print $1; exit}')
+    fi
     identity_ok=1
     # A Forge task id IS that thread's durable identity, exactly like a Claude
     # session uuid -- so it goes through the same refuse-rather-than-guess gate.
@@ -7945,7 +7954,7 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
     elif [[ "$tool" == "forge" && ! "$expected_sid" =~ ^tsk-[A-Za-z0-9]+$ ]]; then
       failures+=("$name: saved Forge task id '$expected_sid' is malformed")
       identity_ok=0
-    elif [[ "$tool" == "forge" ]] && forge_task_claim "$expected_sid" "$name"; then
+    elif [[ "$tool" == "forge" ]] && forge_task_claim "$expected_sid" "$name" "$same_name_pane"; then
       failures+=("$name: Forge task $expected_sid is already claimed by ${R_FORGE_TASK_CLAIM}")
       identity_ok=0
     elif [[ -n "$expected_sid" ]] && ! durable_session_exists "$tool" "$expected_sid" "$dir"; then
