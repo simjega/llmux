@@ -2,6 +2,14 @@
 
 Multiplex LLM sessions in tmux. Manage a grid of named panes — each with a clear title and working directory — in a single tmux session.
 
+## Desktop preview
+
+An experimental macOS app now provides a project-first thread list, live terminal control, an activity queue, and built-in diagnostics. It runs against the existing tmux session, so the CLI remains the source of truth.
+
+![llmux Desktop](https://i.imgur.com/HstUJYh.png)
+
+See the [desktop preview guide](desktop/README.md) for its architecture, setup, validation, and known gaps.
+
 ## Install
 
 ```bash
