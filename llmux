@@ -146,6 +146,12 @@ Usage:
                                                 Claude threads do this automatically (Stop /
                                                 Notification hooks); this is for the tools
                                                 without hooks.
+  llmux memory [--goal G] [--doing D]           Working memory for this thread, drawn in the
+               [--note N] | show | clear        right-hand panel: what you are ultimately
+                                                trying to do, and what you are doing right
+                                                now. One short line each. Update --doing
+                                                whenever the activity changes.
+  llmux memory panel [on|off]                   Show/hide that panel.
   llmux urgent [on|off]                         Escalate: draw this thread's row RED with a
                                                 🚨 until Jay looks at it. Above `asking`
                                                 (yellow) — for when this thread is the one
@@ -2252,6 +2258,56 @@ get_sidebar_pane() {
     | grep '|1$' | head -1 | cut -d'|' -f1; } || true
 }
 
+MEMORY_WIDTH=34
+get_memory_pane() {
+  { tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_memory}' 2>/dev/null \
+    | grep '|1$' | head -1 | cut -d'|' -f1; } || true
+}
+
+# The panel is furniture, exactly like the sidebar: it holds no work, is never a thread,
+# and is excluded from list_threads and from the snapshot by the same @llmux_ flags.
+cmd_memory_panel() {
+  local action="${1:-on}" mp
+  mp=$(get_memory_pane)
+  case "$action" in
+    off)
+      [[ -z "$mp" ]] && { echo "Memory panel already off."; return 0; }
+      tmux kill-pane -t "$mp" 2>/dev/null || true
+      tmux set-option -t "$SESSION" @llmux_memory_mode "0" 2>/dev/null || true
+      sidebar_apply_layout
+      echo "Memory panel off."
+      return 0
+      ;;
+    on) ;;
+    *) echo "Usage: llmux memory panel [on|off]" >&2; return 1 ;;
+  esac
+  if [[ -n "$mp" ]]; then
+    tmux set-option -t "$SESSION" @llmux_memory_mode "1" 2>/dev/null || true
+    sidebar_apply_layout; render_sidebar
+    echo "Memory panel already on — repainted."
+    return 0
+  fi
+  local sb win anchor
+  sb=$(get_sidebar_pane)
+  [[ -z "$sb" ]] && { echo "Error: memory panel needs sidebar mode — run 'llmux sidebar on'" >&2; return 1; }
+  win=$(tmux display-message -p -t "$sb" '#{window_index}' 2>/dev/null || true)
+  # Split from the LAST pane in the window so the new one lands on the right edge; the
+  # sidebar owns the left and the thread must stay between them.
+  anchor=$({ tmux list-panes -t "$SESSION:$win" -F '#{pane_id}' | tail -1; } || true)
+  # Runs a bare sleep loop, NOT a shell: we paint this pane by writing to its tty, and
+  # an interactive prompt would redraw itself over the frame every time it woke up.
+  mp=$(tmux split-window -h -t "${anchor:-$sb}" -c "$HOME" -P -F '#{pane_id}' -l "$MEMORY_WIDTH" \
+        "sh -c 'while :; do sleep 3600; done'" 2>/dev/null) \
+    || { echo "Error: could not create the memory panel" >&2; return 1; }
+  tmux set-option -p -t "$mp" @llmux_memory "1"
+  tmux set-option -p -t "$mp" @llmux_name "" 2>/dev/null || true
+  tmux select-pane -t "$mp" -T "working memory" 2>/dev/null || true
+  tmux set-option -t "$SESSION" @llmux_memory_mode "1" 2>/dev/null || true
+  sidebar_apply_layout
+  render_sidebar
+  echo "Memory panel on."
+}
+
 get_parked_anchor() {
   { tmux list-panes -s -t "$SESSION" -F '#{pane_id}|#{@llmux_parked_anchor}' 2>/dev/null \
     | grep '|1$' | head -1 | cut -d'|' -f1; } || true
@@ -2358,7 +2414,9 @@ get_active_thread_pane() {
   [[ -z "$sb" ]] && return 0
   win=$(tmux display-message -p -t "$sb" '#{window_index}' 2>/dev/null || true)
   [[ -z "$win" ]] && return 0
-  { tmux list-panes -t "$SESSION:$win" -F '#{pane_id}|#{@llmux_sidebar}' 2>/dev/null \
+  # Both kinds of furniture are excluded. Missing the memory panel here would make it
+  # the "active thread" whenever it sorted first, and every switch path reads this.
+  { tmux list-panes -t "$SESSION:$win" -F '#{pane_id}|#{@llmux_sidebar}#{@llmux_memory}' 2>/dev/null \
     | grep -v '|1$' | head -1 | cut -d'|' -f1; } || true
 }
 
@@ -2536,6 +2594,119 @@ for project, items in by_project.items():
 for project, kind, rest in out:
     print("%s\t%s\t%s" % (project, kind, rest))
 ' "$PAUSED_FILE" "$blob" "$expanded" "$PR_STALE_DAYS" "$PR_LINK"
+}
+
+# The right-hand panel. Painted from render_sidebar's loop on purpose: a second 2s loop
+# would be a second thing to supervise, a second pid to claim, and two paints that can
+# disagree about which thread is active.
+#
+# Shows the ACTIVE thread in full -- goal, current action, notes -- because that is the
+# context-switch cost this is meant to remove: land on a thread and know what it is for
+# without reading its scrollback. Below it, one line per other thread, so the panel also
+# answers "which of these is worth switching to" without opening any of them.
+render_memory() {
+  local mp
+  mp=$(get_memory_pane)
+  [[ -z "$mp" ]] && return 0
+  local w
+  w=$(tmux display-message -p -t "$mp" '#{pane_width}' 2>/dev/null || true)
+  [[ "$w" =~ ^[0-9]+$ ]] || w="$MEMORY_WIDTH"
+  local inner=$(( w - 2 )); (( inner < 8 )) && inner=8
+
+  local active out="" now_ts
+  active=$(get_active_thread_pane)
+  now_ts=$(date +%s)
+
+  # Wrap to the panel, indenting continuations so a two-line goal still reads as one
+  # field. fold is a fork, but this paints one thread's fields, not fifty.
+  # $indent is PLAIN text and $colour is applied around each line: measuring a prefix
+  # that contains escape sequences counts their bytes as columns, which folded every
+  # field to one word per line.
+  # $first prefixes line one, $indent every continuation. They must be the same DISPLAY
+  # width, or the fold width stops matching what is drawn — and a bullet repeated on
+  # each wrapped line turns one note into three.
+  _mem_wrap() {
+    local text="$1" indent="$2" colour="${3:-}" first="${4:-}"
+    [[ -z "$first" ]] && first="$indent"
+    [[ -z "$text" ]] && return 0
+    local width=$(( inner - ${#indent} )); (( width < 6 )) && width=6
+    local line n=0
+    # `|| [[ -n "$line" ]]`: fold's final line carries no trailing newline, so a bare
+    # `read` returns false on it and the loop drops it -- silently losing the last line
+    # of every field, and the whole of any field short enough to be one line.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if (( n == 0 )); then out+="${first}${colour}${line}\033[0m"$'\n'
+      else out+="${indent}${colour}${line}\033[0m"$'\n'; fi
+      # n=$((n+1)), never ((n++)): the post-increment form EVALUATES to 0 on the first
+      # pass, which is exit status 1, and under `set -euo pipefail` that kills this
+      # function mid-render. The panel then keeps whatever frame it had, silently.
+      n=$(( n + 1 ))
+    done < <(printf '%s' "$text" | fold -s -w "$width")
+  }
+
+  out+=$' \033[1;38;5;39mworking memory\033[0m\n'
+  local rule="" ri=0
+  while (( ri < inner )); do rule+="─"; ((ri++)); done
+  out+=" \033[38;5;240m${rule}\033[0m"$'\n'
+
+  if [[ -n "$active" ]]; then
+    local a_name a_goal a_doing a_at a_notes
+    IFS='|' read -r a_name a_goal a_doing a_at a_notes < <(tmux display-message -p -t "$active" \
+      '#{@llmux_name}|#{@llmux_goal}|#{@llmux_doing}|#{@llmux_doing_at}|#{@llmux_notes}' 2>/dev/null || true)
+    out+=" \033[1;38;5;252m${a_name:0:$inner}\033[0m"$'\n'
+    if [[ -n "$a_goal" ]]; then
+      out+=" \033[38;5;244mgoal\033[0m"$'\n'
+      _mem_wrap "$a_goal" "   " "\033[38;5;252m"
+    fi
+    if [[ -n "$a_doing" ]]; then
+      # Age is the signal a bare activity word cannot carry: "still root-causing after
+      # 40m" is worth a glance in a way "root-causing" never is. Only shown once it is
+      # unusual, so the steady state stays quiet.
+      local age=""
+      if [[ "$a_at" =~ ^[0-9]+$ ]]; then
+        local mins=$(( (now_ts - a_at) / 60 ))
+        (( mins >= 15 )) && age=" \033[38;5;208m${mins}m\033[0m"
+        (( mins >= 90 )) && age=" \033[1;38;5;203m$(( mins / 60 ))h\033[0m"
+      fi
+      out+=" \033[38;5;244mnow\033[0m${age}"$'\n'
+      _mem_wrap "$a_doing" "   " "\033[38;5;252m"
+    fi
+    if [[ -n "$a_notes" ]]; then
+      out+=" \033[38;5;244mnotes\033[0m"$'\n'
+      local nl
+      while IFS= read -r nl || [[ -n "$nl" ]]; do
+        [[ -z "$nl" ]] && continue
+        _mem_wrap "$nl" "     " "\033[38;5;245m" "   \033[38;5;240m·\033[0m "
+      done < <(printf '%s' "$a_notes" | tr '\037' '\n')
+    fi
+    [[ -z "$a_goal$a_doing$a_notes" ]] \
+      && out+="   \033[38;5;240m(nothing recorded)\033[0m"$'\n'
+  fi
+
+  out+=$'\n'" \033[38;5;240m${rule}\033[0m"$'\n'
+  local entry pane_id nm gl dg rest shown=0
+  while IFS='|' read -r pane_id nm gl dg rest; do
+    [[ -z "$nm" || "$pane_id" == "$active" ]] && continue
+    [[ -z "$dg$gl" ]] && continue
+    out+=" \033[38;5;250m${nm:0:$inner}\033[0m"$'\n'
+    _mem_wrap "${dg:-$gl}" "   " "\033[38;5;244m"
+    shown=$(( shown + 1 ))
+  done < <(tmux list-panes -s -t "$SESSION" \
+      -F '#{pane_id}|#{@llmux_name}|#{@llmux_goal}|#{@llmux_doing}|x' 2>/dev/null || true)
+  (( shown )) || out+=" \033[38;5;240m no other thread has\n recorded anything yet\033[0m"$'\n'
+
+  local clipped="" line rows=0 h
+  h=$(tmux display-message -p -t "$mp" '#{pane_height}' 2>/dev/null || echo 40)
+  [[ "$h" =~ ^[0-9]+$ ]] || h=40
+  while (( rows < h )) && IFS= read -r line; do
+    (( rows )) && clipped+=$'\n'
+    clipped+="$line"; ((rows++))
+  done <<< "$out"
+  # Same mechanism as the sidebar, and for the same reasons: write straight to the
+  # pane's tty (respawn would kill whatever is in it), autowrap off so an over-long
+  # field smears rather than reflowing, and \033[3J to drop the scrollback a 2s
+  # repaint would otherwise fill with stale copies of itself.
+  printf '\033[H\033[2J\033[3J\033[?7l%b' "$clipped" > "$(tmux display-message -p -t "$mp" '#{pane_tty}')" 2>/dev/null || true
 }
 
 # Draw the thread list, grouped into sections. Row geometry here is the contract
@@ -3199,6 +3370,7 @@ render_sidebar() {
   # itself and pinned it at history-limit within the hour. There is nothing worth
   # scrolling back to here: the pane shows current state and nothing else.
   printf '\033[H\033[2J\033[3J\033[?7l%b' "$out" > "$(tmux display-message -p -t "$sb" '#{pane_tty}')" 2>/dev/null || true
+  render_memory
 }
 
 # Runs inside the sidebar pane. Polls so llmux-watch's @llmux_status changes
@@ -3983,6 +4155,16 @@ sidebar_apply_layout() {
   if [[ -n "$first" && "$first" != "$sb" ]]; then
     tmux swap-pane -s "$sb" -t "$first" 2>/dev/null || true
   fi
+  # Memory panel is pinned to the RIGHT edge before the layout runs, for the mirror of
+  # the reason the sidebar is pinned left: even-horizontal orders panes by index, so the
+  # panel has to BE last or it lands in the middle and splits the thread off-screen.
+  local mp_last
+  mp_last=$(get_memory_pane)
+  if [[ -n "$mp_last" ]]; then
+    local last
+    last=$({ tmux list-panes -t "$SESSION:$win" -F '#{pane_id}' | tail -1; } || true)
+    [[ -n "$last" && "$last" != "$mp_last" ]] && tmux swap-pane -s "$mp_last" -t "$last" 2>/dev/null || true
+  fi
   tmux select-layout -t "$SESSION:$win" even-horizontal 2>/dev/null || true
   # The width YOU last left it at, not the constant. This used to snap back to
   # SIDEBAR_WIDTH on every switch, so widening the sidebar to read longer names
@@ -4001,6 +4183,15 @@ sidebar_apply_layout() {
   fi
   (( want < 10 )) && want="$SIDEBAR_WIDTH"
   tmux resize-pane -t "$sb" -x "$want" 2>/dev/null || true
+  if [[ -n "$mp_last" ]]; then
+    local mwant="$MEMORY_WIDTH"
+    if [[ "$winw" =~ ^[0-9]+$ ]] && (( winw > 40 )); then
+      local mmax=$(( winw / 3 ))
+      (( mwant > mmax )) && mwant="$mmax"
+    fi
+    (( mwant < 12 )) && mwant=12
+    tmux resize-pane -t "$mp_last" -x "$mwant" 2>/dev/null || true
+  fi
 }
 
 # Make <name> the visible thread. Accepts a name or a 1-based list index.
@@ -7394,6 +7585,90 @@ cmd_pr() {
 # question; "this is more urgent than the other eleven threads" cannot be, so it is
 # always an explicit call -- which also means EVERY thread has it, whatever tool it
 # runs, since it is one command and no hook.
+# ── Working memory ───────────────────────────────────────────────────────────
+#
+# Two facts per thread, written by the thread itself: what it is ultimately trying to
+# do (@llmux_goal) and what it is doing RIGHT NOW (@llmux_doing). The panel exists so
+# Jay can context-switch without opening a pane and reading backwards -- the goal says
+# whether this thread is worth his attention at all, the action says whether it is at a
+# moment where interrupting costs anything.
+#
+# Pane options, not a new file: they are already the metadata model, they survive a tool
+# restart, and snapshot_session carries them into paused.json so a restore brings the
+# memory back with the thread.
+MEMORY_NOTE_MAX=4     # notes are a scratchpad, not a log; oldest falls off
+MEMORY_FIELD_MAX=200
+
+cmd_memory() {
+  local pane="${TMUX_PANE:-}" goal="" doing="" note="" action="" clear_notes=0 got=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --goal)  goal="${2:?--goal requires a value}"; got=1; shift 2 ;;
+      --doing) doing="${2:?--doing requires a value}"; got=1; shift 2 ;;
+      --note)  note="${2:?--note requires a value}"; got=1; shift 2 ;;
+      --clear-notes) clear_notes=1; got=1; shift ;;
+      panel) shift; cmd_memory_panel "$@"; return $? ;;
+      show|clear) action="$1"; shift ;;
+      *) echo "Usage: llmux memory [--goal G] [--doing D] [--note N] | show | clear" >&2; return 1 ;;
+    esac
+  done
+  if [[ -z "$pane" ]]; then
+    echo "Error: not inside a tmux pane — run this from the thread it describes" >&2
+    return 1
+  fi
+
+  if [[ "$action" == "clear" ]]; then
+    local o
+    for o in goal doing doing_at notes; do
+      tmux set-option -p -t "$pane" "@llmux_$o" "" 2>/dev/null || true
+    done
+    echo "Working memory cleared."
+    render_sidebar 2>/dev/null || true
+    return 0
+  fi
+
+  if [[ "$action" == "show" || ( -z "$action" && $got -eq 0 ) ]]; then
+    local g d n
+    g=$(tmux show-option -p -t "$pane" -qv @llmux_goal 2>/dev/null || true)
+    d=$(tmux show-option -p -t "$pane" -qv @llmux_doing 2>/dev/null || true)
+    n=$(tmux show-option -p -t "$pane" -qv @llmux_notes 2>/dev/null || true)
+    echo "goal:  ${g:-—}"
+    echo "doing: ${d:-—}"
+    [[ -n "$n" ]] && { echo "notes:"; printf '%s' "$n" | tr '\037' '\n' | sed 's/^/  - /'; }
+    return 0
+  fi
+
+  # Collapsed and capped on write, so the panel never has to defend itself against a
+  # paragraph: a newline in a pane option would break the option round-trip, and an
+  # essay here defeats the point of a field you can read at a glance.
+  local flat
+  if [[ -n "$goal" ]]; then
+    flat=$(printf '%s' "$goal" | tr '\n\r\t' '   ' | tr -s ' ')
+    tmux set-option -p -t "$pane" @llmux_goal "${flat:0:$MEMORY_FIELD_MAX}" 2>/dev/null || true
+  fi
+  if [[ -n "$doing" ]]; then
+    flat=$(printf '%s' "$doing" | tr '\n\r\t' '   ' | tr -s ' ')
+    tmux set-option -p -t "$pane" @llmux_doing "${flat:0:$MEMORY_FIELD_MAX}" 2>/dev/null || true
+    # Stamped so the panel can age it. A `doing` that has not moved in 40 minutes is
+    # the tell that a thread is stuck -- which a spinner could never say.
+    tmux set-option -p -t "$pane" @llmux_doing_at "$(date +%s)" 2>/dev/null || true
+  fi
+  (( clear_notes )) && tmux set-option -p -t "$pane" @llmux_notes "" 2>/dev/null || true
+  if [[ -n "$note" ]]; then
+    local cur
+    cur=$(tmux show-option -p -t "$pane" -qv @llmux_notes 2>/dev/null || true)
+    flat=$(printf '%s' "$note" | tr '\n\r\t' '   ' | tr -s ' ')
+    # \037 (unit separator), never a newline: snapshot_session inventories panes with a
+    # LINE-based tmux format, so a newline inside any option value would split one
+    # thread's row in two and desync every field after it.
+    cur="${cur:+$cur$'\037'}${flat:0:$MEMORY_FIELD_MAX}"
+    cur=$(printf '%s' "$cur" | tr '\037' '\n' | tail -n "$MEMORY_NOTE_MAX" | paste -sd $'\037' -)
+    tmux set-option -p -t "$pane" @llmux_notes "$cur" 2>/dev/null || true
+  fi
+  render_sidebar 2>/dev/null || true
+  return 0
+}
+
 cmd_urgent() {
   local action="${1:-on}"
   local pane="${TMUX_PANE:-}"
@@ -7642,7 +7917,7 @@ snapshot_session() {
   fi
   local rows=""
   if ! rows=$(tmux list-panes -s -t "$SESSION" \
-      -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_project}|#{@llmux_worktree}|#{@llmux_slot}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_order}|#{@llmux_pinned}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_maintenance}|#{@llmux_forge_task}' \
+      -F '#{@llmux_name}|#{pane_current_path}|#{@llmux_tool}|#{@llmux_project}|#{@llmux_worktree}|#{@llmux_slot}|#{@llmux_claude_session}|#{@llmux_opencode_session}|#{@llmux_codex_session}|#{@llmux_order}|#{@llmux_pinned}|#{@llmux_terminal}|#{@llmux_sidebar}|#{@llmux_parked_anchor}|#{@llmux_maintenance}|#{@llmux_forge_task}|#{@llmux_goal}|#{@llmux_doing}|#{@llmux_notes}' \
       2>/dev/null); then
     echo "llmux: cannot snapshot: pane inventory failed" >&2
     return 4
@@ -7682,7 +7957,7 @@ raw = sys.stdin.read()
 rows, _, opts = raw.partition("\x00")
 keys = ["name","dir","tool","project","worktree","slot","claude_session",
         "opencode_session","codex_session","order","pinned","terminal",
-        "sidebar","anchor","maintenance","forge_task"]
+        "sidebar","anchor","maintenance","forge_task","goal","doing","notes"]
 threads = []
 for line in rows.splitlines():
     if not line.strip():
@@ -7882,7 +8157,7 @@ for t in s.get("threads", []):
     print("|".join([t.get(k, "") for k in
         ["name","dir","tool","project","worktree","slot","claude_session",
          "opencode_session","codex_session","order","pinned","maintenance",
-         "forge_task"]]))
+         "forge_task","goal","doing","notes"]]))
 ' "$PAUSED_FILE" 2>/dev/null || true)
   if [[ -z "$rows" ]]; then
     echo "No session snapshot to restore." >&2
@@ -7924,7 +8199,7 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
 
   local name dir tool project worktree slot csid osid codexid order pinned maintenance forge_task
   local pane n=0 failures=() expected_sid current_sid existing existing_tool identity_ok recovery_pane recovery_complete failure_text failure_count_before same_name_pane
-  while IFS='|' read -r name dir tool project worktree slot csid osid codexid order pinned maintenance forge_task; do
+  while IFS='|' read -r name dir tool project worktree slot csid osid codexid order pinned maintenance forge_task goal doing notes; do
     [[ -z "$name" ]] && continue
     failure_count_before=${#failures[@]}
     [[ -d "$dir" ]] || dir="$HOME"
@@ -8017,6 +8292,11 @@ for k, v in ((d.get("session") or {}).get("options") or {}).items():
     [[ -n "$order" ]]     && tmux set-option -p -t "$pane" @llmux_order "$order"
     [[ "$pinned" == "1" ]] && tmux set-option -p -t "$pane" @llmux_pinned 1
     [[ -n "$maintenance" ]] && tmux set-option -p -t "$pane" @llmux_maintenance "$maintenance"
+    # Working memory rides the restore: a thread that comes back not knowing what it was
+    # doing has lost the very thing the panel exists to show.
+    [[ -n "$goal" ]]  && tmux set-option -p -t "$pane" @llmux_goal "$goal"
+    [[ -n "$doing" ]] && tmux set-option -p -t "$pane" @llmux_doing "$doing"
+    [[ -n "$notes" ]] && tmux set-option -p -t "$pane" @llmux_notes "$notes"
     # Resume the SAME conversation rather than starting a fresh one — the session id
     # is the whole reason the snapshot bothers to carry it.
     case "$tool" in
@@ -8506,6 +8786,7 @@ case "$command" in
   _click)        sidebar_click "$@" ;;
   _newthread)    cmd__newthread "$@" ;;
   _movethread)   cmd__movethread "$@" ;;
+  memory)        cmd_memory "$@" ;;
   urgent)        cmd_urgent "$@" ;;
   _watch)        watch_start; echo "Watcher started" ;;
   _watch-stop)   watch_stop; echo "Watcher stopped" ;;
