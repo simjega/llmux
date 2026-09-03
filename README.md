@@ -346,6 +346,43 @@ delivering to the wrong agent is worse than not delivering.
 - Nothing is queued: a thread that is not running has no mailbox, which is correct —
   there is nobody to read it.
 
+### Working memory — the right-hand panel
+
+`llmux memory panel on` adds a column on the right holding two facts per thread, written
+by the thread itself:
+
+```
+ working memory
+ ────────────────────────────────
+ alpha
+ goal
+   Separate campaign provisioning
+   from delivery liveness
+ now 40m
+   waiting-on-CI for the revert
+ notes
+   · no DELETE /syncs so anything
+     creating one needs Jay
+ ────────────────────────────────
+ charlie
+   verifying coupon families
+ bravo
+   root-causing the 60k gap
+```
+
+The **active thread** shows in full — goal, current action, notes — so landing on a
+thread tells you what it is for without reading its scrollback. Every other thread gets
+one line, so the panel also answers *which of these is worth switching to*.
+
+- **`--goal` once, `--doing` whenever the activity changes.** `--doing` is a verb plus
+  its object: `waiting-on-CI`, `root-causing the 60k gap`. Never `working` — every
+  thread is working, so it discriminates nothing.
+- **Time-in-state appears once it is unusual** (`now 40m`, then hours in red). "Still
+  root-causing after 40m" is worth a glance in a way a spinner never is.
+- **Stored as pane options** (`@llmux_goal`, `@llmux_doing`, `@llmux_notes`) and carried
+  through the snapshot, so a restore brings the memory back with the thread.
+- Painted from the sidebar's existing loop, not a second one.
+
 ### A thread that is asking you something turns colour
 
 When an agent asks Jay a question, its row goes to the alert colour and picks up 🙋 —
