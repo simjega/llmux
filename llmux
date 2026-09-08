@@ -7001,7 +7001,7 @@ else: print(f'{delta // 86400}d ago')
 " 2>/dev/null)
     fi
     local tool_tag="${ptool:+ [$ptool]}"
-    paused_display+=("$(printf '  %-10s │ %-50s │ %s' "${ts:-?}" "${pname}${tool_tag}" "$short_dir")")
+    paused_display+=("$(printf '  %-10s │ %-44s │ %-16s │ %s' "${ts:-?}" "${pname}${tool_tag}" "${pproj:0:16}" "$short_dir")")
   done < <(read_paused)
 
   # --- Determine tool for session history ---
@@ -7043,6 +7043,32 @@ else: print(f'{delta // 86400}d ago')
     esac
 
     if [[ -n "$harvest_fn" ]]; then
+      # A thread resumed from TOOL HISTORY used to land in SCRATCH: the paused-entry
+      # row carries its project in field 9, but the harvested-session row had only
+      # seven fields and no project at all, so cmd_resume's $entry_project was always
+      # empty for this path. llmux does know the answer -- paused.json records the
+      # project against the session id -- so resolve it here, once, for every tool.
+      #
+      # A flat string with \037/\036 delimiters, NOT an associative array: `bash` here
+      # is /bin/bash 3.2, which has no `declare -A` at all (nothing else in this file
+      # uses one). Lookup is pure parameter expansion, so resolving fifty rows costs
+      # no forks and no temp files.
+      local _rp_map=""
+      _rp_map=$(python3 -c "$PY_PAUSED_IO"'
+import sys
+d = _load(sys.argv[1])
+out = []
+def add(sid, proj):
+    if sid and proj:
+        out.append("\x1f%s\x1e%s" % (sid, proj))
+for t in ((d.get("session") or {}).get("threads") or []):
+    for k in ("claude_session", "opencode_session", "codex_session", "forge_task"):
+        add(t.get(k), t.get("project"))
+for p in (d.get("paused") or []):
+    add(p.get("session_id"), p.get("project"))
+sys.stdout.write("".join(out) + "\x1f")
+' "$PAUSED_FILE" 2>/dev/null || true)
+
       while IFS='|' read -r sid dir ts summary; do
         [[ -z "$sid" ]] && continue
         # Filter out old sessions unless the cutoff is disabled (0) or the age
@@ -7054,9 +7080,16 @@ else: print(f'{delta // 86400}d ago')
             continue
           fi
         fi
-        session_raw+=("session|$sid|$dir|$tool|||$summary")
+        local sproj="" _rp_rest
+        case "$_rp_map" in
+          *$'\037'"$sid"$'\036'*)
+            _rp_rest="${_rp_map#*$'\037'"$sid"$'\036'}"
+            sproj="${_rp_rest%%$'\037'*}"
+            ;;
+        esac
+        session_raw+=("session|$sid|$dir|$tool|||$summary||$sproj")
         local short_dir="${dir/#$HOME/\~}"
-        session_display+=("$(printf '  %-10s │ %-50s │ %s' "${ts:-?}" "${summary:0:50}" "$short_dir")")
+        session_display+=("$(printf '  %-10s │ %-44s │ %-16s │ %s' "${ts:-?}" "${summary:0:44}" "${sproj:0:16}" "$short_dir")")
       done < <($harvest_fn)
     fi
   fi
