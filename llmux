@@ -4286,13 +4286,26 @@ except Exception: print(999)" 2>/dev/null || echo 999)
     return 0
   fi
 
-  # Park the outgoing thread first so window 0 never holds two threads (a
-  # failed join would otherwise leave the layout wedged).
-  if [[ -n "$current" ]]; then
-    park_pane "$current" || {
-      echo "Error: could not park current thread" >&2
-      return 1
-    }
+  # Park EVERY thread currently in the sidebar's window, not just the first one.
+  # get_active_thread_pane returns a single pane, so a window that had somehow
+  # collected two threads kept one of them forever -- and the layout then split the
+  # screen between them. Parking the whole set makes any such state self-heal on the
+  # next switch instead of needing a manual fix.
+  #
+  # Furniture is excluded by @llmux_sidebar / @llmux_memory; the target itself is
+  # skipped because it may already be here.
+  local sw_win sw_pane sw_flags
+  sw_win=$(tmux display-message -p -t "$sb" '#{window_index}' 2>/dev/null || true)
+  if [[ -n "$sw_win" ]]; then
+    while IFS='|' read -r sw_pane sw_flags; do
+      [[ -z "$sw_pane" || "$sw_flags" == *1* ]] && continue
+      [[ "$sw_pane" == "$pane" ]] && continue
+      park_pane "$sw_pane" || {
+        echo "Error: could not park current thread" >&2
+        return 1
+      }
+    done < <(tmux list-panes -t "$SESSION:$sw_win" \
+      -F '#{pane_id}|#{@llmux_sidebar}#{@llmux_memory}' 2>/dev/null || true)
   fi
 
   if ! tmux join-pane -h -s "$pane" -t "$sb" 2>/dev/null; then
@@ -7327,8 +7340,13 @@ sys.stdout.write("".join(out) + "\x1f")
     # entry so it doesn't show up duplicated in `llmux ls` / `llmux resume`.
     remove_paused "$pane_name" >/dev/null 2>&1 || true
 
+    # Spawn PARKED. Un-detached, spawn_llm_pane splits off the terminal pane, and in
+    # sidebar mode that lands a second thread in the window that is already showing
+    # one -- so the resumed thread and the thread Jay was reading ended up sharing the
+    # screen. The detached path exists for exactly this: create it parked, then let
+    # cmd_switch below bring in one thread and park whatever was there.
     local new_pane
-    new_pane=$(spawn_llm_pane "$selected_dir")
+    new_pane=$(spawn_llm_pane "$selected_dir" true)
     tmux select-pane -t "$new_pane" -T "$pane_name"
     tmux set-option -p -t "$new_pane" @llmux_name "$pane_name"
     tmux set-option -p -t "$new_pane" @llmux_tool "$selected_tool"
