@@ -158,6 +158,13 @@ whatever is actually in flight rather than every PR you've ever authored.
   cluttered one. Relevance is derived from the thread on screen, so it follows every
   switch path with nothing to keep in sync, and a peek is deliberately not persisted —
   a restore lands on the clean folded view.
+- **A merged PR unregisters itself.** `llmux pr add` never removed anything, so the
+  registry only grew — 157 entries, 144 of them merged or closed. The sidebar already
+  hid those, but each still cost a `gh pr view` on every refresh. Each refresh now
+  unregisters any PR seen merged or closed more than `LLMUX_PR_KEEP_DONE_HOURS` (24)
+  ago, so `llmux pr ls` still shows what shipped today and nothing older. `llmux pr
+  prune [--now]` does it on demand. A PR whose fetch FAILED is never pruned — only an
+  explicit merged/closed state counts, so a `gh` outage cannot unregister live work.
 - **Drag the divider to read more.** Every label — thread names, PR titles, stack
   names — is cut to what the pane can actually show at its current width, never to a
   fixed cap, so widening the sidebar reveals more text on the next repaint (≤2s). The
