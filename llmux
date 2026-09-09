@@ -125,6 +125,10 @@ Usage:
                                                 sharing --stack group under that name; an
                                                 unlabelled base/head chain groups itself.
   llmux pr ls | rm <number|url> | refresh       List / unregister / re-poll PR state
+  llmux pr prune [--now]                        Unregister merged/closed PRs (kept
+                                                LLMUX_PR_KEEP_DONE_HOURS=24 after their
+                                                last activity; --now ignores that).
+                                                Also runs automatically on each refresh.
   llmux review add --title T --url U            Queue a doc for Jay to review (lookout link or
              --context C [--kind K]             equivalent). Project defaults to the calling
              [--project P]                      pane's section. Rides on the reviewq queue, so
@@ -844,6 +848,66 @@ if len(d["prs"]) == before:
     sys.exit(1)
 _save(path, d)
 ' "$PAUSED_FILE" "$1" "$2"
+}
+
+# Unregister PRs that are done. `llmux pr add` never unregisters, so the registry only
+# ever grew -- 157 entries here, of which 144 were merged or closed and 13 actually
+# open. The sidebar already HIDES non-OPEN rows, so those 144 were invisible dead
+# weight: they still cost a `gh pr view` each on every refresh, and they are why
+# @llmux_prs_state grew to 4KB.
+#
+# Takes the state blob the refresher just fetched rather than re-querying: a PR absent
+# from the blob is one whose `gh pr view` FAILED, and treating that as "done" would
+# unregister live work on a network blip. Only an explicit non-OPEN state prunes.
+#
+# ONE python invocation for the whole set, not one remove_pr per PR: 144 forks each
+# taking the file lock is a different kind of bad.
+prune_done_prs() {
+  local blob="${1-}" keep_hours="${2:-$PR_KEEP_DONE_HOURS}"
+  [[ -n "$blob" ]] || return 0
+  python3 -c "$PY_PAUSED_IO"'
+import sys, time
+path, blob, keep_hours = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    keep = int(keep_hours) * 3600
+except ValueError:
+    keep = 86400
+
+state = {}
+for chunk in filter(None, blob.split(";")):
+    k, _, v = chunk.partition("=")
+    parts = v.split(",")
+    if len(parts) == 3:
+        try:
+            state[k] = (parts[0], int(parts[2] or 0))
+        except ValueError:
+            continue
+
+now = int(time.time())
+_lk = _lock(path)
+d = _load(path)
+kept, dropped = [], []
+for p in d["prs"]:
+    key = "%s#%s" % (p.get("repo", ""), p.get("number", ""))
+    st = state.get(key)
+    # No fetched state at all -> keep. That is either a PR registered seconds ago or
+    # one whose fetch failed, and neither is evidence that it is finished.
+    if st is None or st[0] in ("", "OPEN"):
+        kept.append(p)
+        continue
+    # A grace period so `llmux pr ls` still shows what shipped today; keep it if the
+    # merge is too recent, or if the timestamp is unusable.
+    if keep > 0 and (not st[1] or now - st[1] < keep):
+        kept.append(p)
+        continue
+    dropped.append("%s %s" % (key, st[0]))
+if not dropped:
+    sys.exit(0)
+d["prs"] = kept
+_save(path, d)
+for line in dropped:
+    print(line)
+' "$PAUSED_FILE" "$blob" "$keep_hours"
 }
 
 # For claude panes: after launch, watch the project's slug dir for a jsonl
@@ -7473,6 +7537,10 @@ watch_start() {
 # mean something, and a PR nobody has pushed to in two weeks is not it. The entry
 # stays in paused.json — this hides the row, it does not unregister.
 PR_STALE_DAYS="${LLMUX_PR_STALE_DAYS:-14}"
+# How long a merged/closed PR stays REGISTERED after its last activity. The sidebar
+# hides it immediately either way; this only governs how long `llmux pr ls` still
+# shows what shipped. 0 unregisters as soon as a refresh sees it done.
+PR_KEEP_DONE_HOURS="${LLMUX_PR_KEEP_DONE_HOURS:-24}"
 
 # Which review UI a PR row opens. Graphite by default: the work being tracked here is
 # stacked, and Graphite is where a stack is reviewable as a stack — a GitHub PR page
@@ -7515,6 +7583,9 @@ print("%s,%d,%d" % (d.get("state","") , 1 if d.get("isDraft") else 0, ep))
     blob+="${repo}#${number}=${parsed};"
   done < <(read_prs)
   tmux set-option -t "$SESSION" @llmux_prs_state "${blob%;}" 2>/dev/null || true
+  # Prune before invalidating, so the next paint is already computed from the
+  # smaller registry.
+  prune_done_prs "${blob%;}" >/dev/null 2>&1 || true
   invalidate_pr_rows
 }
 
@@ -7534,6 +7605,23 @@ cmd_pr() {
       return 0
       ;;
     refresh) cmd__pr_refresh; echo "Refreshed PR state."; return 0 ;;
+    prune)
+      # --now ignores the grace period, for clearing a backlog by hand rather than
+      # waiting a day per PR.
+      local keep="$PR_KEEP_DONE_HOURS"
+      [[ "${1:-}" == "--now" || "${1:-}" == "--all" ]] && keep=0
+      local blob n
+      blob=$(tmux show-option -t "$SESSION" -qv @llmux_prs_state 2>/dev/null || true)
+      if [[ -z "$blob" ]]; then
+        echo "No fetched PR state yet — run 'llmux pr refresh' first." >&2
+        return 1
+      fi
+      n=$(prune_done_prs "$blob" "$keep" | tee /dev/stderr | grep -c . || true)
+      invalidate_pr_rows
+      render_sidebar 2>/dev/null || true
+      echo "Unregistered ${n:-0} finished PR(s)."
+      return 0
+      ;;
     rm)
       local target="${1:-}"
       [[ -z "$target" ]] && { echo "Usage: llmux pr rm <number|url>" >&2; return 1; }
