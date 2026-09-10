@@ -150,6 +150,12 @@ whatever is actually in flight rather than every PR you've ever authored.
   ⌥ #53625 footer addresses  ← click opens it in a browser
 ```
 
+- **`llmux rename [name|index] [new-name]`**, or `prefix`+`R` for the thread on screen.
+  Takes a sidebar row number as well as a name, and works on paused threads too.
+  Renaming rewrites the snapshot record in place rather than letting the guard see the
+  old name vanish — otherwise every snapshot would refuse until a human authorized it.
+  The terminal pane refuses to be renamed: `rm`, `pause` and `cycle` all guard it by
+  name, so renaming it would defeat all three.
 - **Every project heading has its own `+`** — new thread *in that project*, which is
   the common case, so it skips the "which project?" prompt entirely. The sidebar's
   single `+` on the rule row still means "ask me which project". Both sit in the same
