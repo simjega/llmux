@@ -150,6 +150,11 @@ whatever is actually in flight rather than every PR you've ever authored.
   ⌥ #53625 footer addresses  ← click opens it in a browser
 ```
 
+- **Every project heading has its own `+`** — new thread *in that project*, which is
+  the common case, so it skips the "which project?" prompt entirely. The sidebar's
+  single `+` on the rule row still means "ask me which project". Both sit in the same
+  column, so they read as one affordance repeated rather than two different things.
+  Clicking a heading's label instead of its `+` is deliberately inert.
 - **Only the project you're working in shows its docs and PRs.** Every other section
   folds them into one summary row — `· 👀2  ⌥3   ▸` — because a doc queued in July and
   a PR opened last week are not what you're looking at right now. Click the row to peek

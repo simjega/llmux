@@ -2453,6 +2453,23 @@ sidebar_section_header() {
   project_meta "$key" >/dev/null; meta="$R_PROJECT_META"
   label="${meta%%|*}"
   colour="${meta##*|}"
+  # Truncate the label to what the header can actually hold. Without this a long
+  # project name ran past the pane (40 columns in a 30-column sidebar on main) --
+  # tolerable when the row was inert, but the "+" rides on it now, and an overflowing
+  # label pushed the glyph to column 41 while the click handler still tested
+  # SIDEBAR_PLUS_COL. The affordance you could see was the one you could not click.
+  #
+  # Budget, with_plus: 1 leading space + label + 1 space + >=1 rule + 1 space + "+"
+  # lands the glyph in SIDEBAR_PLUS_COL, so the label gets PLUS_COL - 4.
+  local label_max
+  if [[ "$with_plus" == "1" ]]; then
+    label_max=$(( SIDEBAR_PLUS_COL - 4 ))
+  else
+    label_max=$(( SIDEBAR_RULE_WIDTH - 2 ))
+  fi
+  (( label_max < 4 )) && label_max=4
+  (( ${#label} > label_max )) && label="${label:0:label_max}"
+
   if [[ "$with_plus" == "1" ]]; then
     # Stop the rule so the "+" lands exactly in SIDEBAR_PLUS_COL for every
     # section: 1 leading space + label + 1 space + rule + 1 space + "+".
@@ -2461,6 +2478,7 @@ sidebar_section_header() {
     # Plus-less sections keep the rule flush with the title divider.
     rule_len=$(( SIDEBAR_RULE_WIDTH - ${#label} - 1 ))
   fi
+  (( rule_len < 1 )) && rule_len=1
 
   (( rule_len < 0 )) && rule_len=0
   while (( i < rule_len )); do rule+="─"; ((i++)); done
@@ -3053,8 +3071,17 @@ render_sidebar() {
       ((row++))
     fi
     drawn=1
-    sidebar_section_header "$key" 0 >/dev/null
+    # Every section heading carries its own "+" -> new thread IN THIS PROJECT, which
+    # is the common case; the sidebar's single "+" on the rule row still means "ask me
+    # which project". sidebar_section_header's with_plus mode already shortens the rule
+    # so the glyph lands in SIDEBAR_PLUS_COL, the same column as the global one, so
+    # they read as one affordance repeated rather than two different things.
+    sidebar_section_header "$key" 1 >/dev/null
     out+="${R_SECTION_HEADER}"$'\n'
+    # Registered against the heading's row: the click handler routes a hit in
+    # SIDEBAR_PLUS_COL through addmap to sidebar_add_prompt "$key", and cmd__newthread
+    # already treats a non-"*" target as the project, skipping the project prompt.
+    addmap+="${row}:${key},"
     ((row++))
 
     # Links get their OWN row under the heading rather than sharing it. Inline, a
