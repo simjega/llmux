@@ -85,6 +85,9 @@ Usage:
                                                 thread (it asks which platform).
   llmux switch [name|index]                     Make a thread the visible one (no argument =
                                                 picker; or click its row in the sidebar)
+  llmux rename [name|index] [new-name]          Rename a thread (live or paused). Prompts
+                                                for either argument if omitted; prefix+R
+                                                renames the thread on screen.
   llmux mv [name|index] [project] [--tolaria <slug|new|none>]
                                                 Move a thread to another project, creating
                                                 the project if it's new ('scratch' moves it
@@ -3848,6 +3851,152 @@ move_thread_to() {
 # The same gesture as move_thread_to, for a thread that isn't running. Nothing is
 # resumed to do it: the section is a field in paused.json, so a paused thread can
 # be filed exactly like a live one.
+# Rename a thread. The tricky part is not the pane option -- it is that a rename makes
+# the OLD name vanish and a NEW one appear, which is precisely the shape the snapshot
+# guard refuses ("still missing: <old>"). So the snapshot RECORD is renamed in place,
+# preserving the session ids, rather than letting the guard see a removal plus an
+# unknown arrival. Get that wrong and every snapshot refuses until a human authorizes,
+# which is how a project was lost once.
+rename_thread_record() {
+  local old="${1:?}" new="${2:?}"
+  python3 -c "$PY_PAUSED_IO"'
+import sys
+path, old, new = sys.argv[1:4]
+_lk = _lock(path)
+d = _load(path)
+hit = 0
+for t in ((d.get("session") or {}).get("threads") or []):
+    if t.get("name") == old:
+        t["name"] = new; hit += 1
+for p in (d.get("paused") or []):
+    if p.get("name") == old:
+        p["name"] = new; hit += 1
+# A thread that has never been snapshotted has no record, which is not an error --
+# the next snapshot will simply write it under its new name.
+if hit:
+    _save(path, d)
+print(hit)
+' "$PAUSED_FILE" "$old" "$new"
+}
+
+cmd_rename() {
+  local thread="" newname=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      *) if [[ -z "$thread" ]]; then thread="$1"; elif [[ -z "$newname" ]]; then newname="$1"; fi; shift ;;
+    esac
+  done
+
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "Error: no llmux session running" >&2
+    return 1
+  fi
+
+  # No thread given: pick one, same as `llmux mv`.
+  if [[ -z "$thread" ]]; then
+    local menu=() pid nm rest
+    while IFS='|' read -r pid nm rest; do
+      [[ -n "$nm" ]] && menu+=("$nm")
+    done < <(list_threads)
+    while IFS='|' read -r nm rest; do
+      [[ -n "$nm" ]] && menu+=("$nm")
+    done < <(read_paused)
+    [[ ${#menu[@]} -eq 0 ]] && { echo "No threads to rename." >&2; return 1; }
+    thread=$(printf '%s\n' "${menu[@]}" | gum filter \
+      --header "Rename which thread?" --indicator "▸" \
+      --indicator.foreground "212" --match.foreground "212" \
+      --header.foreground "99" --prompt.foreground "39") || return 0
+    [[ -z "$thread" ]] && return 0
+  fi
+
+  # A sidebar row number addresses the sidebar, exactly as in `llmux mv` -- the number
+  # is on screen, which is usually why you are renaming this one.
+  local line="" pane="" oldname="" paused_hit=0
+  if [[ "$thread" =~ ^[0-9]+$ ]]; then
+    line=$({ list_threads | sed -n "${thread}p"; } || true)
+  else
+    line=$({ list_threads | grep -m1 "^[^|]*|${thread}|"; } || true)
+  fi
+  if [[ -n "$line" ]]; then
+    pane=$(printf '%s' "$line" | cut -d'|' -f1)
+    oldname=$(printf '%s' "$line" | cut -d'|' -f2)
+  elif [[ ! "$thread" =~ ^[0-9]+$ ]] && read_paused | grep -q "^${thread}|"; then
+    oldname="$thread"; paused_hit=1
+  else
+    echo "Error: no thread '$thread'" >&2
+    return 1
+  fi
+
+  # The terminal pane is furniture whose NAME is load-bearing: cmd_rm, cmd_pause and
+  # cmd_cycle each guard it with [[ "$name" == "terminal" ]], so renaming it would
+  # quietly defeat all three and let the always-on shell be removed or cycled. Tested
+  # on the pane option rather than the name, since the name is the thing at issue.
+  if [[ -n "$pane" ]] \
+     && [[ "$(tmux display-message -p -t "$pane" '#{@llmux_terminal}' 2>/dev/null || true)" == "1" ]]; then
+    echo "Error: the terminal pane cannot be renamed" >&2
+    return 1
+  fi
+
+  if [[ -z "$newname" ]]; then
+    newname=$(gum input --value "$oldname" --header "Rename '${oldname}' to" \
+      --header.foreground "99" --prompt.foreground "39") || return 0
+  fi
+  # Same normalisation cmd_add applies: names become tmux option values, window titles
+  # and claude session names, and whitespace breaks the |-delimited listings.
+  newname=$(printf '%s' "$newname" | tr -d '[:space:]')
+  [[ -z "$newname" ]] && return 0
+  if [[ "$newname" == "$oldname" ]]; then
+    echo "Name unchanged."
+    return 0
+  fi
+  # Reserved and colliding names. A duplicate would make `llmux switch`, `send` and
+  # the resume picker ambiguous, and every one of those resolves by name.
+  case "$newname" in
+    terminal|threads) echo "Error: '$newname' is reserved" >&2; return 1 ;;
+  esac
+  if list_threads | grep -q "^[^|]*|${newname}|" || read_paused | grep -q "^${newname}|"; then
+    echo "Error: a thread named '$newname' already exists" >&2
+    return 1
+  fi
+
+  # Record first, then the pane: if the record write fails we have changed nothing,
+  # whereas a renamed pane with a stale record is the state that deadlocks snapshots.
+  rename_thread_record "$oldname" "$newname" >/dev/null || {
+    echo "Error: could not update the snapshot record for '$oldname'" >&2
+    return 1
+  }
+  if (( ! paused_hit )); then
+    if ! tmux set-option -p -t "$pane" @llmux_name "$newname" 2>/dev/null; then
+      # Put the record back rather than leaving the two disagreeing.
+      rename_thread_record "$newname" "$oldname" >/dev/null || true
+      echo "Error: could not rename the pane" >&2
+      return 1
+    fi
+    tmux select-pane -t "$pane" -T "$newname" 2>/dev/null || true
+  fi
+
+  if sidebar_enabled; then render_sidebar; fi
+  snapshot_session || {
+    echo "Renamed '$oldname' to '$newname' (snapshot deferred)." >&2
+    return 0
+  }
+  echo "Renamed '$oldname' to '$newname'"
+}
+
+# Popup form of the above for prefix+R: renames the thread currently on screen.
+cmd__renamethread() {
+  local pane name
+  pane=$(get_active_thread_pane)
+  if [[ -z "$pane" ]]; then
+    echo "No thread on screen to rename." >&2
+    sleep 1
+    return 0
+  fi
+  name=$(tmux display-message -p -t "$pane" '#{@llmux_name}' 2>/dev/null || true)
+  [[ -z "$name" ]] && { echo "That pane is not a thread." >&2; sleep 1; return 0; }
+  cmd_rename "$name"
+}
+
 move_paused_thread_to() {
   local name="${1:-}" intent="${3:-}" project prev prev_slug label rc
   [[ -z "$name" ]] && return 1
@@ -4527,6 +4676,11 @@ sidebar_bind_keys() {
   # you need when the mouse is what's misbehaving.
   tmux bind-key -T prefix M display-popup -E -w 56 -h 24 -T ' move thread ' \
     'llmux _movethread' 2>/dev/null || true
+  # R for rename, prefilled with the current name. Capital for the same reason as M:
+  # lowercase r is tmux's own refresh-client in many configs, and this pane is a
+  # display that people do refresh.
+  tmux bind-key -T prefix R display-popup -E -w 56 -h 8 -T ' rename thread ' \
+    'llmux _renamethread' 2>/dev/null || true
   local i
   for i in 1 2 3 4 5 6 7 8 9; do
     tmux bind-key -T prefix "$i" run-shell -b "llmux switch $i" 2>/dev/null || true
@@ -8952,6 +9106,8 @@ case "$command" in
   _click)        sidebar_click "$@" ;;
   _newthread)    cmd__newthread "$@" ;;
   _movethread)   cmd__movethread "$@" ;;
+  rename)        cmd_rename "$@" ;;
+  _renamethread) cmd__renamethread ;;
   memory)        cmd_memory "$@" ;;
   urgent)        cmd_urgent "$@" ;;
   _watch)        watch_start; echo "Watcher started" ;;
