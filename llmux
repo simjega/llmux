@@ -2905,7 +2905,7 @@ render_sidebar() {
   #
   # Absolute rows mean spacers and headings appear in neither map, so clicking
   # them is a no-op for free.
-  local rowmap="" addmap="1:*," prmap="" linkmap="" foldmap=""
+  local rowmap="" addmap="1:*," prmap="" linkmap="" foldmap="" renamemap=""
   local key meta label gcolour drawn=0 entry eidx
 
   # PR rows, precomputed per project so the draw loop below stays a straight walk.
@@ -3322,11 +3322,21 @@ render_sidebar() {
       [[ -n "$semoji" ]] && flag_w=3
       local age_w=0
       [[ -n "$age_txt" ]] && age_w=$(( 3 + ${#age_txt} ))   # sp, dot, sp, text
-      local name_w=$(( sb_w - prefix_w - flag_w - age_w ))
+      # A ✎ on the ACTIVE row only -> click to rename. Only that row, because two
+      # columns is a real cost on a 30-column pane and paying it on every row to
+      # advertise a rare action is the wrong trade; one glyph beside the thread you
+      # are looking at also says WHICH thread it renames. Right-aligned to the pane
+      # edge rather than to SIDEBAR_PLUS_COL: aligning it with the section "+" would
+      # strand three columns of name budget for the sake of a tidier column.
+      # ✎ is U+270E, East-Asian width Neutral, so ONE column -- the same property the
+      # ⚒ row depends on.
+      local rename_w=0
+      [[ "$pane_id" == "$active" ]] && rename_w=2   # sp + glyph
+      local name_w=$(( sb_w - prefix_w - flag_w - age_w - rename_w ))
       if (( name_w < 6 )) && (( age_w > 0 )); then
         # Too narrow to say both: the name is what identifies the row, so the age goes.
         age_txt=""; age_w=0
-        name_w=$(( sb_w - prefix_w - flag_w ))
+        name_w=$(( sb_w - prefix_w - flag_w - rename_w ))
       fi
       (( name_w < 1 )) && name_w=1
       local tlabel="${name:0:name_w}"
@@ -3336,9 +3346,23 @@ render_sidebar() {
       # what says which platform this is — and it does that in one column, in the
       # platform's colour. The marker takes the project colour with the number and
       # name: it marks WHICH THREAD is selected, which is the same axis.
+      # Pad the name whenever anything is right-aligned after it, so the ✎ lands in a
+      # predictable column rather than hugging a short name.
+      (( rename_w > 0 )) && printf -v tlabel '%-*s' "$name_w" "$tlabel"
       out+="${idx_col}${marker}\033[0m${idx_col}${eidx}\033[0m ${icon_col}${icon}\033[0m ${name_col}${tlabel}\033[0m"
       [[ -n "$age_txt" ]] && out+=" \033[38;5;${fade}m● ${age_txt}\033[0m"
-      out+="${flag}"$'\n'
+      out+="${flag}"
+      if (( rename_w > 0 )); then
+        out+=" \033[38;5;240m✎\033[0m"
+        # Column-scoped like the Monitor/Flag links, and computed from the SAME
+        # integers the row was budgeted with -- every field here is a known column
+        # count, so no display-width measurement is involved. Two columns wide so the
+        # space before the glyph is clickable too: one column is not a thing anyone
+        # should have to aim at.
+        local ren_col=$(( prefix_w + name_w + age_w + flag_w ))
+        renamemap+="${row}:${ren_col}:$(( ren_col + 1 )):${pane_id}"$'\n'
+      fi
+      out+=$'\n'
       rowmap+="${row}:${pane_id},"
       ((row++))
 
@@ -3423,7 +3447,7 @@ render_sidebar() {
     done
   done
 
-  out+=$'\n\033[38;5;240m click a row, + to add\n prefix j/k  next/prev\n prefix M    move project\n prefix 1-9  jump\033[0m\n'
+  out+=$'\n\033[38;5;240m click a row, + to add\n ✎ rename    prefix R\n prefix j/k  next/prev\n prefix M    move project\n prefix 1-9  jump\033[0m\n'
 
   # Never write a newline from the pane's bottom row. Once the rendered list is
   # taller than the sidebar, the terminal would scroll the first rows away while
@@ -3449,6 +3473,8 @@ render_sidebar() {
   # Same contract again: the fold summary rows are published in the call that
   # paints them, so a click cannot toggle a section the pixels no longer show.
   tmux set-option -t "$SESSION" @llmux_sidebar_foldmap "${foldmap%,}" 2>/dev/null || true
+  # Same contract as every other map: published in the call that paints the glyph.
+  tmux set-option -t "$SESSION" @llmux_sidebar_renamemap "$renamemap" 2>/dev/null || true
 
   # respawn-pane would kill the loop; write straight into the pane instead.
   tmux send-keys -t "$sb" "" 2>/dev/null || true
@@ -3579,6 +3605,35 @@ sidebar_click() {
   fi
 
   (( y < SIDEBAR_HEADER_LINES )) && return 0
+
+  # The ✎ on the active thread's row. Checked BEFORE rowmap because it shares that
+  # row: rowmap would match first and just re-focus the thread, so the glyph would
+  # look inert. Column-scoped, so clicking the name still switches.
+  local renamemap rnline r_row r_s r_e r_pane
+  renamemap=$(tmux show-option -t "$SESSION" -qv @llmux_sidebar_renamemap 2>/dev/null || true)
+  if [[ -n "$renamemap" && -n "$x" ]]; then
+    while IFS= read -r rnline || [[ -n "$rnline" ]]; do
+      [[ -z "$rnline" ]] && continue
+      r_row="${rnline%%:*}"; rnline="${rnline#*:}"
+      r_s="${rnline%%:*}";   rnline="${rnline#*:}"
+      r_e="${rnline%%:*}";   r_pane="${rnline#*:}"
+      [[ "$r_row" == "$y" ]] || continue
+      (( x >= r_s && x <= r_e )) || continue
+      [[ -z "$r_pane" ]] && continue
+      local r_name
+      r_name=$(tmux display-message -p -t "$r_pane" '#{@llmux_name}' 2>/dev/null || true)
+      [[ -z "$r_name" ]] && return 0
+      if [[ -n "${LLMUX_DEBUG_CLICK:-}" ]]; then
+        echo "$(date +%H:%M:%S) y=$y x=$x -> rename '$r_name'" \
+          >> "${TMPDIR:-/tmp}/llmux-click.log"
+      fi
+      # The popup IS the interaction and gum needs a tty, so display-popup directly
+      # rather than through run-shell -- the same reason prefix+M does.
+      tmux display-popup -E -w 56 -h 8 -T " rename thread " \
+        "$(printf 'llmux rename %q' "$r_name")" 2>/dev/null || true
+      return 0
+    done <<< "$renamemap"
+  fi
 
   # Link rows (Monitor / Flag) carry no thread, so they are checked before the thread
   # maps and are column-scoped -- clicking anywhere else on the row stays inert.
