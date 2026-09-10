@@ -150,6 +150,10 @@ whatever is actually in flight rather than every PR you've ever authored.
   ⌥ #53625 footer addresses  ← click opens it in a browser
 ```
 
+- **Click the `✎`** beside the thread you're on to rename it. It's drawn on the active
+  row only — two columns is a real cost on a 30-column pane, and one glyph next to the
+  row you're looking at also says *which* thread it renames. To rename another thread,
+  click it (which switches to it) then click its `✎`.
 - **`llmux rename [name|index] [new-name]`**, or `prefix`+`R` for the thread on screen.
   Takes a sidebar row number as well as a name, and works on paused threads too.
   Renaming rewrites the snapshot record in place rather than letting the guard see the
