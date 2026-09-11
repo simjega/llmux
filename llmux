@@ -7674,8 +7674,12 @@ sys.stdout.write("".join(out) + "\x1f")
       echo "Warning: could not remove '$pane_name' from paused list"
     fi
 
+    # Spawn PARKED, for the reason #42 fixed on the tool-session branch: un-detached,
+    # spawn_llm_pane splits off the terminal pane, which in sidebar mode drops a second
+    # thread into the window already showing one. cmd_switch below brings in exactly
+    # one and parks the rest.
     local new_pane
-    new_pane=$(spawn_llm_pane "$pane_dir")
+    new_pane=$(spawn_llm_pane "$pane_dir" true)
     tmux select-pane -t "$new_pane" -T "$pane_name"
     tmux set-option -p -t "$new_pane" @llmux_name "$pane_name"
     if [[ "$pane_tool" == "forge" ]]; then
@@ -7711,7 +7715,16 @@ sys.stdout.write("".join(out) + "\x1f")
     else
       echo "Resumed '$pane_name'"
     fi
-    attach_to_pane "$pane_name"
+    # The sidebar_enabled branch every other creation path already has. Without it
+    # this one called attach_to_pane unconditionally, and attach_to_pane does
+    # select-window -- which in sidebar mode drags the client into the hidden _parked
+    # window showing every thread tiled, exactly as cmd_add's comment warns. So
+    # resuming a paused thread did not put you on that thread.
+    if sidebar_enabled; then
+      cmd_switch "$pane_name"
+    else
+      attach_to_pane "$pane_name"
+    fi
 
   else
     # --- Original session resume flow ---
