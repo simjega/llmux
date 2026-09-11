@@ -161,7 +161,11 @@ whatever is actually in flight rather than every PR you've ever authored.
   The terminal pane refuses to be renamed: `rm`, `pause` and `cycle` all guard it by
   name, so renaming it would defeat all three.
 - **Every project heading has its own `+`** — new thread *in that project*, which is
-  the common case, so it skips the "which project?" prompt entirely. The sidebar's
+  the common case, so it skips the "which project?" prompt entirely. When that project
+  has past threads it first asks **new thread** or **resume one of N**, and the resume
+  picker is filtered to that project's own history across every tool — so it never
+  asks "which tool?" and can't land on an empty list. A project with no history skips
+  the question and goes straight to creating one. The sidebar's
   single `+` on the rule row still means "ask me which project". Both sit in the same
   column, so they read as one affordance repeated rather than two different things.
   Clicking a heading's label instead of its `+` is deliberately inert.

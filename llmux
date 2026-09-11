@@ -83,6 +83,9 @@ Usage:
                                                 unassigned. A thread's glyph says which
                                                 platform it runs. Click the + to add a
                                                 thread (it asks which platform).
+                                                Each project heading has its own +:
+                                                new thread in that project, or resume
+                                                one of its past threads.
   llmux switch [name|index]                     Make a thread the visible one (no argument =
                                                 picker; or click its row in the sidebar)
   llmux rename [name|index] [new-name]          Rename a thread (live or paused). Prompts
@@ -3797,6 +3800,27 @@ NEWTHREAD_TOOLS=(claude codex opencode forge amp aider)
 cmd__newthread() {
   local target="${1:-*}"
 
+  # --- new, or resume one of this project's own past threads? ---
+  # Only asked for a project "+", and only when that project actually HAS resumable
+  # history: a menu whose second option leads to an empty list is worse than no menu.
+  # The global "+" on the rule row skips this -- it already means "ask me which
+  # project", and plain `llmux resume` is the unfiltered picker.
+  if [[ "$target" != "*" ]]; then
+    count_resumable_in_project "$target"
+    if (( R_RESUMABLE_COUNT > 0 )); then
+      local label pick_what
+      label=$(project_meta "$target"); label="${label%%|*}"
+      pick_what=$(printf '%s\n%s\n' \
+        "✳  new thread" \
+        "↩  resume one of ${R_RESUMABLE_COUNT}" | gum choose \
+        --header "${label}" --header.foreground "99" --cursor.foreground "212") || return 0
+      [[ -z "$pick_what" ]] && return 0
+      case "$pick_what" in
+        *resume*) cmd_resume --from-project "$target"; return $? ;;
+      esac
+    fi
+  fi
+
   # --- platform ---
   local menu=() t
   for t in "${NEWTHREAD_TOOLS[@]}"; do
@@ -7253,16 +7277,69 @@ for i, t in enumerate(data):
   done
 }
 
+# True when a picker row belongs to $2, or when no filter was given. Field 9 is the
+# project, which every row kind has carried since resume learned to preserve it.
+resume_row_in_project() {
+  local row="${1-}" want="${2-}"
+  [[ -z "$want" ]] && return 0
+  local proj
+  proj=$(printf '%s' "$row" | cut -d'|' -f9)
+  [[ "$proj" == "$want" ]]
+}
+
+# How many resumable threads a project has, so the "+" can offer "resume" only when
+# there is something to resume -- a menu whose second option leads to an empty list is
+# worse than no menu. Counts paused entries and harvested tool sessions the same way
+# the picker does, but without building the display rows.
+R_RESUMABLE_COUNT=0
+count_resumable_in_project() {
+  local want="${1-}"
+  R_RESUMABLE_COUNT=0
+  [[ -z "$want" ]] && return 0
+  local n=0 nm rest proj
+  while IFS='|' read -r nm _dir _tool _wt _at _sid _slot proj; do
+    [[ -n "$nm" && "$proj" == "$want" ]] && n=$(( n + 1 ))
+  done < <(read_paused)
+  # Tool sessions: the project comes from paused.json's record of that session id,
+  # which is the same source the picker now uses.
+  local ids
+  ids=$(python3 -c "$PY_PAUSED_IO"'
+import sys
+d = _load(sys.argv[1])
+want = sys.argv[2]
+seen = set()
+for t in ((d.get("session") or {}).get("threads") or []):
+    if t.get("project") != want:
+        continue
+    for k in ("claude_session", "opencode_session", "codex_session", "forge_task"):
+        if t.get(k):
+            seen.add(t[k])
+print(len(seen))
+' "$PAUSED_FILE" "$want" 2>/dev/null || echo 0)
+  [[ "$ids" =~ ^[0-9]+$ ]] || ids=0
+  R_RESUMABLE_COUNT=$(( n + ids ))
+  return 0
+}
+
 cmd_resume() {
   local tool_override=""
   local show_all=""
   local project_override=""
+  local from_project=""
   local exact_paused_name=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --tool) tool_override="${2:?--tool requires a value}"; shift 2 ;;
       --project) project_override="$(sanitize_project "${2:?--project requires a value}")"; shift 2 ;;
+      # Distinct from --project, which only ASSIGNS a project to whatever you pick.
+      # This one also FILTERS the picker to that project's own past threads, which is
+      # what a project's "+" means by "resume". Kept separate because the Forge path
+      # passes --project for a task that has no project yet, and filtering there would
+      # hand back an empty list.
+      --from-project)
+        from_project="$(sanitize_project "${2:?--from-project requires a value}")"
+        project_override="$from_project"; shift 2 ;;
       --name) exact_paused_name="${2:?--name requires a value}"; shift 2 ;;
       --all)  show_all=1; shift ;;
       *) shift ;;
@@ -7335,6 +7412,10 @@ else: print(f'{delta // 86400}d ago')
       exit 1
     elif [[ ${#resumable[@]} -eq 1 ]]; then
       tool="${resumable[0]}"
+    elif [[ -n "$from_project" ]]; then
+      # Harvested above, across every tool. Leave $tool empty so the single-tool
+      # harvest below is skipped rather than duplicating rows.
+      tool=""
     elif [[ ${#resumable[@]} -gt 1 ]]; then
       tool=$(printf '%s\n' "${resumable[@]}" | gum choose --header "Which tool's sessions?")
       [[ -z "$tool" ]] && exit 0
@@ -7346,6 +7427,64 @@ else: print(f'{delta // 86400}d ago')
   local session_display=()
 
   if [[ -n "$tool" ]]; then
+    # A thread resumed from TOOL HISTORY used to land in SCRATCH: the paused-entry
+    # row carries its project in field 9, but the harvested-session row had only
+    # seven fields and no project at all, so cmd_resume's $entry_project was always
+    # empty for this path. llmux does know the answer -- paused.json records the
+    # project against the session id -- so resolve it here, once, for every tool.
+    #
+    # A flat string with \037/\036 delimiters, NOT an associative array: `bash` here
+    # is /bin/bash 3.2, which has no `declare -A` at all (nothing else in this file
+    # uses one). Lookup is pure parameter expansion, so resolving fifty rows costs
+    # no forks and no temp files.
+    local _rp_map=""
+    _rp_map=$(python3 -c "$PY_PAUSED_IO"'
+import sys
+d = _load(sys.argv[1])
+out = []
+def add(sid, proj):
+  if sid and proj:
+      out.append("\x1f%s\x1e%s" % (sid, proj))
+for t in ((d.get("session") or {}).get("threads") or []):
+  for k in ("claude_session", "opencode_session", "codex_session", "forge_task"):
+      add(t.get(k), t.get("project"))
+for p in (d.get("paused") or []):
+  add(p.get("session_id"), p.get("project"))
+sys.stdout.write("".join(out) + "\x1f")
+' "$PAUSED_FILE" 2>/dev/null || true)
+
+    # Filtering to one project means harvesting EVERY tool, not asking which. The
+    # project's "+" promises "resume one of N" counted across tools, so asking for a
+    # tool first would both add a step and be able to land on an empty list -- which
+    # is the count contradicting itself. Without a filter, the tool question still
+    # narrows a long unfiltered history, so it stays.
+    if [[ -n "$from_project" ]]; then
+      local ft fn
+      for ft in claude codex opencode amp forge; do
+        command -v "$ft" >/dev/null 2>&1 || continue
+        case "$ft" in
+          claude)   fn=harvest_claude_sessions ;;
+          amp)      fn=harvest_amp_sessions ;;
+          codex)    fn=harvest_codex_sessions ;;
+          opencode) fn=harvest_opencode_sessions ;;
+          forge)    fn=harvest_forge_sessions ;;
+          *) continue ;;
+        esac
+        local rsid rdir rts rsum rproj
+        while IFS='|' read -r rsid rdir rts rsum; do
+          [[ -z "$rsid" ]] && continue
+          rproj=""
+          case "$_rp_map" in
+            *$'\037'"$rsid"$'\036'*)
+              rproj="${_rp_map#*$'\037'"$rsid"$'\036'}"; rproj="${rproj%%$'\037'*}" ;;
+          esac
+          [[ "$rproj" == "$from_project" ]] || continue
+          session_raw+=("session|$rsid|$rdir|$ft|||$rsum||$rproj")
+          session_display+=("$(printf '  %-10s │ %-44s │ %-16s │ %s' "${rts:-?}" "${rsum:0:44}" "${rproj:0:16}" "${rdir/#$HOME/\~}")")
+        done < <($fn)
+      done
+    fi
+
     local harvest_fn=""
     case "$tool" in
       claude)   harvest_fn=harvest_claude_sessions ;;
@@ -7356,32 +7495,6 @@ else: print(f'{delta // 86400}d ago')
     esac
 
     if [[ -n "$harvest_fn" ]]; then
-      # A thread resumed from TOOL HISTORY used to land in SCRATCH: the paused-entry
-      # row carries its project in field 9, but the harvested-session row had only
-      # seven fields and no project at all, so cmd_resume's $entry_project was always
-      # empty for this path. llmux does know the answer -- paused.json records the
-      # project against the session id -- so resolve it here, once, for every tool.
-      #
-      # A flat string with \037/\036 delimiters, NOT an associative array: `bash` here
-      # is /bin/bash 3.2, which has no `declare -A` at all (nothing else in this file
-      # uses one). Lookup is pure parameter expansion, so resolving fifty rows costs
-      # no forks and no temp files.
-      local _rp_map=""
-      _rp_map=$(python3 -c "$PY_PAUSED_IO"'
-import sys
-d = _load(sys.argv[1])
-out = []
-def add(sid, proj):
-    if sid and proj:
-        out.append("\x1f%s\x1e%s" % (sid, proj))
-for t in ((d.get("session") or {}).get("threads") or []):
-    for k in ("claude_session", "opencode_session", "codex_session", "forge_task"):
-        add(t.get(k), t.get("project"))
-for p in (d.get("paused") or []):
-    add(p.get("session_id"), p.get("project"))
-sys.stdout.write("".join(out) + "\x1f")
-' "$PAUSED_FILE" 2>/dev/null || true)
-
       while IFS='|' read -r sid dir ts summary; do
         [[ -z "$sid" ]] && continue
         # Filter out old sessions unless the cutoff is disabled (0) or the age
@@ -7411,25 +7524,40 @@ sys.stdout.write("".join(out) + "\x1f")
   local all_raw=()
   local all_display=()
 
-  if [[ ${#paused_display[@]} -gt 0 ]]; then
+  # Collect the surviving rows FIRST, then add the section header only if any
+  # survived. Adding it up front made a filtered-to-nothing project show a picker
+  # containing a lone "PAUSED" heading instead of saying there was nothing to resume.
+  local keep_raw=() keep_disp=()
+  for i in "${!paused_raw[@]}"; do
+    resume_row_in_project "${paused_raw[$i]}" "$from_project" || continue
+    keep_raw+=("${paused_raw[$i]}")
+    keep_disp+=("${paused_display[$i]}")
+  done
+  if [[ ${#keep_raw[@]} -gt 0 ]]; then
     all_raw+=("header||||||")
     local paused_header="PAUSED"
     [[ "$hidden_paused" -gt 0 ]] && paused_header+="   ($hidden_paused older hidden — llmux resume --all)"
     all_display+=("$paused_header")
-    for i in "${!paused_raw[@]}"; do
-      all_raw+=("${paused_raw[$i]}")
-      all_display+=("${paused_display[$i]}")
+    for i in "${!keep_raw[@]}"; do
+      all_raw+=("${keep_raw[$i]}")
+      all_display+=("${keep_disp[$i]}")
     done
   fi
 
-  if [[ ${#session_display[@]} -gt 0 ]]; then
+  keep_raw=(); keep_disp=()
+  for i in "${!session_raw[@]}"; do
+    resume_row_in_project "${session_raw[$i]}" "$from_project" || continue
+    keep_raw+=("${session_raw[$i]}")
+    keep_disp+=("${session_display[$i]}")
+  done
+  if [[ ${#keep_raw[@]} -gt 0 ]]; then
     all_raw+=("header||||||")
     local sess_header="SESSIONS"
     [[ "$hidden_sessions" -gt 0 ]] && sess_header+="   ($hidden_sessions older hidden — llmux resume --all)"
     all_display+=("$sess_header")
-    for i in "${!session_raw[@]}"; do
-      all_raw+=("${session_raw[$i]}")
-      all_display+=("${session_display[$i]}")
+    for i in "${!keep_raw[@]}"; do
+      all_raw+=("${keep_raw[$i]}")
+      all_display+=("${keep_disp[$i]}")
     done
   fi
 
