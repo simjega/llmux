@@ -7820,15 +7820,56 @@ print(" ".join(sorted(tools)))
       selected_summary=$(fetch_thread_title "$selected_tool" "$selected_id")
     fi
 
-    local default_name="${selected_summary:0:40}"
+    # The name llmux already knows, in order of authority: what paused.json recorded
+    # against this session id, then the llmux name the harvester recovered from the
+    # transcript head (#38 renders those rows as "name — topic"). Either one IS the
+    # thread's name, so asking for it is asking a question llmux can answer.
+    #
+    # Before this, default_name was the first 40 characters of the whole summary, so
+    # resuming offered "lilo-zeus-alerting — https://owner-works" as a pane name and
+    # made you edit it back down by hand.
+    local known_name=""
+    known_name=$(python3 -c "$PY_PAUSED_IO"'
+import sys
+d = _load(sys.argv[1])
+sid = sys.argv[2]
+for t in ((d.get("session") or {}).get("threads") or []):
+  for k in ("claude_session", "opencode_session", "codex_session", "forge_task"):
+      if t.get(k) == sid and t.get("name"):
+          print(t["name"]); raise SystemExit(0)
+for p in (d.get("paused") or []):
+  if p.get("session_id") == sid and p.get("name"):
+      print(p["name"]); raise SystemExit(0)
+' "$PAUSED_FILE" "$selected_id" 2>/dev/null || true)
+    if [[ -z "$known_name" && "$selected_summary" == *" — "* ]]; then
+      known_name="${selected_summary%% — *}"
+    fi
+    # Only a real slug: anything with whitespace is prose, not a name.
+    [[ "$known_name" == *" "* ]] && known_name=""
+
+    local default_name="${known_name:-${selected_summary:0:40}}"
     [[ -z "$default_name" ]] && default_name="$selected_id"
 
     local pane_name
-    # No-space title looks deliberately set (slug-like); use it directly.
-    # Otherwise it's likely first-words of the conversation — prompt for a name.
-    if [[ -n "$selected_summary" && "$selected_summary" != *" "* ]]; then
+    if [[ -n "$known_name" ]]; then
+      # llmux knows this thread's name; do not ask. A collision would make switch,
+      # send and the resume picker ambiguous -- all resolve by name -- so suffix
+      # rather than prompt, and say which name was taken.
+      pane_name="$known_name"
+      if list_threads | grep -q "^[^|]*|${pane_name}|" || read_paused | grep -q "^${pane_name}|"; then
+        local n=2
+        while list_threads | grep -q "^[^|]*|${known_name}-${n}|" \
+           || read_paused | grep -q "^${known_name}-${n}|"; do
+          n=$(( n + 1 ))
+        done
+        pane_name="${known_name}-${n}"
+        echo "'$known_name' is taken — using '$pane_name'"
+      fi
+    elif [[ -n "$selected_summary" && "$selected_summary" != *" "* ]]; then
+      # No-space title looks deliberately set (slug-like); use it directly.
       pane_name="$default_name"
     else
+      # Genuinely unknown: the summary is first-words of the conversation.
       read -rp "Pane name [$default_name]: " pane_name
       [[ -z "$pane_name" ]] && pane_name="$default_name"
     fi
