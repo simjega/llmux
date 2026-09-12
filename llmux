@@ -6909,25 +6909,62 @@ def relative_time(mtime):
         days = delta // 86400
         return f"{days}d ago"
 
+_decode_cache = {}
+
 def decode_project_path(encoded):
     """Decode Claude's project dir encoding by finding the real path on disk.
-    Tries /, ., and - as separators with backtracking to find a valid path."""
+
+    Claude flattens a cwd by replacing "/" and "." with "-", so the original is
+    ambiguous: ".workspaces/slot-12" and "-workspaces-slot-12" look the same. The old
+    resolver guessed -- it tried "/", "." and "-" at every segment and recursed, which
+    is 3^segments with a stat at every step. Deep paths whose directories are gone
+    explore the entire tree before failing: two of them cost 6.8s and 6.4s here, and
+    the resume picker took 13.4 SECONDS to draw. Behind a display-popup that is a
+    blank box, which reads as "nothing happened".
+
+    This walks the REAL directory instead of guessing. At each level the remaining
+    segments are joined with "-" and compared against each entry's own name with its
+    "-" and "." normalised the same way, so one scandir per level replaces an
+    exponential search -- and only paths that actually exist are ever considered.
+    Pruning on the prefix would NOT work, because a segment boundary can fall
+    mid-name: "slot-12" splits as "slot","12" and ".workspaces/slot" does not exist."""
+    if encoded in _decode_cache:
+        return _decode_cache[encoded]
     parts = encoded.lstrip("-").split("-")
+
+    def norm(name):
+        return name.replace(".", "-")
 
     def resolve(idx, current):
         if idx == len(parts):
             return current
-        part = parts[idx]
-        seps = ["/"] if not current else ["/", ".", "-"]
-        for sep in seps:
-            candidate = current + sep + part
-            result = resolve(idx + 1, candidate)
-            if result and os.path.exists(result):
-                return result
-        return current + "/" + part if idx == len(parts) - 1 else None
+        rest = "-".join(parts[idx:])
+        try:
+            entries = os.listdir(current if current else "/")
+        except OSError:
+            return None
+        best = None
+        for name in entries:
+            n = norm(name)
+            if not n:
+                continue
+            nxt = (current + "/" + name) if current else ("/" + name)
+            if n == rest:
+                return nxt
+            if rest.startswith(n + "-"):
+                # This entry consumes n.count("-")+1 segments; keep looking if the
+                # remainder does not resolve, since another entry may also match.
+                got = resolve(idx + n.count("-") + 1, nxt)
+                if got:
+                    return got
+                if best is None:
+                    best = None
+        return best
 
     result = resolve(0, "")
-    return result if result and os.path.exists(result) else "/" + "/".join(parts)
+    out = result if result and os.path.exists(result) else "/" + "/".join(parts)
+    _decode_cache[encoded] = out
+    return out
 
 projects_dir = os.path.expanduser("~/.claude/projects")
 if not os.path.isdir(projects_dir):
@@ -7471,8 +7508,28 @@ sys.stdout.write("".join(out) + "\x1f")
     # is the count contradicting itself. Without a filter, the tool question still
     # narrows a long unfiltered history, so it stays.
     if [[ -n "$from_project" ]]; then
+      # Only the tools this project's own threads actually used. Harvesting all five
+      # meant an `amp threads search` and a `forge task list` -- both network calls,
+      # ~1.6s each -- for a project that never used either, and the popup is blank for
+      # the whole wait.
+      local want_tools
+      want_tools=$(python3 -c "$PY_PAUSED_IO"'
+import sys
+d = _load(sys.argv[1])
+want = sys.argv[2]
+tools = set()
+for t in ((d.get("session") or {}).get("threads") or []):
+  if t.get("project") == want and t.get("tool"):
+      tools.add(t["tool"])
+for p in (d.get("paused") or []):
+  if p.get("project") == want and p.get("tool"):
+      tools.add(p["tool"])
+print(" ".join(sorted(tools)))
+' "$PAUSED_FILE" "$from_project" 2>/dev/null || true)
+      # Nothing recorded: fall back to every tool rather than showing an empty list.
+      [[ -z "$want_tools" ]] && want_tools="claude codex opencode amp forge"
       local ft fn
-      for ft in claude codex opencode amp forge; do
+      for ft in $want_tools; do
         command -v "$ft" >/dev/null 2>&1 || continue
         case "$ft" in
           claude)   fn=harvest_claude_sessions ;;
