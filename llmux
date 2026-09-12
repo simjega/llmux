@@ -7296,28 +7296,26 @@ count_resumable_in_project() {
   local want="${1-}"
   R_RESUMABLE_COUNT=0
   [[ -z "$want" ]] && return 0
-  local n=0 nm rest proj
-  while IFS='|' read -r nm _dir _tool _wt _at _sid _slot proj; do
-    [[ -n "$nm" && "$proj" == "$want" ]] && n=$(( n + 1 ))
-  done < <(read_paused)
-  # Tool sessions: the project comes from paused.json's record of that session id,
-  # which is the same source the picker now uses.
-  local ids
-  ids=$(python3 -c "$PY_PAUSED_IO"'
+  # Counts DISTINCT THREAD NAMES in the project, not session ids. The picker matches a
+  # harvested row to a project by id OR by the llmux name recovered from the rollout
+  # head, precisely because the watcher binds session ids asynchronously and often has
+  # none recorded -- so an id-only count said "resume one of 3" for a project whose
+  # picker then listed nine. The count and the list have to be answering the same
+  # question or the menu lies.
+  R_RESUMABLE_COUNT=$(python3 -c "$PY_PAUSED_IO"'
 import sys
 d = _load(sys.argv[1])
 want = sys.argv[2]
-seen = set()
+names = set()
 for t in ((d.get("session") or {}).get("threads") or []):
-    if t.get("project") != want:
-        continue
-    for k in ("claude_session", "opencode_session", "codex_session", "forge_task"):
-        if t.get(k):
-            seen.add(t[k])
-print(len(seen))
+  if t.get("project") == want and t.get("name") and t.get("terminal") != "1":
+      names.add(t["name"])
+for p in (d.get("paused") or []):
+  if p.get("project") == want and p.get("name"):
+      names.add(p["name"])
+print(len(names))
 ' "$PAUSED_FILE" "$want" 2>/dev/null || echo 0)
-  [[ "$ids" =~ ^[0-9]+$ ]] || ids=0
-  R_RESUMABLE_COUNT=$(( n + ids ))
+  [[ "$R_RESUMABLE_COUNT" =~ ^[0-9]+$ ]] || R_RESUMABLE_COUNT=0
   return 0
 }
 
@@ -7410,12 +7408,13 @@ else: print(f'{delta // 86400}d ago')
     if [[ ${#resumable[@]} -eq 0 && ${#paused_raw[@]} -eq 0 ]]; then
       echo "No resumable tools found and no paused panes."
       exit 1
+    elif [[ -n "$from_project" ]]; then
+      # BEFORE the single-tool case: with only one tool installed, that branch would
+      # claim $tool first and this mode would quietly become a single-tool harvest.
+      # Empty $tool skips the single-tool loop; the all-tools harvest runs regardless.
+      tool=""
     elif [[ ${#resumable[@]} -eq 1 ]]; then
       tool="${resumable[0]}"
-    elif [[ -n "$from_project" ]]; then
-      # Harvested above, across every tool. Leave $tool empty so the single-tool
-      # harvest below is skipped rather than duplicating rows.
-      tool=""
     elif [[ ${#resumable[@]} -gt 1 ]]; then
       tool=$(printf '%s\n' "${resumable[@]}" | gum choose --header "Which tool's sessions?")
       [[ -z "$tool" ]] && exit 0
@@ -7426,7 +7425,12 @@ else: print(f'{delta // 86400}d ago')
   local session_raw=()
   local session_display=()
 
-  if [[ -n "$tool" ]]; then
+  # `|| -n "$from_project"`: that mode deliberately leaves $tool empty (it harvests
+  # every tool instead of asking which), and this guard used to be `-n "$tool"` alone
+  # -- so the filtered harvest inside was unreachable and a project "+" that promised
+  # "resume one of 3" opened a picker with nothing in it. An empty $tool still yields
+  # no harvest_fn from the case below, so the single-tool loop stays skipped.
+  if [[ -n "$tool" || -n "$from_project" ]]; then
     # A thread resumed from TOOL HISTORY used to land in SCRATCH: the paused-entry
     # row carries its project in field 9, but the harvested-session row had only
     # seven fields and no project at all, so cmd_resume's $entry_project was always
@@ -7450,6 +7454,14 @@ for t in ((d.get("session") or {}).get("threads") or []):
       add(t.get(k), t.get("project"))
 for p in (d.get("paused") or []):
   add(p.get("session_id"), p.get("project"))
+# By NAME as well as by id. The watcher tags @llmux_codex_session asynchronously and
+# can miss it entirely, so a live thread may have no session id recorded at all -- an
+# id-only map then drops it from its own project. The harvester still recovers its
+# llmux NAME from the rollout head, and the name is the durable identity here.
+for t in ((d.get("session") or {}).get("threads") or []):
+  add(t.get("name"), t.get("project"))
+for p in (d.get("paused") or []):
+  add(p.get("name"), p.get("project"))
 sys.stdout.write("".join(out) + "\x1f")
 ' "$PAUSED_FILE" 2>/dev/null || true)
 
@@ -7478,6 +7490,16 @@ sys.stdout.write("".join(out) + "\x1f")
             *$'\037'"$rsid"$'\036'*)
               rproj="${_rp_map#*$'\037'"$rsid"$'\036'}"; rproj="${rproj%%$'\037'*}" ;;
           esac
+          # Fall back to the NAME the harvester recovered. #38 renders a known thread
+          # as "name — topic", so the part before the em dash is that name; a summary
+          # with no name simply matches nothing.
+          if [[ -z "$rproj" && "$rsum" == *" — "* ]]; then
+            local rname="${rsum%% — *}"
+            case "$_rp_map" in
+              *$'\037'"$rname"$'\036'*)
+                rproj="${_rp_map#*$'\037'"$rname"$'\036'}"; rproj="${rproj%%$'\037'*}" ;;
+            esac
+          fi
           [[ "$rproj" == "$from_project" ]] || continue
           session_raw+=("session|$rsid|$rdir|$ft|||$rsum||$rproj")
           session_display+=("$(printf '  %-10s │ %-44s │ %-16s │ %s' "${rts:-?}" "${rsum:0:44}" "${rproj:0:16}" "${rdir/#$HOME/\~}")")
